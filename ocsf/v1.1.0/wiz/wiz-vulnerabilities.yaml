@@ -1,0 +1,130 @@
+name: "Wiz Vulnerabilities to OCSF"
+description: "Transforms Wiz Vulnerabilities into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "wiz-vulnerabilities"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "wiz"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            # Required OCSF Fields
+            "activity_id": 0,
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200200,
+            "time": (if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
+          
+            # Time fields
+            "start_time": (if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
+            "end_time": (if .lastDetectedAt then (.lastDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
+          
+            # Severity mapping
+            "severity_id": (
+              if .vendorSeverity == "MEDIUM" then 2
+              elif .vendorSeverity == "HIGH" then 3
+              elif .vendorSeverity == "LOW" then 1
+              elif .vendorSeverity == "CRITICAL" then 5
+              else 0 
+              end
+            ),
+          
+            # Finding Info
+            "finding_info": {
+              "title": .name,
+              "desc": .description,
+              "uid": .id,
+              "status": .status,
+              "resolution_reason": .resolutionReason,
+              "resolved_at": (if .resolvedAt then (.resolvedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else null end)
+            },
+          
+            # Vulnerabilities array
+            "vulnerabilities": [
+              {
+                "cve": {
+                  "uid": .name,
+                  "description": .CVEDescription
+                },
+                "title": .name,
+                "desc": .description,
+                "remediation": {
+                  "desc": .remediation,
+                  "fixed_version": .fixedVersion
+                },
+                "severity": .vendorSeverity,
+                "scores": {
+                  "cvss_severity": .CVSSSeverity,
+                  "epss": {
+                    "percentile": .epssPercentile,
+                    "probability": .epssProbability,
+                    "severity": .epssSeverity
+                  },
+                  "exploitability": .exploitabilityScore,
+                  "impact": .impactScore
+                },
+                "package": {
+                  "name": .detailedName,
+                  "version": .version
+                },
+                "metadata": {
+                  "has_exploit": .hasExploit,
+                  "has_cisa_kev_exploit": .hasCisaKevExploit
+                }
+              }
+            ],
+          
+            # Resource details
+            "resource": {
+              "type": .vulnerableAsset.type,
+              "name": .vulnerableAsset.name,
+              "id": .vulnerableAsset.id,
+              "status": .vulnerableAsset.status,
+              "image": {
+                "id": .vulnerableAsset.imageId,
+                "registry": .vulnerableAsset.registry.name,
+                "repository": .vulnerableAsset.repository.name
+              },
+              "tags": .vulnerableAsset.tags
+            },
+          
+            # Cloud context
+            "cloud": {
+              "provider": .vulnerableAsset.cloudPlatform,
+              "subscription": {
+                "id": .vulnerableAsset.subscriptionId,
+                "name": .vulnerableAsset.subscriptionName,
+                "external_id": .vulnerableAsset.subscriptionExternalId
+              },
+              "region": .vulnerableAsset.region
+            },
+          
+            # Metadata
+            "metadata": {
+              "product": {
+                "name": "Wiz",
+                "vendor_name": "Wiz"
+              },
+              "version": "1.1.0",
+              "detection_details": {
+                "method": .detectionMethod,
+                "validation": .validatedInRuntime
+              },
+              "source": {
+                "name": .dataSourceName,
+                "link": .link,
+                "portal_url": .portalUrl
+              }
+            },
+          
+            # Raw data
+            "raw_data": (. | tostring)
+          }

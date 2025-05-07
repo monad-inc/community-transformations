@@ -1,0 +1,78 @@
+name: "Snyk Issue Findings to OCSF"
+description: "Transforms Snyk Issue Findings into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "snyk-issues"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "snyk"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "class_uid": 2002, # Vulnerability Finding
+            "category_uid": 2, # Findings
+            "activity_id": 2, # Update
+            "type_uid": 200202, # Vulnerability Finding: Update
+            "time": (
+              (
+                .attributes.created_at
+                | split(".")[0] + "Z"
+                | fromdateiso8601
+              ) // 0
+            ),
+            "severity_id": (
+              {
+                "info": 1,
+                "low": 2,
+                "medium": 3,
+                "high": 4,
+                "critical": 5
+              }[.attributes.effective_severity_level] // 0
+            ),
+            "finding_info": {
+              "uid": .id,
+              "title": .attributes.title,
+              "type": .attributes.type,
+              "status": .attributes.status,
+              "created_time": (
+                (
+                  .attributes.created_at
+                  | split(".")[0] + "Z"
+                  | fromdateiso8601
+                ) // 0
+              ),
+              "updated_time": (
+                (
+                  .attributes.updated_at
+                  | split(".")[0] + "Z"
+                  | fromdateiso8601
+                ) // 0
+              )
+            },
+            "raw_data": (. | tostring),
+            "metadata": {
+              "product": {
+                "name": "Snyk",
+                "vendor_name": "Snyk"
+              },
+              "version": "1.1.0"
+            },
+            "vulnerabilities": [
+              {
+                "uid": .attributes.problems[0].id,
+                "name": .attributes.title,
+                "severity": .attributes.effective_severity_level,
+                "component": {
+                  "name": .attributes.coordinates[0].representations[0].dependency.package_name,
+                  "version": .attributes.coordinates[0].representations[0].dependency.package_version
+                }
+              }
+            ]
+          }

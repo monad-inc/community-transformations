@@ -1,0 +1,74 @@
+name: "Monad Organization Logs to OCSF"
+description: "Transforms Monad Organization Logs into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "monad-logs"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "monad"
+  - "organization"
+  - "logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "activity_id": (
+              if .method == "GET" then 2      # Read
+              elif .method == "POST" then 1    # Create
+              elif .method == "PATCH" then 3   # Update
+              elif .method == "PUT" then 3     # Update
+              elif .method == "DELETE" then 4  # Delete
+              else 99                         # Other
+              end
+            ),
+            "time": (.timestamp | fromdate * 1000),
+            "actor": {
+              "user": {
+                "email": .user_email
+              }
+            },
+            "api": {
+              "operation": .method,
+              "request": {
+                "uid": .id,
+                "protocol": "HTTP",
+                "method": .method,
+                "url": .resource
+              },
+              "response": {
+                "status_code": .status
+              }
+            },
+            "src_endpoint": {
+              "ip": .client_ip
+            },
+            "user_agent": .client_info,
+            "metadata": {
+              "product": {
+                "name": "Monad",
+                "version": .log_version,
+                "vendor_name": "Monad"
+              },
+              "version": "1.0.0"
+            },
+            "cloud": {
+              "provider": "Monad"
+            },
+            "severity_id": 0,
+            "type_uid": (6003 * 100 + (
+              if .method == "GET" then 2      # Read
+              elif .method == "POST" then 1    # Create
+              elif .method == "PATCH" then 3   # Update
+              elif .method == "PUT" then 3     # Update
+              elif .method == "DELETE" then 4  # Delete
+              else 99                         # Other
+              end
+            )),
+            "category_uid": 6,
+            "class_uid": 6003
+          }

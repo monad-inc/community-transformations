@@ -1,0 +1,111 @@
+name: "Wiz Cloud Config Findings to OCSF"
+description: "Transforms Wiz Cloud Config Findings into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "wiz-cloud-configuration-findings"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "wiz"
+  - "cloud"
+  - "configuration"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            # Required OCSF Fields
+            "category_uid": 2,
+            "class_uid": 2003,
+            "time": .firstSeenAt,
+            "type_uid": 200302,
+            "activity_id": 2,
+          
+            # Name fields
+            "category_name": "Findings",
+            "class_name": "Compliance Finding",
+            "type_name": "Compliance Finding: Update",
+            "activity_name": "Update",
+          
+            # Severity mapping
+            "severity": .severity,
+            "severity_id": (
+              if .severity == "MEDIUM" then 3 
+              elif .severity == "HIGH" then 4 
+              elif .severity == "LOW" then 2
+              else 0 
+              end
+            ),
+          
+            # Finding Info
+            "finding_info": {
+              "title": (.rule.name // null),
+              "uid": .id,
+              "desc": (.rule.description // null),
+              "created_time": (.firstSeenAt // null),
+              "modified_time": (.updatedAt // null),
+              "types": [
+                "configuration"
+              ]
+            },
+          
+            # Metadata
+            "metadata": {
+              "product": {
+                "name": "Wiz",
+                "vendor_name": "Wiz",
+                "version": "1.0"
+              },
+              "version": "1.1.0"
+            },
+          
+            # Message and Resource details
+            "message": (.rule.name // null),
+            "resource": {
+              "type": (.resource.type // null),
+              "uid": (.resource.id // null),
+              "name": (.resource.name // null),
+              "labels": (if .resource.labels then (.resource.labels | to_entries | map(.value)) else [] end),
+              "owner": (.resource | if .owner then {
+                "name": (.owner // null),
+                "uid": (.ownerId // null),
+                "type_id": (
+                  if .ownerType == "ADMIN" then 2
+                  elif .ownerType == "SYSTEM" then 3
+                  elif .ownerType == "USER" then 1
+                  else 0 
+                  end
+                ),
+                "type": (.ownerType // null)
+              } else null end),
+              "cloud": {
+                "provider": (.resource.cloudPlatform // null),
+                "account": {
+                  "uid": (.resource.subscription.externalId // null)
+                },
+                "region": (.resource.region // null)
+              }
+            },
+          
+            # Remediation and Status
+            "remediation": (.remediation // null),
+            "status": (.status // null),
+            "status_id": (
+              if .status == "OPEN" then 1
+              elif .status == "RESOLVED" then 4
+              else 0 
+              end
+            ),
+          
+            # Raw data and Observables
+            "raw_data": (. | tostring),
+            "observables": [{
+              "name": "resource_id",
+              "value": (.targetExternalId // null),
+              "type": "Resource UID",
+              "type_id": 10
+            }]
+          }
