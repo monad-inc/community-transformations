@@ -1,0 +1,138 @@
+{
+  # Required fields per schema
+  "activity_id": 1,
+  "activity_name": "Information",
+  "category_uid": 5,
+  "category_name": "Discovery",
+  "class_uid": 5001,
+  "class_name": "Device Inventory Info",
+  "type_uid": 0,
+  "type_name": "Device Information",
+  "severity_id": 0,
+  "severity": "Info",
+  "time": (.agent_local_time | format_timestamp),
+  "status": "Success",
+  "status_id": 0,
+
+  # Metadata (required)
+  "metadata": {
+    "version": "1.1.0",
+    "product": {
+      "name": "Endpoint Protection",
+      "vendor_name": "Security Vendor",
+      "feature": {
+        "name": "Device Control",
+        "uid": .device_policies.device_control.policy_id,
+        "version": .agent_version
+      }
+    }
+  },
+
+  # Device object following exact schema
+  "device": {
+    # Required field
+    "type_id": (
+      if .product_type_desc == "Workstation" then 1
+      elif .product_type_desc == "Server" then 2
+      elif .product_type_desc == "Mobile" then 4
+      else 99
+      end
+    ),
+
+    # Optional fields present in input
+    "hostname": .hostname,
+    "name": .hostname,
+    "uid": .device_id,
+    "domain": null,
+    "ip": .local_ip,
+    "mac": .mac_address,
+    "first_seen_time": (.first_seen | format_timestamp),
+    "last_seen_time": (.last_seen | format_timestamp),
+    "is_managed": (.provision_status == "Provisioned"),
+
+    # Network interfaces array
+    "network_interfaces": [
+      {
+        "type_id": 1,
+        "type": "Wired",
+        "hostname": .hostname,
+        "ip": .local_ip,
+        "mac": .mac_address,
+        "name": .interface_name
+      },
+      (
+        if .connection_ip then {
+          "type_id": (if (.connection_ip | contains(":")) then 2 else 1 end),
+          "type": (if (.connection_ip | contains(":")) then "Wireless" else "Wired" end),
+          "hostname": .hostname,
+          "ip": .connection_ip,
+          "mac": .mac_address,
+          "name": .interface_name
+        } else empty
+        end
+      ),
+      (
+        if .external_ip then {
+          "type_id": (if (.external_ip | contains(":")) then 2 else 1 end),
+          "type": (if (.external_ip | contains(":")) then "Wireless" else "Wired" end),
+          "hostname": .hostname,
+          "ip": .external_ip,
+          "mac": .mac_address,
+          "name": .interface_name
+        } else empty
+        end
+      )
+    ],
+
+    # Hardware info
+    "hw_info": {
+      "bios_manufacturer": .system_manufacturer,
+      "bios_ver": ("v" + .agent_version),
+      "cpu_bits": (if .platform_name == "Mac" then 64 else null end),
+      "cpu_type": (.cpu_vendor | tostring),
+      "chassis": .chassis_type_desc,
+      "serial_number": .serial_number
+    },
+
+    # OS information
+    "os": {
+      "name": (.platform_name + " " + .os_version),
+      "type_id": (
+        if .platform_name == "Mac" then 300
+        elif .platform_name == "Windows" then 100
+        elif .platform_name == "Linux" then 200
+        else 0
+        end
+      ),
+      "type": .platform_name,
+      "version": .os_version,
+      "build": .os_build,
+      "cpu_bits": (if .platform_name == "Mac" then 64 else null end),
+      "cpe_name": (
+        if .platform_name == "Mac" then
+          ("cpe:/o:apple:macos:" + (.os_version | split(" ")[0] | ascii_downcase))
+        else null
+        end
+      )
+    },
+
+    # Modified time if available
+    "modified_time": (if .modified_timestamp then (.modified_timestamp | format_timestamp) else null end)
+  },
+
+  "raw_data": (. | tostring),
+
+  # Optional fields that are present in source data
+  "unmapped": {
+    "agent_load_flags": .agent_load_flags,
+    "config_id_base": .config_id_base,
+    "config_id_build": .config_id_build,
+    "config_id_platform": .config_id_platform,
+    "kernel_version": .kernel_version,
+    "platform_id": .platform_id,
+    "platform_name": .platform_name,
+    "provision_status": .provision_status,
+    "reduced_functionality_mode": .reduced_functionality_mode,
+    "device_policies": .device_policies
+  }
+}

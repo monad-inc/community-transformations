@@ -1,0 +1,17 @@
+{
+  "name": "Crowdstrike Device Details to OCSF",
+  "description": "Transforms Crowdstrike device details into OCSF Schema",
+  "created_by": "Monad",
+  "tags": ["v1.1.0", "ocsf", "crowdstrike", "device", "inventory"],
+  "config": {
+    "operations": [
+      {
+        "operation": "jq",
+        "arguments": {
+          "key": "",
+          "query": "{{query.jq}}"
+        }
+      }
+    ]
+  }
+}

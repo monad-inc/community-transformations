@@ -1,0 +1,17 @@
+{
+  "name": "CrowdStrike Vulnerability Findings to OCSF",
+  "description": "Transforms CrowdStrike Vulnerability Findings data into OCSF Schema",
+  "created_by": "Monad",
+  "tags": ["v1.1.0", "ocsf", "crowdstrike", "vulnerability", "findings"],
+  "config": {
+    "operations": [
+      {
+        "operation": "jq",
+        "arguments": {
+          "key": "",
+          "query": "{{query.jq}}"
+        }
+      }
+    ]
+  }
+}
