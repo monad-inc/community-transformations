@@ -1,0 +1,142 @@
+name: "Tenable Assets to OCSF"
+description: "Transforms Tenable Asset Inventory into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "tenable-assets"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "tenable"
+  - "asset"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            # Static fields
+            "category_uid": 5,                    # Discovery
+            "class_uid": 5001,                    # Device Inventory Info
+            "activity_id": 2,                     # Collect
+            "type_uid": 500102,                   # Device Inventory Info: Collect
+            "severity_id": 1,                     # Informational
+          
+            # Dynamic time field - remove milliseconds and convert to epoch
+            "time": (
+              if .updated_at then
+                .updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+              else
+                now
+              end
+            ),
+          
+            # Device object with all available fields
+            "device": {
+              "type_id": 0,                       # Unknown
+              "uid": .id,
+              "hostname": (
+                if (.hostnames | length > 0) then
+                  .hostnames[0]
+                else
+                  ""
+                end
+              ),
+              "ip": (
+                if (.ipv4s | length > 0) then
+                  .ipv4s[0]
+                else
+                  null
+                end
+              ),
+              "mac": (
+                if (.mac_addresses | length > 0) then
+                  .mac_addresses[0]
+                else
+                  null
+                end
+              ),
+              # Additional fields
+              "first_seen_time": (
+                if .first_seen then
+                  .first_seen | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+                else
+                  null
+                end
+              ),
+              "last_seen_time": (
+                if .last_seen then
+                  .last_seen | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+                else
+                  null
+                end
+              ),
+              "network_interfaces": (
+                if (.network_interfaces | length > 0) then
+                  .network_interfaces
+                else
+                  []
+                end
+              ),
+              "region": (
+                if .aws_region then
+                  .aws_region
+                else
+                  null
+                end
+              ),
+              "type": (
+                if (.system_types | length > 0) then
+                  .system_types[0]
+                else
+                  null
+                end
+              ),
+              "domain": (
+                if (.fqdns | length > 0) then
+                  .fqdns[0]
+                else
+                  null
+                end
+              ),
+              "os": (
+                if (.operating_systems | length > 0) then
+                  .operating_systems[0]
+                else
+                  null
+                end
+              ),
+              "created_time": (
+                if .created_at then
+                  .created_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+                else
+                  null
+                end
+              ),
+              "modified_time": (
+                if .updated_at then
+                  .updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601
+                else
+                  null
+                end
+              ),
+              "zone": (
+                if .network_name then
+                  .network_name
+                else
+                  null
+                end
+              )
+            },
+          
+            # Static metadata
+            "metadata": {
+              "version": "1.1.0",
+              "product": {
+                "vendor_name": "Tenable"
+              }
+            },
+            "raw_data": (. | tostring)
+          }

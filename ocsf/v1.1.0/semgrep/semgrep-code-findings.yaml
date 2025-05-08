@@ -1,0 +1,67 @@
+name: "Semgrep Code Vulnerability Findings to OCSF"
+description: "Transforms Semgrep Code Vulnerability Findings into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "semgrep-code-findings"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "semgrep"
+  - "code"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "class_uid": 2002, # Vulnerability Finding
+            "category_uid": 2, # Findings
+            "type_uid": 200200, # Vulnerability Finding: Unknown
+            "activity_id": 0, # Unknown
+            "severity_id": (.severity | if . == "medium" then 2 else if . == "high" then 3 else if . == "critical" then 4 else 1 end end end),
+            "time": (.created_at | sub("\\.[0-9]+"; "") | fromdateiso8601),
+            "cloud": {
+              "provider": "Unknown",
+              "account": { "name": .repository.name }
+            },
+            "finding_info": {
+              "uid": .id | tostring,
+              "title": .rule_name,
+              "desc": .rule_message,
+              "first_seen_time": (.relevant_since | sub("\\.[0-9]+"; "") | fromdateiso8601)
+            },
+            "vulnerabilities": [{
+              "desc": .rule_message,
+              "severity": .severity,
+              "title": .rule_name,
+              "vendor_name": "Semgrep",
+              "first_seen_time": (.relevant_since | sub("\\.[0-9]+"; "") | fromdateiso8601),
+              "last_seen_time": (.created_at | sub("\\.[0-9]+"; "") | fromdateiso8601),
+              "cwe": {
+                "uid": (if .rule.cwe_names and .rule.cwe_names[0] then (.rule.cwe_names[0] | split("-")[1]) else null end),
+                "caption": (if .rule.cwe_names and .rule.cwe_names[0] then (.rule.cwe_names[0] | split(":")[1]) else null end)
+              },
+              "affected_code": [{
+                "file": {
+                  "path": .location.file_path,
+                  "name": (if .location.file_path then (.location.file_path | split("/")[-1]) else null end),
+                  "type_id": 0 #Unknown
+                },
+                "start_line": .location.line,
+                "end_line": .location.end_line
+              }],
+              "references": .rule.owasp_names
+            }],
+            "raw_data": (. | tostring),
+            "metadata": {
+              "version": "1.1.0",
+              "product": {
+                "vendor_name": "Semgrep",
+                "name": "Semgrep"
+              }
+            }
+          }

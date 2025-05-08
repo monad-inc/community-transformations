@@ -1,0 +1,61 @@
+name: "Tenable Vulnerability Findings to OCSF"
+description: "Transforms Tenable Vulnerability Findings into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "tenable-vulnerabilities"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "tenable"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            # Required OCSF Fields
+            "class_uid": 2002,
+            "category_uid": 2,
+            "type_uid": 200200,
+            "activity_id": 0,
+            "time": (.scan.started_at | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
+            "severity_id": .severity_id,
+          
+            # Metadata
+            "metadata": {
+              "version": "1.1.0",
+              "product": {
+                "vendor_name": "Tenable",
+                "name": "Nessus"
+              }
+            },
+          
+            # Raw data
+            "raw_data": (. | tostring),
+          
+            # Finding Info
+            "finding_info": {
+              "title": .plugin.name,
+              "uid": (.plugin.id | tostring),
+              "last_seen_time": (.last_found | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
+              "first_seen_time": (.first_found | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+            },
+          
+            # Vulnerabilities array
+            "vulnerabilities": [{
+              "desc": .plugin.description,
+              "name": .plugin.name,
+              "uid": (.plugin.id | tostring),
+              "cvss": {
+                "version": "3.0",
+                "vector": .plugin.cvss3_vector.raw,
+                "base_score": .plugin.cvss3_base_score
+              },
+              "remediation": {
+                "desc": .plugin.solution
+              }
+            }]
+          }

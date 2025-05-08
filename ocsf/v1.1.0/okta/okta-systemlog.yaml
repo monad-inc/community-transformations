@@ -1,0 +1,215 @@
+name: "Okta System Audit Logs to OCSF"
+description: "Transforms Okta System Audit Logs into OCSF Schema"
+created_by: "Monad"
+inputs:
+  - "okta-systemlog"
+outputs:
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "okta"
+  - "audit"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          def clean_timestamp($ts):
+            ($ts | split(".")[0] + "Z" | fromdateiso8601);
+          
+          def get_activity_details($event_type):
+            if ($event_type | strings and contains("user.authentication")) then
+              {activity: "Logon", activity_id: 1}
+            else
+              {activity: "Unknown", activity_id: 0}
+            end;
+          
+          def get_audit_category($event_type):
+            if ($event_type | strings and contains("user.authentication")) then
+              {category_name: "Audit Activity events", category_uid: 3}
+            else
+              {category_name: "Unknown", category_uid: 0}
+            end;
+          
+          def get_event_class:
+            {class_name: "Authentication", class_uid: 3002};
+          
+          def get_clear_text_value($auth_protocol):
+            if ($auth_protocol == null) then
+              true  # Return true for null values
+            elif ($auth_protocol | strings) then
+              $auth_protocol != "FTP" and $auth_protocol != "TELNET"
+            else
+              true  # Default case
+            end;
+          
+          def get_destination_endpoint($debug_data):
+            {
+              hostname: ($debug_data.requestUri // ""),
+              ip: "",
+              instance_uid: "",
+              interface_id: "",
+              svc_name: ($debug_data.url // "")
+            };
+          
+          def get_logon_type($transaction):
+            if ($transaction.type | strings and contains("WEB")) then
+              {logon_type: $transaction.type, logon_type_id: 99}
+            else
+              {logon_type: ($transaction.type // "UNKNOWN"), logon_type_id: 0}
+            end;
+          
+          def get_severity($severity):
+            if ($severity | strings and $severity == "INFO") then
+              {severity: $severity, severity_id: 1}
+            else
+              {severity: ($severity // "UNKNOWN"), severity_id: 0}
+            end;
+          
+          def get_src_endpoint($data):
+            {
+              hostname: ($data.debugContext.debugData.requestUri // ""),
+              "ip ": ($data.client.ipAddress // ""),
+              interface_id: ($data.client.device // "")
+            };
+          
+          def get_src_user($data):
+            {
+              type: ($data.actor.type // ""),
+              name: ($data.actor.displayName // ""),
+              email_addr: ($data.actor.alternateId // "")
+            };
+          
+          def get_status_details($data):
+            if ($data.outcome.result | strings and $data.outcome.result == "SUCCESS") then
+              {
+                status: $data.outcome.result,
+                status_code: "N/A",
+                status_detail: "LOGON_USER_INITIATED",
+                status_id: 1
+              }
+            else
+              {
+                status: ($data.outcome.result // "UNKNOWN"),
+                status_code: "N/A",
+                status_detail: "",
+                status_id: -1
+              }
+            end;
+          
+          def get_enrichment_data($client_data):
+            [{
+              name: "geographicalContext",
+              data: ($client_data.geographicalContext // {}),
+              value: ($client_data.ipAddress // ""),
+              type: "location"
+            }];
+          
+          def get_actor_data($actor_data):
+            if $actor_data == null then 
+              null 
+            else 
+              # Find the first element where type is "User"
+              ($actor_data | map(select(.type == "User")) | first) // null |
+              if . != null then {
+                "user": {
+                  "uid": .id,
+                  "name": .displayName,
+                  "email_addr": .alternateId
+                }
+              } else null end
+            end;
+          
+          def get_type_category($event_type):
+            if ($event_type | strings and contains("user.authentication")) then
+              {type_name: "Authentication Audit: Logon", type_uid: 300201}
+            else
+              {type_name: "Unknown", type_uid: 0}
+            end;
+          
+          def get_metadata($time; $version):
+            {
+              original_time: ($time // ""),
+              product: {
+                vendor_name: "Okta",
+                name: "Okta System Log"
+              },
+              version: ($version // "0")
+            };
+          
+          def get_auth_protocol($auth_provider):
+            if ($auth_provider == null) then
+              {auth_protocol: "Unknown", auth_protocol_id: 0}
+            elif ($auth_provider | strings and contains("FACTOR")) then
+              {auth_protocol: "Other / MFA", auth_protocol_id: 1}
+            else
+              {auth_protocol: "Unknown", auth_protocol_id: 0}
+            end;
+          
+          def transform_data:
+            . as $data |
+            {
+            # Base OCSF Fields
+            time: clean_timestamp($data.published),
+            activity_name: (get_activity_details($data.eventType).activity),
+            activity_id: (get_activity_details($data.eventType).activity_id),
+            category_name: (get_audit_category($data.eventType).category_name),
+            category_uid: (get_audit_category($data.eventType).category_uid),
+            class_name: get_event_class.class_name,
+            class_uid: get_event_class.class_uid,
+            type_name: (get_type_category($data.eventType).type_name),
+            type_uid: (get_type_category($data.eventType).type_uid),
+          
+            # Authentication Details
+            authentication_info: {
+              auth_protocol: (get_auth_protocol($data.authenticationContext.authenticationProvider).auth_protocol),
+              auth_protocol_id: (get_auth_protocol($data.authenticationContext.authenticationProvider).auth_protocol_id),
+              is_cleartext: get_clear_text_value($data.authenticationContext.authenticationProvider),
+              session_uid: ($data.authenticationContext.externalSessionId // "")
+            },
+          
+            # Source and Destination Information
+            src_endpoint: get_src_endpoint($data),
+            dst_endpoint: get_destination_endpoint($data.debugContext.debugData),
+          
+            # User Information
+            src_user: get_src_user($data),
+            dst_user: ($data.actor.alternateId // ""),
+            user_info: {
+              name: ($data.actor.displayName // ""),
+              type: ($data.actor.type // ""),
+              email_addr: ($data.actor.alternateId // "")
+            },
+          
+            # Status and Severity Details
+            severity: (get_severity($data.severity).severity),
+            severity_id: (get_severity($data.severity).severity_id),
+            status: (get_status_details($data).status),
+            status_code: (get_status_details($data).status_code),
+            status_detail: (get_status_details($data).status_detail),
+            status_id: (get_status_details($data).status_id),
+          
+            # Login Information
+            logon_info: {
+              type: (get_logon_type($data.transaction).logon_type),
+              type_id: (get_logon_type($data.transaction).logon_type_id)
+            },
+          
+            # Actor Information
+            actor: (get_actor_data($data.target)),
+          
+            # Enrichment Data
+            enrichments: get_enrichment_data($data.client),
+          
+            # Metadata
+            metadata: get_metadata($data.published; $data.version),
+          
+            # Additional Context
+            raw_data: (. | tostring),
+            display_message: ($data.displayMessage // ""),
+            ref_time: ($data.published // "")
+          };
+          
+          transform_data
