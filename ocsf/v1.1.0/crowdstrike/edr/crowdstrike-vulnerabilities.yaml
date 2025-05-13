@@ -1,9 +1,10 @@
   name: "CrowdStrike Vulnerability Findings to OCSF"
   description: "Transforms CrowdStrike Vulnerability Findings data into OCSF Schema"
-  created_by: "Monad"
+  author: "Monad"
+  contributors:
+    - "https://github.com/Credgate"
   inputs:
     - "crowdstrike-vulnerabilities"
-  outputs:
   tags:
     - "v1.1.0"
     - "ocsf"

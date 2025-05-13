@@ -1,9 +1,10 @@
 name: "Wiz Vulnerabilities to OCSF"
 description: "Transforms Wiz Vulnerabilities into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "wiz-vulnerabilities"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

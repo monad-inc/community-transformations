@@ -1,9 +1,10 @@
 name: "Okta System Audit Logs to OCSF"
 description: "Transforms Okta System Audit Logs into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "okta-systemlog"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

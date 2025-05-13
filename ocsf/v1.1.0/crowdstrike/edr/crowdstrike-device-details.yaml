@@ -1,9 +1,10 @@
 name: "Crowdstrike Device Details to OCSF"
 description: "Transforms Crowdstrike device details into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "crowdstrike-device-details"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

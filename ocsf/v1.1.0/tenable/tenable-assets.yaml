@@ -1,9 +1,10 @@
 name: "Tenable Assets to OCSF"
 description: "Transforms Tenable Asset Inventory into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "tenable-assets"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

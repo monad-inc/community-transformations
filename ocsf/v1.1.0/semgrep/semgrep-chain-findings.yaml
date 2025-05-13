@@ -1,9 +1,10 @@
 name: "Semgrep Supply Chain Findings to OCSF"
 description: "Transforms Semgrep Supply Chain Findings into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "semgrep-chain-findings"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"
