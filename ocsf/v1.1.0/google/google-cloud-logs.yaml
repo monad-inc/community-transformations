@@ -1,9 +1,10 @@
 name: "Google Cloud Audit Logs to OCSF"
 description: "Transforms Google Cloud Audit Logs into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "google-cloud-logs"
-outputs:
 tags:
   - "v1.0.0"
   - "ocsf"

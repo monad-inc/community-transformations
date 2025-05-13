@@ -1,9 +1,10 @@
 name: "Semgrep Code Vulnerability Findings to OCSF"
 description: "Transforms Semgrep Code Vulnerability Findings into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "semgrep-code-findings"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

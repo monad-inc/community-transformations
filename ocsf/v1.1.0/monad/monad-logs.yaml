@@ -1,9 +1,10 @@
 name: "Monad Organization Logs to OCSF"
 description: "Transforms Monad Organization Logs into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "monad-logs"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

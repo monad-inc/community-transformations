@@ -1,9 +1,10 @@
 name: "Snyk Issue Findings to OCSF"
 description: "Transforms Snyk Issue Findings into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "snyk-issues"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"

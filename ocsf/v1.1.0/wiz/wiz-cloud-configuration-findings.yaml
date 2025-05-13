@@ -1,9 +1,10 @@
 name: "Wiz Cloud Config Findings to OCSF"
 description: "Transforms Wiz Cloud Config Findings into OCSF Schema"
-created_by: "Monad"
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
 inputs:
   - "wiz-cloud-configuration-findings"
-outputs:
 tags:
   - "v1.1.0"
   - "ocsf"
