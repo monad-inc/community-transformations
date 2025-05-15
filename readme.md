@@ -80,7 +80,7 @@ Create your transformation following the guidelines below:
 
 ### 4. Submit a Pull Request
 
-- Push your changes to your forked repository
+- Push your changes to branch
 - Create a pull request to the main repository
 - Include a detailed description of your transformation and its use cases
 
