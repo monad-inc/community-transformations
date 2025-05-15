@@ -148,14 +148,6 @@ contributors:
 
 This ensures proper credit is given to both original creators and those who improve transformations over time.
 
-## Community Support
-
-- For questions, join our [Community Slack Channel](#)
-- Report issues on the GitHub repository
-- For feature requests, please use the issue template
-
-
-
 ---
 
 Thank you for contributing to the Monad community! Your transformations help make our platform more powerful and useful for everyone.
