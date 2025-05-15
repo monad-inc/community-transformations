@@ -90,18 +90,6 @@ Create your transformation following the guidelines below:
 - You may receive feedback or requests for changes
 - Once approved, your transformation will be merged and become available in the next sync
 
-## Coding Standards and Best Practices
-
-### General Guidelines
-
-1. **Clear Structure**: Organize your transformation logically with proper indentation
-2. **Descriptive Names**: Use meaningful variable and function names
-3. **Error Handling**: Include proper error handling where appropriate
-4. **Performance**: Optimize transformations for performance with large datasets
-5. **Reusability**: Design transformations to be reusable across different contexts
-
-
-
 ### Documentation Requirements
 
 Each transformation should include:
