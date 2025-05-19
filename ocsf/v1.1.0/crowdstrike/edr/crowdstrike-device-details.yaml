@@ -29,7 +29,7 @@ config:
             "type_name": "Device Information",
             "severity_id": 0,
             "severity": "Info",
-            "time": (.agent_local_time | format_timestamp),
+            "time": (if .agent_local_time | type == "string" then (.agent_local_time | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime) else .agent_local_time end),
             "status": "Success",
             "status_id": 0,
 
@@ -65,8 +65,8 @@ config:
               "domain": null,
               "ip": .local_ip,
               "mac": .mac_address,
-              "first_seen_time": (.first_seen | format_timestamp),
-              "last_seen_time": (.last_seen | format_timestamp),
+              "first_seen_time": (if .first_seen | type == "string" then (.first_seen | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime) else .first_seen end),
+              "last_seen_time": (if .last_seen | type == "string" then (.last_seen | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime) else .last_seen end),
               "is_managed": (.provision_status == "Provisioned"),
 
               # Network interfaces array
@@ -136,7 +136,7 @@ config:
               },
 
               # Modified time if available
-              "modified_time": (if .modified_timestamp then (.modified_timestamp | format_timestamp) else null end)
+              "modified_time": (if .modified_timestamp then (if .modified_timestamp | type == "string" then (.modified_timestamp | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime) else .modified_timestamp end) else null end)
             },
 
             "raw_data": (. | tostring),

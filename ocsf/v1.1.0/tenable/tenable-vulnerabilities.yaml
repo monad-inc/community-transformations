@@ -22,7 +22,7 @@ config:
             "category_uid": 2,
             "type_uid": 200200,
             "activity_id": 0,
-            "time": (.scan.started_at | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
+            "time": (.scan.started_at | gsub("\\.[0-9]+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
             "severity_id": .severity_id,
           
             # Metadata
@@ -41,8 +41,8 @@ config:
             "finding_info": {
               "title": .plugin.name,
               "uid": (.plugin.id | tostring),
-              "last_seen_time": (.last_found | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
-              "first_seen_time": (.first_found | gsub("\\\.\\d+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+              "last_seen_time": (.last_found | gsub("\\.[0-9]+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime),
+              "first_seen_time": (.first_found | gsub("\\.[0-9]+Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
             },
           
             # Vulnerabilities array
