@@ -18,114 +18,202 @@ config:
         query: |
           {
             # Required OCSF Fields
-            "activity_id": 0,
-            "category_uid": 2,
-            "class_uid": 2002,
-            "type_uid": 200200,
-            "time": (if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
+            "activity_id": 1,  # 1 = Create for new findings
+            "category_uid": 2,  # Findings
+            "class_uid": 2002,  # Vulnerability Finding
+            "type_uid": 200201,  # Vulnerability Finding: Create
+            "time": (
+              if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              elif .FirstDetected then (.FirstDetected | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              else (now | floor)
+              end
+            ),
           
             # Time fields
-            "start_time": (if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
-            "end_time": (if .lastDetectedAt then (.lastDetectedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else 0 end),
+            "start_time": (
+              if .firstDetectedAt then (.firstDetectedAt | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              elif .FirstDetected then (.FirstDetected | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              else null
+              end
+            ),
+            "end_time": (
+              if .lastDetectedAt then (.lastDetectedAt | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              elif .LastDetected then (.LastDetected | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              else null
+              end
+            ),
+          
+            # Status mapping
+            "status_id": (
+              if (.status // .FindingStatus) == "OPEN" or (.status // .FindingStatus) == "Open" then 1
+              elif (.status // .FindingStatus) == "IN_PROGRESS" or (.status // .FindingStatus) == "InProgress" then 2
+              elif (.status // .FindingStatus) == "RESOLVED" or (.status // .FindingStatus) == "Resolved" then 99
+              else 0
+              end
+            ),
           
             # Severity mapping
             "severity_id": (
-              if .vendorSeverity == "MEDIUM" then 2
-              elif .vendorSeverity == "HIGH" then 3
-              elif .vendorSeverity == "LOW" then 1
-              elif .vendorSeverity == "CRITICAL" then 5
-              else 0 
+              if (.vendorSeverity // .VendorSeverity) == "CRITICAL" or (.vendorSeverity // .VendorSeverity) == "Critical" then 5
+              elif (.vendorSeverity // .VendorSeverity) == "HIGH" or (.vendorSeverity // .VendorSeverity) == "High" then 4
+              elif (.vendorSeverity // .VendorSeverity) == "MEDIUM" or (.vendorSeverity // .VendorSeverity) == "Medium" then 3
+              elif (.vendorSeverity // .VendorSeverity) == "LOW" or (.vendorSeverity // .VendorSeverity) == "Low" then 2
+              elif (.vendorSeverity // .VendorSeverity) == "INFORMATIONAL" or (.vendorSeverity // .VendorSeverity) == "Informational" then 1
+              else 0
               end
             ),
           
             # Finding Info
             "finding_info": {
-              "title": .name,
-              "desc": .description,
-              "uid": .id,
-              "status": .status,
-              "resolution_reason": .resolutionReason,
-              "resolved_at": (if .resolvedAt then (.resolvedAt | gsub("\\.[0-9]+"; "") | fromdateiso8601) else null end)
+              "title": (.name // .Name),
+              "desc": (.description // .Description),
+              "uid": (.id // .ID),
+              "types": ["Vulnerability"],
+              "src_url": (.portalUrl // .WizURL)
             },
           
             # Vulnerabilities array
             "vulnerabilities": [
               {
                 "cve": {
-                  "uid": .name,
-                  "description": .CVEDescription
+                  "uid": (.name // .Name),
+                  "cvss": (
+                    if .score or .Score then {
+                      "base_score": (.score // .Score),
+                      "severity": (.CVSSSeverity // .CVSSSeverity)
+                    }
+                    else null
+                    end
+                  )
                 },
-                "title": .name,
-                "desc": .description,
-                "remediation": {
-                  "desc": .remediation,
-                  "fixed_version": .fixedVersion
-                },
-                "severity": .vendorSeverity,
-                "scores": {
-                  "cvss_severity": .CVSSSeverity,
-                  "epss": {
-                    "percentile": .epssPercentile,
-                    "probability": .epssProbability,
-                    "severity": .epssSeverity
-                  },
-                  "exploitability": .exploitabilityScore,
-                  "impact": .impactScore
-                },
-                "package": {
-                  "name": .detailedName,
-                  "version": .version
-                },
-                "metadata": {
-                  "has_exploit": .hasExploit,
-                  "has_cisa_kev_exploit": .hasCisaKevExploit
-                }
+                "desc": (.CVEDescription // .CVEDescription),
+                "severity": (.vendorSeverity // .VendorSeverity),
+                "is_exploit_available": (.hasExploit // .HasExploit),
+                "is_fix_available": (if (.fixedVersion // .FixedVersion) then true else false end),
+                "packages": [
+                  {
+                    "name": (.detailedName // .DetailedName),
+                    "version": (.version // .Version),
+                    "fix_version": (.fixedVersion // .FixedVersion)
+                  }
+                ],
+                "references": (
+                  if .link then [.link]
+                  elif .Link then [.Link]
+                  else []
+                  end
+                ),
+                "vendor_name": "Wiz"
               }
             ],
           
             # Resource details
-            "resource": {
-              "type": .vulnerableAsset.type,
-              "name": .vulnerableAsset.name,
-              "id": .vulnerableAsset.id,
-              "status": .vulnerableAsset.status,
-              "image": {
-                "id": .vulnerableAsset.imageId,
-                "registry": .vulnerableAsset.registry.name,
-                "repository": .vulnerableAsset.repository.name
-              },
-              "tags": .vulnerableAsset.tags
-            },
+            "resources": [
+              {
+                "uid": (.vulnerableAsset.id // .AssetID),
+                "name": (.vulnerableAsset.name // .AssetName),
+                "type": (.vulnerableAsset.type // .OperatingSystem // "Unknown"),
+                "cloud_partition": (.vulnerableAsset.cloudPlatform // .CloudPlatform),
+                "region": (.vulnerableAsset.region // .AssetRegion),
+                "data": {
+                  "provider_unique_id": (.vulnerableAsset.providerUniqueId // .ProviderUniqueId),
+                  "status": (.vulnerableAsset.status // .Status),
+                  "ip_addresses": (.vulnerableAsset.ipAddresses // .IpAddresses),
+                  "image": (
+                    if .vulnerableAsset.imageId then {
+                      "id": .vulnerableAsset.imageId,
+                      "registry": .vulnerableAsset.registry.name,
+                      "repository": .vulnerableAsset.repository.name
+                    }
+                    else null
+                    end
+                  )
+                },
+                "labels": (
+                  if .vulnerableAsset.tags then [.vulnerableAsset.tags | to_entries[] | {key: .key, value: (.value | tostring)}]
+                  elif .Tags then [.Tags | to_entries[] | {key: .key, value: (.value | tostring)}]
+                  else []
+                  end
+                )
+              }
+            ],
           
-            # Cloud context
+            # Cloud details
             "cloud": {
-              "provider": .vulnerableAsset.cloudPlatform,
-              "subscription": {
-                "id": .vulnerableAsset.subscriptionId,
-                "name": .vulnerableAsset.subscriptionName,
-                "external_id": .vulnerableAsset.subscriptionExternalId
-              },
-              "region": .vulnerableAsset.region
-            },
-          
-            # Metadata
-            "metadata": {
-              "product": {
-                "name": "Wiz",
-                "vendor_name": "Wiz"
-              },
-              "version": "1.1.0",
-              "detection_details": {
-                "method": .detectionMethod,
-                "validation": .validatedInRuntime
-              },
-              "source": {
-                "name": .dataSourceName,
-                "link": .link,
-                "portal_url": .portalUrl
+              "provider": (.vulnerableAsset.cloudPlatform // .CloudPlatform),
+              "region": (.vulnerableAsset.region // .AssetRegion),
+              "account": {
+                "uid": (.vulnerableAsset.subscriptionId // .SubscriptionId),
+                "name": (.vulnerableAsset.subscriptionName // .SubscriptionName)
               }
             },
           
+            # Evidence/Remediation
+            "evidences": (
+              [
+                (if (.remediation // .Remediation) then {
+                  "type": "remediation",
+                  "data": {"text": (.remediation // .Remediation)}
+                } else empty end),
+                (if .CloudProviderURL then {
+                  "type": "resource_link",
+                  "data": {"url": .CloudProviderURL}
+                } else empty end)
+              ] | select(length > 0)
+            ),
+          
+            # Metadata
+            "metadata": {
+              "uid": (.id // .ID),
+              "version": "1.1.0",
+              "product": {
+                "name": "Wiz",
+                "vendor_name": "Wiz, Inc.",
+                "version": "1.0"
+              },
+              "profiles": ["cloud"],
+              "labels": (
+                [
+                  (if .projects then (.projects[] | {key: "project", value: .}) else empty end),
+                  (if .Projects then (.Projects[] | {key: "project", value: .}) else empty end),
+                  {key: "detection_method", value: (.detectionMethod // .DetectionMethod)},
+                  {key: "location_path", value: (.locationPath // .LocationPath)},
+                  (if (.hasCisaKevExploit // .HasCisaKevExploit) then {key: "cisa_kev", value: "true"} else empty end),
+                  (if (.exploitabilityScore // .ExploitabilityScore) then {key: "exploitability_score", value: ((.exploitabilityScore // .ExploitabilityScore) | tostring)} else empty end),
+                  (if (.impactScore // .ImpactScore) then {key: "impact_score", value: ((.impactScore // .ImpactScore) | tostring)} else empty end),
+                  (if .validatedInRuntime then {key: "validated_in_runtime", value: (.validatedInRuntime | tostring)} else empty end),
+                  (if .dataSourceName then {key: "data_source", value: .dataSourceName} else empty end)
+                ] | map(select(. != null and .value != null))
+              )
+            },
+          
+            # Observables
+            "observables": [
+              {
+                "name": "resource.uid",
+                "type": "Resource UID",
+                "type_id": 10,
+                "value": (.vulnerableAsset.id // .AssetID)
+              },
+              (if ((.name // .Name) | test("^CVE-")) then {
+                "name": "cve.uid",
+                "type": "CVE ID",
+                "type_id": 27,
+                "value": (.name // .Name)
+              } else empty end)
+            ],
+          
             # Raw data
-            "raw_data": (. | tostring)
+            "raw_data": (. | tostring),
+          
+            # Additional OCSF fields
+            "confidence_id": 3,  # High confidence
+            "impact_id": (
+              if (.vendorSeverity // .VendorSeverity) == "CRITICAL" or (.vendorSeverity // .VendorSeverity) == "Critical" then 5
+              elif (.vendorSeverity // .VendorSeverity) == "HIGH" or (.vendorSeverity // .VendorSeverity) == "High" then 4
+              elif (.vendorSeverity // .VendorSeverity) == "MEDIUM" or (.vendorSeverity // .VendorSeverity) == "Medium" then 3
+              elif (.vendorSeverity // .VendorSeverity) == "LOW" or (.vendorSeverity // .VendorSeverity) == "Low" then 2
+              else 0
+              end
+            )
           }
