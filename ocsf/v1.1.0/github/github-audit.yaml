@@ -1,0 +1,283 @@
+name: "GitHub Audit Logs to OCSF"
+description: "Transforms GitHub Organization Audit Logs into OCSF Schema with intelligent event categorization"
+author: "https://github.com/atbabers"
+contributors: []
+inputs:
+  - "github-audit"
+tags:
+  - "v1.1.0"
+  - "ocsf"
+  - "github"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          def clean_timestamp($ts):
+            if $ts == null then
+              (now * 1000 | floor)
+            elif ($ts | type) == "number" then
+              $ts
+            else
+              ($ts | fromdateiso8601 * 1000 | floor)
+            end;
+          
+          def get_event_category($action):
+            if ($action | strings) then
+              # Authentication & Identity events
+              if ($action | test("(?i)oauth_|sso|authentication|login|logout|token|credential|access_token|personal_access_token")) then
+                {category_uid: 3, category_name: "Identity & Access Management", class_uid: 3002, class_name: "Authentication"}
+              # Security & Compliance findings
+              elif ($action | test("(?i)secret_scanning|vulnerability|advisory|code_scanning|security|dependabot|compliance|policy|audit")) then
+                {category_uid: 2, category_name: "Findings", class_uid: 2004, class_name: "Detection Finding"}
+              # System administration events
+              elif ($action | test("(?i)billing|business|enterprise|organization|account\\.")) then
+                {category_uid: 1, category_name: "System Activity", class_uid: 1001, class_name: "System Activity"}
+              # Repository and application activity
+              else
+                {category_uid: 6, category_name: "Application Activity", class_uid: 6003, class_name: "API Activity"}
+              end
+            else
+              {category_uid: 6, category_name: "Application Activity", class_uid: 6003, class_name: "API Activity"}
+            end;
+          
+                    def get_activity_mapping($action; $category_uid):
+            if $category_uid == 3 then
+              # Authentication events
+              if ($action | strings and ($action | test("(?i)login|signin|authenticate"))) then
+                {activity_id: 1, activity_name: "Logon"}
+              elif ($action | strings and ($action | test("(?i)logout|signout|revoke"))) then
+                {activity_id: 2, activity_name: "Logoff"}
+              elif ($action | strings and ($action | test("(?i)token|credential"))) then
+                {activity_id: 3, activity_name: "Authentication Ticket"}
+              else
+                {activity_id: 0, activity_name: "Unknown"}
+              end
+            elif $category_uid == 2 then
+              # Security findings - map based on action type
+              if ($action | strings and ($action | test("(?i)create|enable|add"))) then
+                {activity_id: 1, activity_name: "Create"}
+              elif ($action | strings and ($action | test("(?i)update|modify|change"))) then
+                {activity_id: 2, activity_name: "Update"}
+              elif ($action | strings and ($action | test("(?i)remove|delete|disable"))) then
+                {activity_id: 3, activity_name: "Delete"}
+              else
+                {activity_id: 1, activity_name: "Create"}
+              end
+            elif $category_uid == 1 then
+              # System Activity
+              if ($action | strings and ($action | test("(?i)create|add|enable|setup"))) then
+                {activity_id: 1, activity_name: "Create"}
+              elif ($action | strings and ($action | test("(?i)update|modify|change|configure"))) then
+                {activity_id: 2, activity_name: "Update"}
+              elif ($action | strings and ($action | test("(?i)delete|remove|disable|destroy"))) then
+                {activity_id: 3, activity_name: "Delete"}
+              elif ($action | strings and ($action | test("(?i)start|restart|run"))) then
+                {activity_id: 4, activity_name: "Start"}
+              elif ($action | strings and ($action | test("(?i)stop|suspend|cancel"))) then
+                {activity_id: 5, activity_name: "Stop"}
+              else
+                {activity_id: 0, activity_name: "Other"}
+              end
+            else
+              # Application Activity
+              if ($action | strings) then
+                if ($action | test("(?i)create|add|submit|open|request|invite|fork")) then
+                  {activity_id: 1, activity_name: "Create"}
+                elif ($action | test("(?i)read|access|view|download|get|list|fetch|clone")) then
+                  {activity_id: 2, activity_name: "Read"}
+                elif ($action | test("(?i)update|edit|modify|change|merge|approve|review")) then
+                  {activity_id: 3, activity_name: "Update"}
+                elif ($action | test("(?i)delete|remove|destroy|close|cancel|reject")) then
+                  {activity_id: 4, activity_name: "Delete"}
+                elif ($action | test("(?i)push|commit|deploy|publish|transfer|move")) then
+                  {activity_id: 5, activity_name: "Execute"}
+                else
+                  {activity_id: 0, activity_name: "Other"}
+                end
+              else
+                {activity_id: 0, activity_name: "Unknown"}
+              end
+            end;
+          
+          def get_type_uid($class_uid; $activity_id):
+            ($class_uid * 100) + $activity_id;
+          
+          def get_severity_id($action):
+            if ($action | strings) then
+              # Only assign specific severity for clearly risky events
+              if ($action | test("(?i)delete|destroy|disable.*admin|remove.*admin|revoke.*admin|transfer.*ownership")) then 6
+              elif ($action | test("(?i)secret_scanning|vulnerability|security.*alert|malicious")) then 4  
+              elif ($action | test("(?i)failed|error|reject|deny|unauthorized")) then 3
+              # Default to informational for most actions since we don't know success/failure
+              else 1
+              end
+            else 1
+            end;
+          
+          def extract_actor($actor; $actor_id; $email):
+            if ($actor // $actor_id // $email) then {
+              "user": ({} + 
+              (if $actor and $actor != "" then {"name": $actor} else {} end) +
+              (if $actor_id and $actor_id != "" then {"uid": ($actor_id | tostring)} else {} end) +
+              (if $email and $email != "" then {"email_addr": $email} else {} end))
+            } else null end;
+          
+          def extract_src_endpoint($actor_ip; $actor_location; $user_agent):
+            {} +
+            (if $actor_ip and $actor_ip != "" then {"ip": $actor_ip} else {} end) +
+            (if $user_agent and $user_agent != "" then {"user_agent": $user_agent} else {} end) +
+            (if $actor_location then {
+              "location": ({} +
+                (if $actor_location.city and $actor_location.city != "" then {"city": $actor_location.city} else {} end) +
+                (if ($actor_location.country_name // $actor_location.country_code) and ($actor_location.country_name // $actor_location.country_code) != "" then {"country": ($actor_location.country_name // $actor_location.country_code)} else {} end) +
+                (if ($actor_location.region_name // $actor_location.region) and ($actor_location.region_name // $actor_location.region) != "" then {"region": ($actor_location.region_name // $actor_location.region)} else {} end) +
+                (if $actor_location and $actor_location.location and $actor_location.location.lon and $actor_location.location.lat then {"coordinates": [$actor_location.location.lon, $actor_location.location.lat]} else {} end))
+            } else {} end);
+          
+          def extract_resources($repo; $org; $user; $team; $user_id; $event):
+            [
+              (if $repo then ({} +
+              (if ($repo | type) == "string" and $repo != "" then {"name": $repo} else {} end) +
+              (if ($repo | type) == "object" and $repo and $repo.name and $repo.name != "" then {"name": $repo.name} else {} end) +
+              (if ($repo | type) == "object" and $repo and $repo.id and $repo.id != "" then {"uid": ($repo.id | tostring)} else {} end) +
+              (if $event and $event.repo_id and $event.repo_id != "" then {"uid": ($event.repo_id | tostring)} else {} end)) else null end),
+              (if $org then ({} +
+              (if ($org | type) == "string" and $org != "" then {"name": $org} else {} end) +
+              (if ($org | type) == "object" and $org and $org.name and $org.name != "" then {"name": $org.name} else {} end) +
+              (if ($org | type) == "object" and $org and $org.id and $org.id != "" then {"uid": ($org.id | tostring)} else {} end) +
+              (if $event and $event.org_id and $event.org_id != "" then {"uid": ($event.org_id | tostring)} else {} end)) else null end),
+              (if $user and $user != "" then ({
+                "name": $user
+              } +
+              (if $user_id and $user_id != "" then {"uid": ($user_id | tostring)} else {} end)) else null end),
+              (if $team and $team != "" then {
+                "name": $team
+              } else null end),
+              (if $event and $event.business and $event.business != "" then ({
+                "name": $event.business
+              } +
+              (if $event and $event.business_id and $event.business_id != "" then {"uid": ($event.business_id | tostring)} else {} end)) else null end)
+            ] | map(select(. != null and (.name // .uid)));
+          
+          def extract_api_details($action; $method; $url; $request_id):
+            {} +
+            (if $action and $action != "" then {"operation": $action} else {} end) +
+            (if ($method and $method != "") or ($url and $url != "") or ($request_id and $request_id != "") then {
+              "request": ({} +
+                (if $method and $method != "" then {"method": $method} else {} end) +
+                (if $url and $url != "" then {"url": $url} else {} end) +
+                (if $request_id and $request_id != "" then {"uid": $request_id} else {} end))
+            } else {} end);
+          
+
+          def extract_enrichments($data; $event):
+            [
+              (if $data then {
+                "name": "additional_data",
+                "data": $data
+              } else null end),
+              (if $event and $event.workflow_id then {
+                "name": "workflow_context",
+                "data": ({} +
+                  (if $event.workflow_id then {"workflow_id": $event.workflow_id} else {} end) +
+                  (if $event.workflow_run_id then {"workflow_run_id": $event.workflow_run_id} else {} end) +
+                  (if $event.run_number then {"run_number": $event.run_number} else {} end) +
+                  (if $event.conclusion then {"conclusion": $event.conclusion} else {} end))
+              } else null end),
+              (if $event and $event.pull_request_id then {
+                "name": "pull_request_context", 
+                "data": ({} +
+                  (if $event.pull_request_id then {"pull_request_id": $event.pull_request_id} else {} end) +
+                  (if $event.pull_request_title then {"pull_request_title": $event.pull_request_title} else {} end) +
+                  (if $event.pull_request_url then {"pull_request_url": $event.pull_request_url} else {} end))
+              } else null end)
+            ] | map(select(. != null));
+          
+          def get_disposition($action):
+            # Only set disposition if the action explicitly indicates success/failure
+            if ($action | strings) then
+              if ($action | test("(?i)fail|error|reject|deny|cancel|timeout")) then
+                {disposition: "Failed", disposition_id: 2}
+              elif ($action | test("(?i)block|prevent|restrict")) then  
+                {disposition: "Blocked", disposition_id: 5}
+              else
+                {disposition: "Unknown", disposition_id: 0}
+              end
+            else
+              {disposition: "Unknown", disposition_id: 0}
+            end;
+
+          def get_metadata:
+            {
+              "version": "1.1.0"
+            };
+          
+          def transform_data:
+            . as $event |
+            get_event_category($event.action) as $event_cat |
+            get_activity_mapping($event.action; $event_cat.category_uid) as $activity |
+            get_disposition($event.action) as $disposition |
+            
+            # Main transformation
+            {
+              # Required OCSF Base Event Fields
+              "category_uid": $event_cat.category_uid,
+              "category_name": $event_cat.category_name,
+              "class_uid": $event_cat.class_uid,
+              "class_name": $event_cat.class_name,
+              "activity_id": $activity.activity_id,
+              "activity_name": $activity.activity_name,
+              "type_uid": get_type_uid($event_cat.class_uid; $activity.activity_id),
+              "time": clean_timestamp($event."@timestamp" // $event.created_at),
+              "severity_id": get_severity_id($event.action),
+              
+              # Metadata (required)
+              "metadata": get_metadata,
+              
+              # Actor information (only if we have actor data)
+              "actor": (extract_actor($event.actor; $event.actor_id; $event.email) // null)
+            } +
+            
+            # Source endpoint information (only if we have endpoint data)
+            (if ($event.actor_ip and $event.actor_ip != "") or $event.actor_location or ($event.user_agent and $event.user_agent != "") then {
+              "src_endpoint": extract_src_endpoint($event.actor_ip; $event.actor_location; $event.user_agent)
+            } else {} end) +
+            
+            {
+              
+              # Resources affected
+              "resources": extract_resources($event.repo; $event.org; $event.user; $event.team; $event.user_id; $event)
+            } +
+            
+            # API Activity details (only for app activity events - category 6)
+            (if $event_cat.category_uid == 6 then {
+              "api": extract_api_details($event.action; $event.method; $event.url; $event.request_id)
+            } else {} end) +
+            
+                        # Authentication details (only for auth events - category 3, and only if we have auth data)
+            (if $event_cat.category_uid == 3 and $event.actor then {
+              "user": (extract_actor($event.actor; $event.actor_id; $event.email).user // {})
+            } else {} end) +
+            
+            {
+              # Disposition information (only if we can infer from event data)
+              "disposition": $disposition.disposition,
+              "disposition_id": $disposition.disposition_id,
+              "message": (
+                ($event_cat.category_name // "") + 
+                (if $event_cat.category_name then ": " else "" end) + 
+                ($activity.activity_name // "") +
+                (if $activity.activity_name and $event.action then " - " else "" end) +
+                ($event.action // "") +
+                (if $event.actor then " by " + $event.actor else "" end) +
+                (if $event.repo then " on " + $event.repo else "" end)
+              ),
+              
+              # Enrichment data
+              "enrichments": extract_enrichments($event.data; $event)
+            };
+          
+          transform_data 
