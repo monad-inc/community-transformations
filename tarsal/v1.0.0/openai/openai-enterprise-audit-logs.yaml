@@ -1,0 +1,25 @@
+name: "Sentry User Events to Tarsal"
+description: "Transforms Sentry User Events into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "openai-enterprise-audit-logs"
+tags:
+  - "v1.0.0"
+  - "openai"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "data": . + {
+                "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_event_time": .dateCreated,
+                "t_ip_address": .ipAddress,
+                "t_email_address": .actor?.email // null
+            }
+          }
