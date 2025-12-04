@@ -1,0 +1,25 @@
+name: "Clumio Consolidated Alerts to Tarsal"
+description: "Transforms Clumio Consolidated Alerts into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "clumio-consolidated-alerts"
+tags:
+  - "v1.0.0"
+  - "clumio"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "data": . + {
+                "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_event_time": .raised_timestamp,
+                "t_ip_address": .ip_address // null,
+                "t_email_address": .user_email // null
+            }
+          }

@@ -1,0 +1,25 @@
+name: "Twilio Events to Tarsal"
+description: "Transforms Twilio events into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "twilio-events"
+tags:
+  - "v1.0.0"
+  - "twilio"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+          "data": . + {
+              "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+              "t_event_time": .event_date // null,
+              "t_ip_address": .source_ip_address // null,
+              "t_email_address": .event_data.resource_properties?.email?.updated // null
+            }
+          }
