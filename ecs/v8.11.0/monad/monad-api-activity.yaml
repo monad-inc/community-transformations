@@ -1,0 +1,108 @@
+name: "Monad Organization Logs to ECS"
+description: "Collects internal logs from Monad organizations for debugging and pipeline visibility. - Transforms to ECS Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/monad-inc"
+inputs:
+  - "monad-logs"
+tags:
+  - "v8.11.0"
+  - "ecs"
+  - "monad"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ECS Transformation for Monad API Activity
+          #
+          # Field Mappings:
+          #   .timestamp      -> @timestamp
+          #   .id             -> event.id
+          #   .user_email     -> user.email
+          #   .resource       -> url.path
+          #   .method         -> http.request.method
+          #   .status         -> http.response.status_code
+          #   .client_info    -> user_agent.original
+          #   .client_ip      -> client.ip
+          #   .additional_info -> labels.additional_info (if not null)
+          #   .log_version    -> labels.log_version
+
+          # Helper function to determine event outcome based on HTTP status code
+          def determine_outcome:
+            if . >= 200 and . < 400 then "success"
+            elif . >= 400 and . < 500 then "failure"
+            else "failure"
+            end;
+
+          # Helper function to build labels for unmapped fields
+          def build_labels:
+            {log_version: .log_version} +
+            (if .additional_info != null then {additional_info: (.additional_info | tostring)} else {} end);
+
+          # Helper function to determine event action from HTTP method
+          def method_to_action:
+            if . == "GET" then "access"
+            elif . == "POST" then "creation"
+            elif . == "PUT" then "change"
+            elif . == "PATCH" then "change"
+            elif . == "DELETE" then "deletion"
+            else "access"
+            end;
+
+          {
+            # ECS Version
+            ecs: {
+              version: "8.11.0"
+            },
+
+            # Base fields - Primary timestamp
+            "@timestamp": .timestamp,
+
+            # Event fields
+            event: {
+              kind: "event",
+              category: ["web"],
+              type: [(.method | method_to_action)],
+              action: "\(.method) \(.resource)",
+              id: .id,
+              outcome: (.status | determine_outcome),
+              provider: "monad",
+              dataset: "monad.api_activity"
+            },
+
+            # HTTP fields
+            http: {
+              request: {
+                method: .method
+              },
+              response: {
+                status_code: (.status | floor)
+              }
+            },
+
+            # URL fields
+            url: {
+              path: .resource
+            },
+
+            # User fields
+            user: {
+              email: .user_email
+            },
+
+            # Client fields
+            client: {
+              ip: .client_ip
+            },
+
+            # User agent fields
+            user_agent: {
+              original: .client_info
+            },
+
+            # Preserve unmapped fields in labels
+            labels: build_labels
+          }
