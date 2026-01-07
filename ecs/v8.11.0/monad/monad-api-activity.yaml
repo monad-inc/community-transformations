@@ -1,0 +1,105 @@
+name: "Monad Api-Activity to ECS"
+description: "Transforms Monad Api-Activity logs into ECS Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/monad-inc"
+inputs:
+  - "monad-api-activity"
+tags:
+  - "v8.11.0"
+  - "ecs"
+  - "monad"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ECS Transformation for api_activity.tmpl
+          #
+          # Field Mappings:
+          #   .id             -> event.id
+          #   .timestamp      -> @timestamp
+          #   .user_email     -> user.email
+          #   .resource       -> url.path
+          #   .method         -> http.request.method, event.action
+          #   .status         -> http.response.status_code, event.outcome
+          #   .client_info    -> user_agent.original
+          #   .client_ip      -> source.ip
+          #   .additional_info -> labels.additional_info (if not null)
+          #   .log_version    -> labels.log_version
+
+          # Helper function to determine event outcome from HTTP status code
+          def determine_outcome:
+            if . >= 200 and . < 400 then "success"
+            elif . >= 400 and . < 500 then "failure"
+            else "failure"
+            end;
+
+          # Helper function to determine event type based on HTTP method
+          def determine_event_type:
+            if . == "GET" then ["access"]
+            elif . == "POST" then ["creation"]
+            elif . == "PUT" then ["change"]
+            elif . == "DELETE" then ["deletion"]
+            else ["info"]
+            end;
+
+          # Helper function to build labels with optional additional_info
+          def build_labels:
+            {log_version: .log_version} +
+            (if .additional_info != null then {additional_info: .additional_info} else {} end);
+
+          {
+            # ECS Version - Required
+            ecs: {
+              version: "8.11.0"
+            },
+
+            # Base fields - Required
+            "@timestamp": .timestamp,
+
+            # Event fields
+            event: {
+              kind: "event",
+              category: ["web"],
+              type: (.method | determine_event_type),
+              action: "\(.method) \(.resource)",
+              id: .id,
+              outcome: (.status | determine_outcome)
+            },
+
+            # HTTP fields
+            http: {
+              request: {
+                method: .method
+              },
+              response: {
+                status_code: (.status | floor)
+              }
+            },
+
+            # URL fields
+            url: {
+              path: .resource
+            },
+
+            # Source fields (client IP)
+            source: {
+              ip: .client_ip
+            },
+
+            # User fields
+            user: {
+              email: .user_email
+            },
+
+            # User agent fields
+            user_agent: {
+              original: .client_info
+            },
+
+            # Labels for unmapped/custom fields
+            labels: build_labels
+          }
