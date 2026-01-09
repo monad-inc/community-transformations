@@ -1,0 +1,101 @@
+name: "Snyk Issue Findings to ECS"
+description: "Collects issue data from Snyk to surface security risks related to known vulnerabilities - Transforms to ECS Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/monad-inc"
+inputs:
+  - "snyk-issues"
+tags:
+  - "v8.11.0"
+  - "ecs"
+  - "snyk"
+  - "issues"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ECS Transformation for Snyk Issues
+          #
+          # Field Mappings:
+          #   .attributes.created_at           -> @timestamp
+          #   .id                              -> event.id
+          #   .attributes.key                  -> vulnerability.id
+          #   .attributes.description          -> vulnerability.description
+          #   .attributes.effective_severity_level -> vulnerability.severity
+          #   .attributes.severities[0].score  -> vulnerability.score.base
+          #   .attributes.severities[0].vector -> vulnerability.score.version
+          #   .attributes.title                -> message
+          #   .attributes.problems[0].id       -> vulnerability.enumeration
+          #   .attributes.problems[0].url      -> vulnerability.reference
+          #   .attributes.type                 -> vulnerability.category
+
+          # Helper function to extract CVSS version from vector string
+          def extract_cvss_version:
+            if . != null and (. | type) == "string" then
+              (. | split("/")[0] | split(":")[1]) // null
+            else
+              null
+            end;
+
+          # Helper function to build labels for unmapped fields
+          def build_labels:
+            {
+              original_type: .type,
+              vulnerability_type: .attributes.type
+            } +
+            (if .attributes.slots.exploit != null then {exploit_status: .attributes.slots.exploit} else {} end) +
+            (if .attributes.slots.disclosure_time != null then {disclosure_time: .attributes.slots.disclosure_time} else {} end) +
+            (if .attributes.slots.publication_time != null then {publication_time: .attributes.slots.publication_time} else {} end);
+
+          # Helper function to build references array
+          def build_references:
+            [
+              (if .attributes.problems[0].url != null then .attributes.problems[0].url else empty end),
+              (if .attributes.slots.references != null then .attributes.slots.references[].url else empty end)
+            ] | if length > 0 then .[0] else null end;
+
+          {
+            # ECS Version
+            ecs: {
+              version: "8.11.0"
+            },
+
+            # Base fields - Primary timestamp
+            "@timestamp": .attributes.created_at,
+
+            # Message field
+            message: .attributes.title,
+
+            # Event fields
+            event: {
+              kind: "alert",
+              category: ["vulnerability"],
+              type: ["info"],
+              created: .attributes.created_at,
+              id: .id,
+              provider: "snyk",
+              dataset: "snyk.issues"
+            },
+
+            # Vulnerability fields
+            vulnerability: {
+              id: .attributes.key,
+              description: .attributes.description,
+              severity: .attributes.effective_severity_level,
+              category: [.attributes.type],
+              enumeration: (.attributes.problems[0].id // null),
+              reference: build_references,
+              score: {
+                base: (.attributes.severities[0].score // null),
+                version: (.attributes.severities[0].vector | extract_cvss_version)
+              },
+              scanner: {
+                vendor: "Snyk"
+              }
+            },
+
+            # Preserve unmapped fields in labels
+            labels: build_labels
+          }
