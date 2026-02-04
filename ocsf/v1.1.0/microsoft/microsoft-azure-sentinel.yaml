@@ -1,0 +1,61 @@
+name: "Microsoft Sentinel compliant schema"
+description: "Transforms incoming data's schema to rename Azure Sentinel reserved keywords. This transform is not guaranteed to contain all possible keywords preserved by Azure Sentinel."
+author: "Monad"
+contributors:
+- "https://github.com/mon-aneesh"
+tags:
+- "v1.1.0"
+- "microsoft"
+- "azure"
+- "sentinel"
+config:
+  operations:
+  - operation: "jq"
+    arguments:
+      key: ""
+      query: |
+        walk(
+          if type == "object" and has("kind") then
+              .source_kind = .kind | del(.kind)
+          else
+              .
+          end
+        ) | 
+        walk(
+          if type == "object" and has("uuid") then
+              .source_uuid = .uuid | del(.uuid)
+          else
+              .
+          end
+        ) |
+        walk(
+            if type == "object" and has("output") then
+                .source_output = .output | del(.output)
+            else
+                .
+            end
+        ) 
+        | 
+        walk(
+            if type == "object" and has("scan") then
+                .source_scan = .scan | del(.scan)
+            else
+                .
+            end
+        ) 
+        |
+        walk(
+            if type == "object" and has("id") then
+                .source_id = .id | del(.id)
+            else
+                .
+            end
+        ) 
+        |
+        walk(
+            if type == "object" and has("type") then
+                .source_type = .type | del(.type)
+            else
+                .
+            end
+        ) 
