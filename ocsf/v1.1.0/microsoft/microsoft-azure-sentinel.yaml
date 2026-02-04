@@ -14,48 +14,26 @@ config:
     arguments:
       key: ""
       query: |
-        walk(
-          if type == "object" and has("kind") then
-              .source_kind = .kind | del(.kind)
-          else
-              .
-          end
-        ) | 
-        walk(
-          if type == "object" and has("uuid") then
-              .source_uuid = .uuid | del(.uuid)
-          else
-              .
-          end
-        ) |
-        walk(
-            if type == "object" and has("output") then
-                .source_output = .output | del(.output)
-            else
-                .
-            end
-        ) 
+        if .kind then
+            .source_kind = .kind | del(.kind)
+        end
         | 
-        walk(
-            if type == "object" and has("scan") then
-                .source_scan = .scan | del(.scan)
-            else
-                .
-            end
-        ) 
+        if .type then
+            .source_type = .type | del(.type)
+        end
+        | 
+        if .uuid then
+            .source_uuid = .uuid | del(.uuid)
+        end
+        | 
+        if .output then
+            .source_output = .output | del(.output)
+        end
         |
-        walk(
-            if type == "object" and has("id") then
-                .source_id = .id | del(.id)
-            else
-                .
-            end
-        ) 
+        if .scan then
+            .source_scan = .scan | del(.scan)
+        end
         |
-        walk(
-            if type == "object" and has("type") then
-                .source_type = .type | del(.type)
-            else
-                .
-            end
-        ) 
+        if .id then
+            .source_id = .id | del(.id)
+        end
