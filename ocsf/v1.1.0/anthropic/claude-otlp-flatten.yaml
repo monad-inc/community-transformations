@@ -1,0 +1,76 @@
+name: "Flatten Claude OTLP Logs and Metrics"
+description: "Flattens OpenTelemetry (OTLP) logs and metrics from Claude into a flat JSON structure, extracting resource and record attributes alongside body, timestamp, and metric fields."
+author: "Monad"
+contributors:
+  - "https://github.com/Credgate"
+inputs:
+  - "claude"
+tags:
+  - "v1.1.0"
+  - "anthropic"
+  - "claude"
+  - "otel"
+  - "otlp"
+  - "flatten"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          [
+            (
+              (.resourceLogs // [])[] |
+              (.resource.attributes // []
+                | map(select(.value != null))
+                | map({ (.key): (.value | .stringValue // .intValue // .doubleValue // .boolValue // .bytesValue) })
+                | add // {}
+              ) as $resource |
+              (.scopeLogs // [])[].logRecords // [] | .[] |
+              (
+                $resource +
+                (.attributes // []
+                  | map(select(.value != null))
+                  | map({ (.key): (.value | .stringValue // .intValue // .doubleValue // .boolValue // .bytesValue) })
+                  | add // {}
+                ) +
+                {
+                  "body": .body.stringValue,
+                  "observedTimeUnixNano": .observedTimeUnixNano,
+                  "timeUnixNano": .timeUnixNano
+                }
+              )
+            ),
+            (
+              (.resourceMetrics // [])[] |
+              (.resource.attributes // []
+                | map(select(.value != null))
+                | map({ (.key): (.value | .stringValue // .intValue // .doubleValue // .boolValue // .bytesValue) })
+                | add // {}
+              ) as $resource |
+              (.scopeMetrics // [])[].metrics // [] | .[] |
+              . as $metric |
+              (
+                .sum.dataPoints //
+                .gauge.dataPoints //
+                .histogram.dataPoints //
+                []
+              )[] |
+              (
+                $resource +
+                (.attributes // []
+                  | map(select(.value != null))
+                  | map({ (.key): (.value | .stringValue // .intValue // .doubleValue // .boolValue // .bytesValue) })
+                  | add // {}
+                ) +
+                {
+                  "metric.name": $metric.name,
+                  "metric.description": $metric.description,
+                  "metric.unit": $metric.unit,
+                  "metric.value": (.asDouble // .asInt),
+                  "startTimeUnixNano": .startTimeUnixNano,
+                  "timeUnixNano": .timeUnixNano
+                }
+              )
+            )
+          ]
