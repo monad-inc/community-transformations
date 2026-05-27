@@ -3,6 +3,7 @@
   author: "Monad"
   contributors:
     - "https://github.com/Credgate"
+    - "https://github.com/behobu"
   inputs:
     - "crowdstrike-vulnerabilities"
   tags:
@@ -110,13 +111,7 @@
                 }
               ],
             
-              # Instead of using tostring, lets include a simplified version of raw data
-              "raw_data": {
-                "id": .id,
-                "vulnerability_id": .vulnerability_id,
-                "status": .status,
-                "timestamp": .created_timestamp
-              },
+              "raw_data": (. | tostring),
             
               # Metadata
               "metadata": {
@@ -126,7 +121,6 @@
                   "vendor_name": "Crowdstrike",
                   "version": "1.0"
                 },
-                "profiles": ["vulnerability"],
                 "uid": (.id // "UNKNOWN")
               },
             
@@ -166,13 +160,16 @@
                 ]
               },
             
-              # Cloud context if available
+              # Cloud context if available. Set to null when the source has no
+              # cloud provider info; the trailing pipeline drops the key
+              # entirely so the event doesn't falsely imply cloud-profile use.
               "cloud": (
-                if .host_info and .host_info.service_provider then {
-                  "provider": (.host_info.service_provider // "unknown"),
-                  "account_uid": (.host_info.service_provider_account_id // "unknown"),
-                  "instance_uid": (.host_info.instance_id // "unknown")
+                if .host_info.service_provider then {
+                  "provider": .host_info.service_provider,
+                  "account_uid": (.host_info.service_provider_account_id // ""),
+                  "instance_uid": (.host_info.instance_id // "")
                 } else null
                 end
               )
             }
+            | if .cloud == null then del(.cloud) else . end
