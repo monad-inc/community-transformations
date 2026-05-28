@@ -1,4 +1,4 @@
-  name: "CrowdStrike Vulnerability Findings to OCSF"
+  name: "CrowdStrike Vulnerability Findings to OCSF v1.5.0"
   description: "Transforms CrowdStrike Vulnerability Findings data into OCSF v1.5.0 Schema"
   author: "https://github.com/behobu"
   contributors:
