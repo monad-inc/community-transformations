@@ -1,0 +1,79 @@
+name: "CrowdStrike Activity Logs to OCSF v1.3.0"
+description: "Transforms CrowdStrike Activity Logs (per-device recent login records) into the OCSF v1.3.0 Authentication class. Emits one event per login in the source record's recent_logins array."
+author: "https://github.com/behobu"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-activity-logs"
+tags:
+  - "v1.3.0"
+  - "ocsf"
+  - "crowdstrike"
+  - "iam"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.3.0
+          # Input: one CrowdStrike Activity Logs record per invocation.
+          # The record is per-device and carries a recent_logins array;
+          # this transform emits ONE OCSF Authentication event per login.
+          #
+          # Carries forward from v1.1.0 the base mapping, and adds the
+          # v1.3.0-recommended `observables` array, populated from the
+          # two natural pivots the source provides:
+          #   * type_id  4 (User Name)    from recent_logins[].user_name
+          #   * type_id 10 (Resource UID) from .device_id
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $root
+          | (.recent_logins // [])[]
+          | . as $login
+          | select(.login_time != null and .login_time != "")
+          | {
+              category_uid: 3,
+              class_uid:    3002,
+              type_uid:     300201,
+              activity_id:  1,
+              severity_id:  1,
+              status_id:    1,
+              time:         to_epoch(.login_time),
+              metadata: ({
+                version: "1.3.0",
+                product: {
+                  vendor_name: "CrowdStrike",
+                  name: "Falcon"
+                },
+                tenant_uid: $root.cid
+              } | if .tenant_uid == null then del(.tenant_uid) else . end),
+              user: ({
+                type_id: 1,
+                name: .user_name
+              } | if .name == null then del(.name) else . end),
+              dst_endpoint: ({
+                uid: $root.device_id
+              } | if .uid == null then null else . end),
+              observables: (
+                [
+                  (if $login.user_name != null and $login.user_name != ""
+                   then {name: "user.name", type_id: 4, value: $login.user_name}
+                   else empty end),
+                  (if $root.device_id != null and $root.device_id != ""
+                   then {name: "dst_endpoint.uid", type_id: 10, value: $root.device_id}
+                   else empty end)
+                ]
+              ),
+              raw_data: (. | tostring)
+            }
+          | if .dst_endpoint == null then del(.dst_endpoint) else . end
+          | if (.observables | length) == 0 then del(.observables) else . end
