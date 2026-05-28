@@ -1,0 +1,25 @@
+name: "Vercel User Events to Tarsal"
+description: "Transforms Vercel User Events into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "vercel-user-events"
+tags:
+  - "v1.0.0"
+  - "vercel"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "data": . + {
+                "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_event_time": (.createdAt / 1000) | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_ip_address": .source_ip_address,
+                "t_email_address": .event_data.resource_properties?.email?.updated // null
+            }
+          }

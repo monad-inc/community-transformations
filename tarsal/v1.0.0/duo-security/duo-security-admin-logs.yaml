@@ -1,0 +1,26 @@
+name: "Duo Security Admin Logs to Tarsal"
+description: "Transforms Duo Security Admin Logs into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "duo-security-admin-logs"
+tags:
+  - "v1.0.0"
+  - "duo-security"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          (.description | try fromjson catch null) as $d |
+          {
+            "data": . + {
+                "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_event_time": .isotimestamp,
+                "t_ip_address": $d?.ip_address? // null,
+                "t_email_address": $d?.email // null
+            }
+          }

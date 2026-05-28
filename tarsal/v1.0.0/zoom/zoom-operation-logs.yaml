@@ -1,0 +1,23 @@
+name: "Zoom Operation Logs to Tarsal"
+description: "Transforms Zoom operation logs into Tarsal Schema"
+author: "Monad"
+contributors:
+  - "https://github.com/saikapuluru99"
+inputs:
+  - "zoom-operation-logs"
+tags:
+  - "v1.0.0"
+  - "zoom"
+  - "tarsal"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          {
+            "data": . + {
+                "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "t_event_time": .time,
+            }
+          }
