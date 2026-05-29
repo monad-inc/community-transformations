@@ -1,13 +1,12 @@
-name: "Tenable Vulnerability Findings to OCSF v1.1.0"
-description: "Transforms Tenable Vulnerability Findings into the OCSF v1.1.0 Vulnerability Finding class."
+name: "Tenable Vulnerability Findings to OCSF v1.5.0"
+description: "Transforms Tenable Vulnerability Findings into the OCSF v1.5.0 Vulnerability Finding class."
 author: "Monad"
 contributors:
-  - "https://github.com/Credgate"
   - "https://github.com/behobu"
 inputs:
   - "tenable-vulnerabilities"
 tags:
-  - "v1.1.0"
+  - "v1.5.0"
   - "ocsf"
   - "tenable"
   - "vulnerability"
@@ -19,7 +18,7 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # OCSF Vulnerability Finding (class_uid=2002) — v1.1.0
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.5.0
           # Input: one Tenable VM vulnerability export record per invocation.
           # ---------------------------------------------------------------
 
@@ -57,12 +56,25 @@ config:
           def status_caption($id):
             {"1":"New","2":"In Progress","4":"Resolved"}[$id|tostring] // "Other";
 
+          # OCSF os.type_id (+ caption): 100=Windows, 200=Linux, 300=macOS,
+          # 201=Android, 301=iOS, 99=Other.
+          def os_type_id:
+            (. // "" | ascii_downcase) as $o |
+            if   ($o | test("windows")) then 100
+            elif ($o | test("mac os|macos|os x")) then 300
+            elif ($o | test("android")) then 201
+            elif ($o | test("ios")) then 301
+            elif ($o | test("linux")) then 200
+            else 99 end;
+          def os_type_caption($id):
+            {"100":"Windows","200":"Linux","300":"macOS","201":"Android","301":"iOS"}[$id|tostring] // "Other";
+
           # Build one OCSF CVSS object, omitting the optional vector when absent.
           def mk_cvss($ver; $score; $vec):
             {"version": $ver, "base_score": $score}
             + (if $vec != null then {"vector_string": $vec} else {} end);
 
-          # Shared inputs reused across the vulnerabilities array.
+          # Shared inputs reused across vulnerabilities / device / observables.
           (.plugin // {}) as $p |
           (.asset // {}) as $a |
           ($p.see_also // []) as $refs |
@@ -121,7 +133,7 @@ config:
 
             # --- Metadata (REQUIRED) ---
             "metadata": {
-              "version": "1.1.0",
+              "version": "1.5.0",
               "product": {
                 "vendor_name": "Tenable",
                 "name": "Tenable Vulnerability Management"
@@ -144,29 +156,65 @@ config:
             },
 
             # --- Vulnerabilities (REQUIRED) ---
-            # The OCSF `vulnerability` object carries an `at_least_one:
-            # [cve, cwe]` constraint in v1.1.0. Emit one entry per CVE; if a
-            # plugin reports no CVE, fall back to CWE. (The `advisory` object
-            # used as a last resort in v1.4.0+ does not exist in this version,
-            # so a record with neither a CVE nor a CWE cannot satisfy the
-            # constraint — such records are rare in Tenable vulnerability data.)
+            # The OCSF `vulnerability` object carries a `just_one:
+            # [advisory, cve, cwe]` constraint (v1.5.0+). Emit one entry per
+            # CVE; if a plugin reports no CVE, fall back to CWE, then to an
+            # advisory synthesized from the plugin so the constraint holds.
             "vulnerabilities": (
               if ($cves | length) > 0 then
                 [ $cves[] as $id | $base_vuln + { "cve": ($cve_base + { "uid": $id }) } ]
               elif ($cwes | length) > 0 then
                 [ $cwes[] as $id | $base_vuln + { "cwe": { "uid": $id } } ]
               else
-                [ $base_vuln ]
+                [ $base_vuln + { "advisory": {
+                    "uid": ($p.id | tostring),
+                    "desc": ($p.synopsis // $p.description),
+                    "references": $refs
+                  } } ]
               end
             ),
 
-            # --- Recommended: generic resource ---
+            # --- Recommended: device (base-level attribute since v1.5.0) ---
+            "device": {
+              "type_id": 0,
+              "hostname": ($a.hostname // $a.fqdn),
+              "uid": $a.uuid,
+              "ip": $a.ipv4,
+              "mac": $a.mac_address,
+              "name": ($a.netbios_name // $a.fqdn // $a.hostname),
+              "os": (
+                ($a.operating_system // [] | first) as $os |
+                if $os != null then
+                  ($os | os_type_id) as $otid |
+                  { "name": $os, "type_id": $otid, "type": os_type_caption($otid) }
+                else null end
+              )
+            },
+
+            # --- Recommended: generic resource + plural resources ---
             "resource": {
               "type": "host",
               "name": ($a.hostname // $a.fqdn),
               "uid": $a.uuid,
               "labels": ($a.operating_system // [])
             },
+            "resources": [{
+              "type": "host",
+              "name": ($a.hostname // $a.fqdn),
+              "uid": $a.uuid,
+              "labels": ($a.operating_system // [])
+            }],
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": [
+              ( $cves[]? | { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": . } ),
+              (if ($a.hostname // $a.fqdn) != null
+                then { "name": "device.hostname", "type": "Hostname", "type_id": 1, "value": ($a.hostname // $a.fqdn) } else empty end),
+              (if $a.ipv4 != null
+                then { "name": "device.ip", "type": "IP Address", "type_id": 2, "value": $a.ipv4 } else empty end),
+              (if $a.mac_address != null
+                then { "name": "device.mac", "type": "MAC Address", "type_id": 3, "value": $a.mac_address } else empty end)
+            ],
 
             # --- Original record for audit / debugging ---
             "raw_data": (. | tostring)

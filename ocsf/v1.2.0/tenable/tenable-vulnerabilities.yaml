@@ -1,13 +1,12 @@
-name: "Tenable Vulnerability Findings to OCSF v1.1.0"
-description: "Transforms Tenable Vulnerability Findings into the OCSF v1.1.0 Vulnerability Finding class."
+name: "Tenable Vulnerability Findings to OCSF v1.2.0"
+description: "Transforms Tenable Vulnerability Findings into the OCSF v1.2.0 Vulnerability Finding class."
 author: "Monad"
 contributors:
-  - "https://github.com/Credgate"
   - "https://github.com/behobu"
 inputs:
   - "tenable-vulnerabilities"
 tags:
-  - "v1.1.0"
+  - "v1.2.0"
   - "ocsf"
   - "tenable"
   - "vulnerability"
@@ -19,7 +18,7 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # OCSF Vulnerability Finding (class_uid=2002) — v1.1.0
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.2.0
           # Input: one Tenable VM vulnerability export record per invocation.
           # ---------------------------------------------------------------
 
@@ -62,7 +61,7 @@ config:
             {"version": $ver, "base_score": $score}
             + (if $vec != null then {"vector_string": $vec} else {} end);
 
-          # Shared inputs reused across the vulnerabilities array.
+          # Shared inputs reused across the vulnerabilities array and observables.
           (.plugin // {}) as $p |
           (.asset // {}) as $a |
           ($p.see_also // []) as $refs |
@@ -121,7 +120,7 @@ config:
 
             # --- Metadata (REQUIRED) ---
             "metadata": {
-              "version": "1.1.0",
+              "version": "1.2.0",
               "product": {
                 "vendor_name": "Tenable",
                 "name": "Tenable Vulnerability Management"
@@ -145,7 +144,7 @@ config:
 
             # --- Vulnerabilities (REQUIRED) ---
             # The OCSF `vulnerability` object carries an `at_least_one:
-            # [cve, cwe]` constraint in v1.1.0. Emit one entry per CVE; if a
+            # [cve, cwe]` constraint in v1.2.0. Emit one entry per CVE; if a
             # plugin reports no CVE, fall back to CWE. (The `advisory` object
             # used as a last resort in v1.4.0+ does not exist in this version,
             # so a record with neither a CVE nor a CWE cannot satisfy the
@@ -167,6 +166,17 @@ config:
               "uid": $a.uuid,
               "labels": ($a.operating_system // [])
             },
+
+            # --- Recommended: observables (new in v1.2.0; natural pivots) ---
+            "observables": [
+              ( $cves[]? | { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": . } ),
+              (if ($a.hostname // $a.fqdn) != null
+                then { "name": "device.hostname", "type": "Hostname", "type_id": 1, "value": ($a.hostname // $a.fqdn) } else empty end),
+              (if $a.ipv4 != null
+                then { "name": "device.ip", "type": "IP Address", "type_id": 2, "value": $a.ipv4 } else empty end),
+              (if $a.mac_address != null
+                then { "name": "device.mac", "type": "MAC Address", "type_id": 3, "value": $a.mac_address } else empty end)
+            ],
 
             # --- Original record for audit / debugging ---
             "raw_data": (. | tostring)
