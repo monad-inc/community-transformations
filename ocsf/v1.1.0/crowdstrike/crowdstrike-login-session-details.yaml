@@ -1,10 +1,10 @@
-name: "CrowdStrike Activity Logs to OCSF v1.1.0"
-description: "Transforms CrowdStrike Activity Logs (per-device recent login records) into the OCSF v1.1.0 Authentication class. Emits one event per login in the source record's recent_logins array."
-author: "https://github.com/behobu"
+name: "CrowdStrike Login Activity to OCSF v1.1.0"
+description: "Transforms CrowdStrike Login Activity (per-device recent login records) into the OCSF v1.1.0 Authentication class. Emits one event per login in the source record's recent_logins array."
+author: "Monad"
 contributors:
   - "https://github.com/behobu"
 inputs:
-  - "crowdstrike-activity-logs"
+  - "crowdstrike-login-session-details"
 tags:
   - "v1.1.0"
   - "ocsf"
@@ -19,7 +19,7 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF Authentication (class_uid=3002) — v1.1.0
-          # Input: one CrowdStrike Activity Logs record per invocation.
+          # Input: one CrowdStrike Login Activity record per invocation.
           # The record is per-device and carries a recent_logins array;
           # this transform emits ONE OCSF Authentication event per login.
           # ---------------------------------------------------------------
