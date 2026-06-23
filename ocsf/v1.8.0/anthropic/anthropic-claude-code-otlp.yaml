@@ -1,0 +1,294 @@
+name: "Anthropic Claude Code (OTLP) to OCSF v1.8.0"
+description: "Transforms raw OTLP logs from the Anthropic Claude Code connector into OCSF v1.8.0. Decodes the resourceLogs envelope and emits one OCSF event per logRecord, fanning out by event and tool: LLM calls -> Process Activity (1007) with the ai_operation profile (ai_model + message_context); shell/other tools -> Process Activity (1007); file tools -> File System Activity (1001); web tools -> Network Activity (4001); auth -> Authentication (3002); MCP -> Network Activity (4001); plugins -> Application Lifecycle (6002); internal errors -> Application Error (6008). Null-identity events are tagged (metadata.labels) and severity-floored rather than passed silently."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-claude-code"
+tags:
+  - "v1.8.0"
+  - "ocsf"
+  - "anthropic"
+  - "ai"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # Anthropic Claude Code RAW OTLP logs -> OCSF v1.8.0 (fan-out)
+          # One OTLP envelope in -> one OCSF event per logRecord out.
+          # Metrics envelopes (resourceMetrics) produce no output.
+          #
+          # Class routing:
+          #   api_request/api_error/api_refusal/api_retries_exhausted, user_prompt
+          #                         -> Process Activity 1007 (+ai_operation profile)
+          #   tool_result: file tools (Read/Edit/Write/NotebookEdit/MultiEdit, path known)
+          #                         -> File System Activity 1001
+          #                web tools (WebFetch/WebSearch) -> Network Activity 4001
+          #                shell/other tools             -> Process Activity 1007
+          #   tool_decision / permission_mode_changed     -> API Activity 6003
+          #   auth                                        -> Authentication 3002
+          #   mcp_server_connection                       -> Network Activity 4001
+          #   plugin_installed/plugin_loaded              -> Application Lifecycle 6002
+          #   internal_error                              -> Application Error 6008
+          #   (other)                                     -> API Activity 6003 / Other
+          #
+          # The ai_operation profile (ai_model + message_context, with token
+          # counts + ai_role) is OCSF 1.8.0's native AI block; only classes that
+          # carry it (1007) get it here. cost has no native field -> unmapped.
+          # -----------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+          def nano2epoch($n):
+            if $n == null or $n == "" then null else (($n | tonumber) / 1000000000 | floor) end;
+          # truthy: handles boolean true AND string "true" (avoids misclassifying bool success)
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+
+          (.resourceLogs // [])[] as $rl
+          | kv($rl.resource.attributes) as $res
+          | ($rl.scopeLogs // [])[] as $sl
+          | ($sl.logRecords // [])[] as $lr
+          | ($res + kv($lr.attributes)) as $r
+          | ( ($lr.body.stringValue) as $b
+              | if ($b != null and ($b | startswith("claude_code."))) then $b
+                elif (($r["event.name"]) // "") != "" then ("claude_code." + $r["event.name"])
+                else ($b // "claude_code.unknown") end ) as $en
+          | (if (($r["event.timestamp"]) // "") != "" then to_epoch($r["event.timestamp"])
+             else nano2epoch($lr.timeUnixNano) end) as $time
+          | (($r["app.version"]) // ($r["service.version"])) as $ver
+
+          # identity guard input
+          | ( (($r["user.email"] // "") != "") or (($r["user.account_uuid"] // "") != "")
+              or (($r["user.id"] // "") != "") or (($r["session.id"] // "") != "") ) as $has_id
+
+          # user.at_least_one is [account,name,uid]; when no identity is present,
+          # fall back to a sentinel name so the object stays valid — the missing
+          # identity is signalled by the label + severity floor below, not by an
+          # invalid user object.
+          | ({ type_id: 1,
+               name: ($r["user.email"] // (if $has_id then null else "unknown" end)),
+               uid: $r["user.account_uuid"],
+               uid_alt: $r["user.account_id"], email_addr: $r["user.email"] }) as $user
+          | ({ user: $user, app_name: "Claude Code" }) as $actor
+          | ({ type_id: 0, hostname: $r["terminal.type"] }) as $device
+
+          # parsed tool parameters (present only when OTEL_LOG_TOOL_DETAILS=1)
+          | ( ($r["tool_parameters"] // $r["tool_input"]) as $s
+              | if ($s | type) == "string" and $s != "" then ($s | fromjson? // {})
+                elif ($s | type) == "object" then $s else {} end ) as $tp
+          | (($tp["full_command"]) // ($tp["bash_command"]) // ($tp["command"])) as $cmd
+          | (($tp["file_path"]) // ($tp["path"]) // ($tp["notebook_path"])) as $path
+          | ($tp["url"]) as $url
+
+          # observables (reference only attributes the class defines)
+          | ([ (if ($r["session.id"] // "") != "" then {name:"metadata.uid", type_id:10, value:$r["session.id"]} else empty end) ]) as $obs_base
+          | ($obs_base + [ (if ($r["user.email"] // "") != "" then {name:"actor.user.email_addr", type_id:5, value:$r["user.email"]} else empty end) ]) as $obs_actor
+          | ($obs_base + [ (if ($r["user.email"] // "") != "" then {name:"user.email_addr", type_id:5, value:$r["user.email"]} else empty end) ]) as $obs_auth
+
+          | ($r | del(.["event.name"], .["event.timestamp"], .["event.sequence"],
+                      .["session.id"], .["user.email"], .["user.account_uuid"],
+                      .["user.account_id"], .["user.id"], .["organization.id"],
+                      .["app.version"], .["prompt.id"], .["service.name"], .["service.version"])) as $unmapped
+
+          | ({ time: $time,
+               metadata: { version: "1.8.0",
+                 product: { vendor_name: "Anthropic", name: "Claude Code", version: $ver },
+                 log_name: $en, uid: $r["prompt.id"], sequence: $r["event.sequence"],
+                 tenant_uid: $r["organization.id"] },
+               unmapped: $unmapped, raw_data: ($lr | tostring) }) as $common
+
+          # message_context for LLM calls (ai_role 2 = Assistant)
+          | ({ ai_role_id: 2,
+               prompt_tokens: $r["input_tokens"], completion_tokens: $r["output_tokens"],
+               total_tokens: (if ($r["input_tokens"] != null or $r["output_tokens"] != null)
+                              then (($r["input_tokens"] // 0) + ($r["output_tokens"] // 0)) else null end),
+               service: { name: "Anthropic API" } }) as $mc_llm
+
+          # =================================================================
+          | if ($en == "claude_code.api_request" or $en == "claude_code.api_error"
+                or $en == "claude_code.api_refusal" or $en == "claude_code.api_retries_exhausted") then
+              ($en == "claude_code.api_request") as $ok
+            | $common + {
+                category_uid: 1, class_uid: 1007, activity_id: 1, type_uid: 100701,
+                severity_id: (if $ok then 1 else 3 end),
+                process: { pid: 0, name: "claude-code", cmd_line: ("model:" + ($r["model"] // "unknown")) },
+                device: $device, actor: $actor,
+                ai_model: (if ($r["model"] // "") != "" then {name: $r["model"], ai_provider: "Anthropic", uid: $r["model"]} else null end),
+                message_context: $mc_llm,
+                duration: $r["duration_ms"],
+                observables: $obs_actor,
+                status_id: (if $ok then 1 else 2 end),
+                status: (if $ok then "Success" else "Failure" end),
+                status_code: (if ($r["status_code"] != null) then ($r["status_code"] | tostring) else null end),
+                status_detail: $r["error"],
+                message: (($r["model"] // "model") + " " + (if $ok then "request" else "request failed" end))
+              }
+
+            elif $en == "claude_code.user_prompt" then
+              $common + {
+                category_uid: 1, class_uid: 1007, activity_id: 1, type_uid: 100701, severity_id: 1,
+                process: { pid: 0, name: "claude-code", cmd_line: "user_prompt" },
+                device: $device, actor: $actor,
+                message_context: { ai_role_id: 1, service: { name: "Claude Code" } },
+                observables: $obs_actor, status_id: 1, status: "Success",
+                message: ("user prompt (" + (($r["prompt_length"] // 0) | tostring) + " chars)")
+              }
+
+            elif $en == "claude_code.tool_result" then
+              ($r["tool_name"] // "unknown") as $tool
+            | ($tool | ascii_downcase) as $tl
+            | truthy($r["success"]) as $tok
+            | (if $tl == "read" then 2 elif $tl == "write" then 1
+               elif ($tl == "edit" or $tl == "notebookedit" or $tl == "multiedit") then 3 else 0 end) as $fa
+            | if (($tl | test("^(read|write|edit|notebookedit|multiedit)$")) and (($path // "") != "")) then
+                # ---- File System Activity 1001 ----
+                $common + {
+                  category_uid: 1, class_uid: 1001, activity_id: $fa, type_uid: (100100 + $fa),
+                  severity_id: (if $tok then 1 else 2 end),
+                  file: { name: $path, type_id: 1 },
+                  device: $device, actor: $actor, observables: $obs_actor,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  status_detail: ($r["error_type"] // $r["error"]),
+                  message: ($tool + " " + ({"1":"create","2":"read","3":"update"}[($fa|tostring)] // "access") + " " + ($path | tostring))
+                }
+              elif ($tl == "webfetch" or $tl == "websearch") then
+                # ---- Network Activity 4001 ----
+                $common + {
+                  category_uid: 4, class_uid: 4001, activity_id: 1, type_uid: 400101,
+                  severity_id: (if $tok then 1 else 2 end),
+                  dst_endpoint: { name: ($url // "web"), svc_name: $tool },
+                  url: (if ($url // "") != "" then {url_string: $url} else null end),
+                  observables: $obs_base,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  message: ($tool + (if ($url // "") != "" then (" " + $url) else "" end))
+                }
+              else
+                # ---- Process Activity 1007 (shell + other tools, or file tool w/o path) ----
+                $common + {
+                  category_uid: 1, class_uid: 1007, activity_id: 1, type_uid: 100701,
+                  severity_id: (if $tok then 1 else 2 end),
+                  process: { pid: 0, name: $tool, cmd_line: $cmd },
+                  device: $device, actor: $actor,
+                  message_context: { ai_role_id: 3, service: { name: "Claude Code" } },
+                  observables: $obs_actor,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  status_detail: ($r["error_type"] // $r["error"]),
+                  message: ($tool + " result")
+                }
+              end
+
+            elif $en == "claude_code.tool_decision" then
+              ($r["decision"] // "accept") as $decision
+            | $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 99, type_uid: 600399, activity_name: $en,
+                severity_id: 1,
+                api: { operation: ("tool:" + ($r["tool_name"] // "unknown")), service: { name: "Claude Code" } },
+                src_endpoint: { name: ($r["terminal.type"] // "claude-code-cli"), uid: $r["session.id"], svc_name: "claude-code" },
+                actor: $actor, observables: ($obs_actor),
+                status_id: (if $decision == "accept" then 1 else 2 end),
+                status: (if $decision == "accept" then "Success" else "Failure" end),
+                message: (($r["tool_name"] // "tool") + " decision: " + $decision)
+              }
+
+            elif $en == "claude_code.permission_mode_changed" then
+              $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 3, type_uid: 600303, severity_id: 1,
+                api: { operation: "permission_mode.change", service: { name: "Claude Code" } },
+                src_endpoint: { name: ($r["terminal.type"] // "claude-code-cli"), uid: $r["session.id"], svc_name: "claude-code" },
+                actor: $actor, observables: $obs_actor, status_id: 1, status: "Success",
+                message: (("permission mode " + ($r["from_mode"] // "?")) + " -> " + ($r["to_mode"] // "?"))
+              }
+
+            elif $en == "claude_code.auth" then
+              ($r["action"] == "login") as $is_login
+            | truthy($r["success"]) as $auth_ok
+            | $common + {
+                category_uid: 3, class_uid: 3002,
+                activity_id: (if $is_login then 1 else 2 end),
+                type_uid: (if $is_login then 300201 else 300202 end),
+                severity_id: (if $auth_ok then 1 else 2 end),
+                user: $user, service: { name: "Claude Code" }, auth_protocol: $r["auth_method"],
+                observables: $obs_auth,
+                status_id: (if $auth_ok then 1 else 2 end),
+                status: (if $auth_ok then "Success" else "Failure" end),
+                status_code: (if ($r["status_code"] != null) then ($r["status_code"] | tostring) else null end),
+                status_detail: $r["error_category"],
+                message: (($r["action"] // "auth") + (if $auth_ok then " succeeded" else " failed" end))
+              }
+
+            elif $en == "claude_code.mcp_server_connection" then
+              ($r["status"]) as $st
+            | (if $st == "connected" then 1 elif $st == "disconnected" then 2 elif $st == "failed" then 4 else 0 end) as $act
+            | $common + {
+                category_uid: 4, class_uid: 4001, activity_id: $act, type_uid: (400100 + $act),
+                severity_id: (if $st == "failed" then 2 else 1 end),
+                dst_endpoint: { name: ($r["server_name"] // "mcp-server"), svc_name: $r["server_name"] },
+                observables: $obs_base,
+                status_id: (if $st == "failed" then 2 else 1 end),
+                status: (if $st == "failed" then "Failure" else "Success" end),
+                status_code: $r["error_code"], status_detail: $r["error"],
+                message: (("MCP " + ($r["transport_type"] // "")) + " " + ($st // "unknown"))
+              }
+
+            elif ($en == "claude_code.plugin_installed" or $en == "claude_code.plugin_loaded") then
+              ($en == "claude_code.plugin_installed") as $installed
+            | (if $installed then 1 else 6 end) as $act
+            | $common + {
+                category_uid: 6, class_uid: 6002, activity_id: $act, type_uid: (600200 + $act), severity_id: 1,
+                app: { name: ($r["plugin.name"] // "Claude Code plugin"), version: $r["plugin.version"],
+                       vendor_name: ($r["marketplace.name"] // "Anthropic") },
+                observables: $obs_base, status_id: 1, status: "Success",
+                message: (($r["plugin.name"] // "plugin") + " " + (if $installed then "installed" else "loaded" end))
+              }
+
+            elif $en == "claude_code.internal_error" then
+              $common + {
+                category_uid: 6, class_uid: 6008, activity_id: 1, type_uid: 600801, severity_id: 3,
+                observables: $obs_base, status_id: 2, status: "Failure", status_code: $r["error_code"],
+                message: (($r["error_name"] // "InternalError")
+                          + (if ($r["error_code"] != null) then (" (" + ($r["error_code"] | tostring) + ")") else "" end))
+              }
+
+            else
+              $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 99, type_uid: 600399, activity_name: $en, severity_id: 1,
+                api: { operation: ($en // "unknown"), service: { name: "Claude Code" } },
+                src_endpoint: { name: ($r["terminal.type"] // "claude-code-cli"), uid: $r["session.id"], svc_name: "claude-code" },
+                actor: $actor, observables: $obs_actor, status_id: 0
+              }
+            end
+
+          # declare the ai_operation profile when an AI block is present
+          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ["ai_operation"] else . end)
+          # identity guard: tag + raise severity floor; never drop
+          | (if ($has_id | not) then
+               .severity_id = ([.severity_id, 3] | max)
+               | .metadata.labels = ["identity.missing"]
+               | .message = ((.message // "") + " [identity.missing]")
+             else . end)
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)
