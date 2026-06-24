@@ -1,5 +1,5 @@
 name: "Anthropic Claude Code (OTLP) to OCSF v1.8.0"
-description: "Transforms raw OTLP logs from the Anthropic Claude Code connector into OCSF v1.8.0. Decodes the resourceLogs envelope and emits one OCSF event per logRecord, fanning out by event and tool: LLM calls -> Process Activity (1007) with the ai_operation profile (ai_model + message_context); shell/other tools -> Process Activity (1007); file tools -> File System Activity (1001); web tools -> Network Activity (4001); auth -> Authentication (3002); MCP -> Network Activity (4001); plugins -> Application Lifecycle (6002); internal errors -> Application Error (6008). Null-identity events are tagged (metadata.labels) and severity-floored rather than passed silently."
+description: "Transforms OTLP logs from Claude Code into OCSF v1.8.0 events, fanning out by type: LLM→Process Activity (1007) with ai_operation profile, file tools→File System Activity (1001), web/MCP→Network Activity (4001), auth→Authentication (3002), plugins→Application Lifecycle (6002), errors→Application Error (6008). Null-identity events are tagged and severity-floored."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
