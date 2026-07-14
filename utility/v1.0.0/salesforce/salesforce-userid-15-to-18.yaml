@@ -1,0 +1,48 @@
+name: "Normalize Salesforce USER_ID (15 to 18 characters)"
+description: "Converts a Salesforce record ID in the USER_ID field from its 15-character (case-sensitive) form to its canonical 18-character (case-insensitive) form. IDs that are already 18 characters, missing, or non-string are passed through unchanged. Use this on Salesforce event data so its USER_ID reliably joins against the 18-character Ids returned by the Salesforce Users input (for example, a KV Lookup enrichment that attaches the user's email)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "salesforce-search-events"
+tags:
+  - "v1.0.0"
+  - "salesforce"
+  - "user-id"
+  - "normalization"
+  - "id-conversion"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Normalize the Salesforce record ID in .USER_ID from its 15-character
+          # (case-sensitive) form to the canonical 18-character (case-insensitive)
+          # form. Salesforce event surfaces emit 15- or 18-character IDs, while the
+          # Salesforce Users input returns 18-character Ids; normalizing to 18 lets
+          # the two join (e.g. for a KV Lookup email enrichment).
+          #
+          # Only a 15-character string is rewritten. An already-18-character ID, a
+          # missing field, or a non-string value is left untouched (no key added).
+          #
+          # If your USER_ID lives at a different path, change both `.USER_ID`
+          # references below.
+          if (.USER_ID | type) == "string" and (.USER_ID | length) == 15
+          then
+            .USER_ID as $id
+            | .USER_ID = $id + (
+                # Append the 3-character checksum suffix. Split the 15 chars into
+                # three 5-character blocks; for each block build a 5-bit value from
+                # which characters are uppercase A-Z (bit i, least-significant first),
+                # then map the resulting 0-31 to this 32-character alphabet.
+                [ range(0;3) as $c
+                  | ( reduce range(0;5) as $i (0;
+                        . + ( ($id[($c*5+$i):($c*5+$i+1)]) as $ch
+                              | if ($ch >= "A" and $ch <= "Z") then [1,2,4,8,16][$i] else 0 end )
+                    ) ) as $v
+                  | "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"[$v:$v+1]
+                ] | join("")
+              )
+          else .
+          end
