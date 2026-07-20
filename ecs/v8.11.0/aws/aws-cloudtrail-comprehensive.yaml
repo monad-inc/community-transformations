@@ -1,0 +1,195 @@
+name: "AWS CloudTrail to ECS v8.11.0 (Comprehensive)"
+description: "Normalizes individual AWS CloudTrail event records into the Elastic Common Schema (ECS) v8.11.0 with full field coverage: core ECS fields plus the aws.cloudtrail.* namespace, error.*, tls.*, session context, resources, and event.original."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudtrail"
+tags:
+  - "v8.11.0"
+  - "ecs"
+  - "aws"
+  - "cloudtrail"
+  - "audit"
+  - "comprehensive"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS CloudTrail  ->  ECS v8.11.0  (COMPREHENSIVE)
+          #
+          # Input: ONE CloudTrail event record per invocation, as emitted by
+          #   the Monad `cloudtrail` input connector. (For the S3/SQS
+          #   connector `aws-sqs-s3-cloudtrail`, explode `.Records[]` in an
+          #   upstream transform first — it emits chunked Records arrays.)
+          #
+          # Superset of the Core transform. In addition to the core ECS
+          # fields (event, cloud, user, source, user_agent, related) it maps
+          # every CloudTrail field with an ECS or aws.cloudtrail.* home:
+          #   - error.code / error.message          <- errorCode / errorMessage
+          #   - tls.version / tls.cipher / tls.client.server_name
+          #   - aws.cloudtrail.* (user_identity, session_context, resources,
+          #     request/response parameters, read_only, management_event, ...)
+          #   - event.original                      <- the whole raw record
+          # Field names under aws.cloudtrail.* follow the Elastic AWS
+          # integration's snake_case convention.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+
+          | ( if ($r.errorCode // null) != null then "failure"
+              elif $r.eventName == "ConsoleLogin"
+                then ( if ($r.responseElements.ConsoleLogin // "") == "Success"
+                       then "success" else "failure" end )
+              else "success" end ) as $outcome
+
+          | ( if ($r.eventName | test("^(ConsoleLogin|AssumeRole|GetSessionToken|GetFederationToken|AssumeRoleWithSAML|AssumeRoleWithWebIdentity)$"))
+                then ["authentication"]
+              elif ($r.eventSource // "") | test("^(iam|sso|signin)\\.")
+                then ["iam"]
+              else ["configuration"] end ) as $category
+
+          | ( if $r.eventName == "ConsoleLogin" then ["start"]
+              elif ($r.readOnly // false) == true then ["access"]
+              elif ($r.eventName | test("^(Create|Add|Enable|Register|Put|Allocate|Import|Run|Provision|Attach|Associate)"))
+                then ["creation"]
+              elif ($r.eventName | test("^(Delete|Remove|Deregister|Disable|Detach|Disassociate|Terminate|Revoke)"))
+                then ["deletion"]
+              elif ($r.eventName | test("^(Update|Modify|Set|Change|Replace)"))
+                then ["change"]
+              else ["info"] end ) as $type
+
+          | ( $r.userIdentity.userName
+              // $r.userIdentity.sessionContext.sessionIssuer.userName ) as $user_name
+
+          | ( $r.userIdentity // {} ) as $ui
+          | ( $ui.sessionContext // {} ) as $sc
+
+          | {
+              ecs: { version: "8.11.0" },
+
+              "@timestamp": $r.eventTime,
+
+              event: {
+                kind: "event",
+                module: "aws",
+                dataset: "aws.cloudtrail",
+                provider: $r.eventSource,
+                action: $r.eventName,
+                id: $r.eventID,
+                category: $category,
+                type: $type,
+                outcome: $outcome,
+                original: ($r | tostring)
+              },
+
+              cloud: {
+                provider: "aws",
+                region: $r.awsRegion,
+                account: { id: ($r.recipientAccountId // $ui.accountId) }
+              },
+
+              user: {
+                id: $ui.principalId,
+                name: $user_name
+              },
+
+              source: {
+                address: $r.sourceIPAddress,
+                ip: ( if is_ip($r.sourceIPAddress) then $r.sourceIPAddress else null end )
+              },
+
+              user_agent: { original: $r.userAgent },
+
+              # error.* — only populated on failed calls.
+              error: {
+                code: $r.errorCode,
+                message: $r.errorMessage
+              },
+
+              # tls.* — from CloudTrail tlsDetails when present.
+              tls: {
+                version: $r.tlsDetails.tlsVersion,
+                cipher: $r.tlsDetails.cipherSuite,
+                client: { server_name: $r.tlsDetails.clientProvidedHostHeader }
+              },
+
+              related: {
+                ip: ( if is_ip($r.sourceIPAddress) then [$r.sourceIPAddress] else [] end ),
+                user: ( [ $user_name, $ui.userName, $sc.sessionIssuer.userName ]
+                        | map(select(. != null)) | unique )
+              },
+
+              # ---- Vendor namespace: full CloudTrail fidelity ------------
+              aws: {
+                cloudtrail: {
+                  event_version: $r.eventVersion,
+                  event_type: $r.eventType,
+                  event_category: $r.eventCategory,
+                  api_version: $r.apiVersion,
+                  management_event: $r.managementEvent,
+                  read_only: $r.readOnly,
+                  request_id: $r.requestID,
+                  recipient_account_id: $r.recipientAccountId,
+                  shared_event_id: $r.sharedEventID,
+                  vpc_endpoint_id: $r.vpcEndpointId,
+                  error_code: $r.errorCode,
+                  error_message: $r.errorMessage,
+
+                  # Parameters kept as structured objects (flattened type).
+                  request_parameters: $r.requestParameters,
+                  response_elements: $r.responseElements,
+                  additional_eventdata: $r.additionalEventData,
+                  service_event_details: $r.serviceEventDetails,
+
+                  user_identity: {
+                    type: $ui.type,
+                    principal_id: $ui.principalId,
+                    arn: $ui.arn,
+                    account_id: $ui.accountId,
+                    access_key_id: $ui.accessKeyId,
+                    user_name: $ui.userName,
+                    invoked_by: $ui.invokedBy,
+                    session_context: {
+                      mfa_authenticated: $sc.attributes.mfaAuthenticated,
+                      creation_date: $sc.attributes.creationDate,
+                      session_issuer: {
+                        type: $sc.sessionIssuer.type,
+                        principal_id: $sc.sessionIssuer.principalId,
+                        arn: $sc.sessionIssuer.arn,
+                        account_id: $sc.sessionIssuer.accountId,
+                        user_name: $sc.sessionIssuer.userName
+                      }
+                    }
+                  },
+
+                  resources: ( ($r.resources // [])
+                    | map({ arn: .ARN, account_id: .accountId, type: .type }) ),
+
+                  console_login: (
+                    if ($r.additionalEventData // null) != null then {
+                      mfa_used: $r.additionalEventData.MFAUsed,
+                      mobile_version: $r.additionalEventData.MobileVersion,
+                      login_to: $r.additionalEventData.LoginTo
+                    } else null end
+                  )
+                }
+              }
+            }
+          | prune
