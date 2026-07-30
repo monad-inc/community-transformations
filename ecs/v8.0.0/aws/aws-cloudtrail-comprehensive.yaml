@@ -23,8 +23,11 @@ config:
           #
           # Input: ONE CloudTrail event record per invocation, as emitted by
           #   the Monad `cloudtrail` input connector. (For the S3/SQS
-          #   connector `aws-sqs-s3-cloudtrail`, explode `.Records[]` in an
-          #   upstream transform first — it emits chunked Records arrays.)
+          #   connector `aws-sqs-s3-cloudtrail` this depends on its Chunking
+          #   Mode: `per_record` already emits one bare event per record and
+          #   needs nothing extra, while `by_size` — the default — emits the
+          #   CloudTrail envelope with `Records` chunked, so explode
+          #   `.Records[]` in an upstream transform first.)
           #
           # Superset of the Core transform. In addition to the core ECS
           # fields (event, cloud, user, source, user_agent, related) it maps
@@ -54,24 +57,24 @@ config:
           . as $r
 
           | ( if ($r.errorCode // null) != null then "failure"
-              elif $r.eventName == "ConsoleLogin"
+              elif ($r.eventName // "") == "ConsoleLogin"
                 then ( if ($r.responseElements.ConsoleLogin // "") == "Success"
                        then "success" else "failure" end )
               else "success" end ) as $outcome
 
-          | ( if ($r.eventName | test("^(ConsoleLogin|AssumeRole|GetSessionToken|GetFederationToken|AssumeRoleWithSAML|AssumeRoleWithWebIdentity)$"))
+          | ( if (($r.eventName // "") | test("^(ConsoleLogin|AssumeRole|GetSessionToken|GetFederationToken|AssumeRoleWithSAML|AssumeRoleWithWebIdentity)$"))
                 then ["authentication"]
               elif ($r.eventSource // "") | test("^(iam|sso|signin)\\.")
                 then ["iam"]
               else ["configuration"] end ) as $category
 
-          | ( if $r.eventName == "ConsoleLogin" then ["start"]
+          | ( if ($r.eventName // "") == "ConsoleLogin" then ["start"]
               elif ($r.readOnly // false) == true then ["access"]
-              elif ($r.eventName | test("^(Create|Add|Enable|Register|Put|Allocate|Import|Run|Provision|Attach|Associate)"))
+              elif (($r.eventName // "") | test("^(Create|Add|Enable|Register|Put|Allocate|Import|Run|Provision|Attach|Associate)"))
                 then ["creation"]
-              elif ($r.eventName | test("^(Delete|Remove|Deregister|Disable|Detach|Disassociate|Terminate|Revoke)"))
+              elif (($r.eventName // "") | test("^(Delete|Remove|Deregister|Disable|Detach|Disassociate|Terminate|Revoke)"))
                 then ["deletion"]
-              elif ($r.eventName | test("^(Update|Modify|Set|Change|Replace)"))
+              elif (($r.eventName // "") | test("^(Update|Modify|Set|Change|Replace)"))
                 then ["change"]
               else ["info"] end ) as $type
 
