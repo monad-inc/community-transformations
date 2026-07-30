@@ -169,6 +169,15 @@ config:
                     access_key_id: $ui.accessKeyId,
                     user_name: $ui.userName,
                     invoked_by: $ui.invokedBy,
+
+                    # Present when the caller is an IAM Identity Center user
+                    # (userIdentity.type "IdentityCenterUser"); identifies the
+                    # Identity Center user the call was made on behalf of.
+                    on_behalf_of: {
+                      user_id: $ui.onBehalfOf.userId,
+                      identity_store_arn: $ui.onBehalfOf.identityStoreArn
+                    },
+
                     session_context: {
                       mfa_authenticated: $sc.attributes.mfaAuthenticated,
                       creation_date: $sc.attributes.creationDate,
