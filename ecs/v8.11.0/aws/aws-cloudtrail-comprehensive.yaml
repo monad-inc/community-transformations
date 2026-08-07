@@ -53,6 +53,13 @@ config:
             if ($s | type) == "string" and $s != "HIDDEN_DUE_TO_SECURITY_REASONS"
             then $s else null end;
 
+          # sourceIdentity is the original identity behind an assumed role. Only
+          # present when STS is configured to require it. requestParameters
+          # and responseElements are not always objects, hence the type guard.
+          def sid($o):
+            if ($o | type) == "object" then real_name($o.sourceIdentity)
+            else null end;
+
           def prune:
             walk(
               if type == "object" then
@@ -101,6 +108,9 @@ config:
 
           | ( $r.userIdentity // {} ) as $ui
           | ( $ui.sessionContext // {} ) as $sc
+          | ( sid($sc)
+              // sid($r.requestParameters)
+              // sid($r.responseElements) ) as $source_identity
 
           | {
               ecs: { version: "8.11.0" },
@@ -157,6 +167,7 @@ config:
               related: {
                 ip: ( if is_ip($r.sourceIPAddress) then [$r.sourceIPAddress] else [] end ),
                 user: ( [ $user_name,
+                          $source_identity,
                           real_name($ui.userName),
                           real_name($sc.sessionIssuer.userName) ]
                         | map(select(. != null)) | unique )
@@ -209,6 +220,7 @@ config:
                     session_context: {
                       mfa_authenticated: $sc.attributes.mfaAuthenticated,
                       creation_date: $sc.attributes.creationDate,
+                      source_identity: $sc.sourceIdentity,
                       session_issuer: {
                         type: $sc.sessionIssuer.type,
                         principal_id: $sc.sessionIssuer.principalId,
