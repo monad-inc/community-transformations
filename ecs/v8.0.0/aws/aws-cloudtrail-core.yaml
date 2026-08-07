@@ -56,6 +56,13 @@ config:
             if ($s | type) == "string" and $s != "HIDDEN_DUE_TO_SECURITY_REASONS"
             then $s else null end;
 
+          # sourceIdentity is the original identity behind an assumed role. Only
+          # present when STS is configured to require it. requestParameters
+          # and responseElements are not always objects, hence the type guard.
+          def sid($o):
+            if ($o | type) == "object" then real_name($o.sourceIdentity)
+            else null end;
+
           # Recursively drop null values and empty objects/arrays so the
           # emitted event stays compact.
           def prune:
@@ -108,6 +115,11 @@ config:
               # sign-in under additionalEventData.UserName instead.
               // real_name($r.additionalEventData.UserName) ) as $user_name
 
+          # ---- sourceIdentity: original identity behind an assumed role ---
+          | ( sid($r.userIdentity.sessionContext)
+              // sid($r.requestParameters)
+              // sid($r.responseElements) ) as $source_identity
+
           | {
               ecs: { version: "8.0.0" },
 
@@ -148,7 +160,8 @@ config:
 
               related: {
                 ip: ( if is_ip($r.sourceIPAddress) then [$r.sourceIPAddress] else [] end ),
-                user: ( [ $user_name ] | map(select(. != null)) )
+                user: ( [ $user_name, $source_identity ]
+                        | map(select(. != null)) | unique )
               }
             }
           | prune
