@@ -1,5 +1,5 @@
 name: "AWS CloudTrail to ECS v8.0.0 (Core)"
-description: "Normalizes individual AWS CloudTrail event records into the Elastic Common Schema (ECS) v8.0.0 core security fields (event, cloud, user, source, user_agent, related)."
+description: "Normalizes individual AWS CloudTrail event records into the Elastic Common Schema (ECS) v8.0.0 core security fields (event, cloud, user, source, user_agent, related), resolving the acting identity across every AWS sign-in form (IAM user, SAML/OIDC federation, IAM Identity Center users, and Identity Center role assumption)."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -35,15 +35,22 @@ config:
           #   .eventSource           -> event.provider
           #   .awsRegion             -> cloud.region
           #   .recipientAccountId    -> cloud.account.id
-          #   .userIdentity.userName -> user.name  (falls back to role name)
-          #   .userIdentity.principalId -> user.id
           #   .sourceIPAddress       -> source.ip / source.address
           #   .userAgent             -> user_agent.original
           #   errorCode / ConsoleLogin result -> event.outcome
+          #   the acting identity    -> user.name / user.id
+          #     (+ user.effective.* for the role it acted through)
+          #
+          # This variant emits ECS fields only - no aws.cloudtrail.* namespace
+          # and no event.original. Use the Comprehensive variant when an
+          # investigation needs the raw request/response detail, the issued
+          # access key id, or federation provider detail.
           # =================================================================
 
           # A CloudTrail sourceIPAddress is sometimes an AWS service name
-          # (e.g. "cloudtrail.amazonaws.com") rather than a client IP.
+          # (e.g. "cloudtrail.amazonaws.com") rather than a client IP. Guarding
+          # this matters for Elasticsearch: an `ip`-mapped field rejects the
+          # document outright when handed a hostname.
           def is_ip($s):
             ($s | type) == "string"
             and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
@@ -56,12 +63,18 @@ config:
             if ($s | type) == "string" and $s != "HIDDEN_DUE_TO_SECURITY_REASONS"
             then $s else null end;
 
-          # sourceIdentity is the original identity behind an assumed role. Only
-          # present when STS is configured to require it. requestParameters
-          # and responseElements are not always objects, hence the type guard.
-          def sid($o):
-            if ($o | type) == "object" then real_name($o.sourceIdentity)
-            else null end;
+          # requestParameters / responseElements / additionalEventData are not
+          # always JSON objects (a bare string aborts the whole transform when
+          # indexed), so every read of them goes through this guard.
+          def g($o; $k): if ($o | type) == "object" then $o[$k] else null end;
+
+          def sid($o): real_name(g($o; "sourceIdentity"));
+
+          # The session-name half of an assumed-role principalId
+          # ("AROAEXAMPLE:session-name" -> "session-name").
+          def session_name($p):
+            if ($p | type) == "string" and ($p | test(":"))
+            then ($p | sub("^[^:]*:"; "")) else null end;
 
           # Recursively drop null values and empty objects/arrays so the
           # emitted event stays compact.
@@ -75,29 +88,47 @@ config:
             );
 
           . as $r
+          | ( $r.userIdentity // {} ) as $ui
+          | ( $ui.sessionContext // {} ) as $sc
+          | ( $r.requestParameters ) as $rp
+          | ( $r.responseElements ) as $re
+          | ( $r.additionalEventData ) as $aed
 
           # ---- outcome ----------------------------------------------------
+          # additionalEventData.success covers the signin.amazonaws.com OAuth2
+          # events, which report failure there rather than via errorCode.
           | ( if ($r.errorCode // null) != null then "failure"
               elif ($r.eventName // "") == "ConsoleLogin"
-                then ( if ($r.responseElements.ConsoleLogin // "") == "Success"
+                then ( if (g($re; "ConsoleLogin") // "") == "Success"
                        then "success" else "failure" end )
+              elif (g($aed; "success") // "") == "false" then "failure"
               else "success" end ) as $outcome
 
-          # ---- event.category (heuristic; AWS has no explicit ECS category)
-          | ( if (($r.eventName // "") | test("^(ConsoleLogin|AssumeRole|GetSessionToken|GetFederationToken|AssumeRoleWithSAML|AssumeRoleWithWebIdentity)$"))
+          # ---- event.category --------------------------------------------
+          # Every AWS sign-in form must land in `authentication`, because that
+          # is what SIEM detection content keys on:
+          #   - IAM user / root console password sign-in .. ConsoleLogin
+          #   - SAML or OIDC federated role assumption ... AssumeRoleWith*
+          #   - plain / chained role assumption .......... AssumeRole, AssumeRoot
+          #   - IAM Identity Center sign-in and tokens ... sso*/signin* events
+          | ( if (($r.eventName // "") | test("^(ConsoleLogin|SwitchRole|ExitRole|RenewRole|CheckMfa|AssumeRole|AssumeRoot|GetSessionToken|GetFederationToken|AssumeRoleWithSAML|AssumeRoleWithWebIdentity)$"))
                 then ["authentication"]
               # IAM Identity Center sign-in and token/credential issuance.
               # This MUST be tested before the eventSource "iam" rule below,
               # which would otherwise swallow every sso./signin. event.
               elif (($r.eventSource // "") | test("^(sso|sso-oidc|signin|identitystore)\\."))
-                   and (($r.eventName // "") | test("^(Authenticate|UserAuthentication|CredentialChallenge|CredentialVerification|Federate|CreateToken|CreateTokenWithIAM|StartDeviceAuthorization|Authorize|GetRoleCredentials|SSOSignIn)$"))
+                   and (($r.eventName // "") | test("^(Authenticate|UserAuthentication|CredentialChallenge|CredentialVerification|Federate|CreateToken|CreateTokenWithIAM|StartDeviceAuthorization|Authorize|AuthorizeOAuth2Access|CreateOAuth2Token|GetRoleCredentials|SSOSignIn)$"))
                 then ["authentication"]
               elif ($r.eventSource // "") | test("^(iam|sso|signin)\\.")
                 then ["iam"]
               else ["configuration"] end ) as $category
 
           # ---- event.type (ECS allowed values) ---------------------------
-          | ( if ($r.eventName // "") == "ConsoleLogin" then ["start"]
+          # An authentication event is a session beginning, so it takes
+          # `start` rather than `access`. ECS pairs category=authentication
+          # with type=start/end/info, and detection content expects `start`.
+          | ( if ($r.eventName // "") == "ExitRole" then ["end"]
+              elif $category == ["authentication"] then ["start"]
               elif ($r.readOnly // false) == true then ["access"]
               elif (($r.eventName // "") | test("^(Create|Add|Enable|Register|Put|Allocate|Import|Run|Provision|Attach|Associate)"))
                 then ["creation"]
@@ -107,22 +138,36 @@ config:
                 then ["change"]
               else ["info"] end ) as $type
 
-          # ---- user.name (role name for assumed-role sessions) -----------
-          | ( real_name($r.userIdentity.userName)
-              // real_name($r.userIdentity.sessionContext.sessionIssuer.userName)
-              # IAM Identity Center no longer emits userIdentity.userName or
-              # principalId. The username is emitted once per successful
-              # sign-in under additionalEventData.UserName instead.
-              // real_name($r.additionalEventData.UserName) ) as $user_name
-
-          # ---- sourceIdentity: original identity behind an assumed role ---
-          | ( sid($r.userIdentity.sessionContext)
-              // sid($r.requestParameters)
-              // sid($r.responseElements) ) as $source_identity
-
-          # ---- role name of an assumed-role session (the effective identity)
-          | ( real_name($r.userIdentity.sessionContext.sessionIssuer.userName) )
-              as $issuer_name
+          # ---- IDENTITY RESOLUTION ---------------------------------------
+          # CloudTrail puts the acting identity in a different place for each
+          # sign-in form, and for a plain assumed-role session it supplies no
+          # human at all. Resolved most-authoritative first:
+          #
+          #  1. sourceIdentity ....... the originating human, when STS is
+          #       configured to require it. Survives role chaining.
+          #  2. Identity Center role assumption (what a mature setup does:
+          #       IdP -> Identity Center -> permission set). userIdentity.type
+          #       is "AssumedRole" and onBehalfOf sits ALONGSIDE principalId,
+          #       whose session-name half is the Identity Center username.
+          #  3. additionalEventData.UserName .. Identity Center sign-in events
+          #       (CredentialChallenge / UserAuthentication). AWS documents
+          #       this as the only username source for Identity Center.
+          #  4. userIdentity.userName ... IAMUser (console password sign-in),
+          #       SAMLUser (the saml:sub), WebIdentityUser (the OIDC user id),
+          #       Root (the account alias).
+          #  5. sessionIssuer.userName .. last resort: the ROLE name, not a
+          #       person. Only used when nothing above identifies a human.
+          | ( g($ui.onBehalfOf; "userId") ) as $idc_user_id
+          | ( if $idc_user_id != null then session_name($ui.principalId)
+              else null end ) as $idc_name
+          | ( sid($sc) // sid($rp) // sid($re) ) as $source_identity
+          | ( $source_identity
+              // $idc_name
+              // real_name(g($aed; "UserName"))
+              // real_name($ui.userName) ) as $actor
+          # The role whose privileges are in effect. Null for non-session
+          # callers (IAM user, SAML/OIDC assume calls, Identity Center users).
+          | ( real_name($sc.sessionIssuer.userName) ) as $role_name
 
           | {
               ecs: { version: "8.0.0" },
@@ -144,35 +189,33 @@ config:
               cloud: {
                 provider: "aws",
                 region: $r.awsRegion,
-                account: { id: ($r.recipientAccountId // $r.userIdentity.accountId) }
+                account: { id: ($r.recipientAccountId // $ui.accountId) }
               },
 
               # ECS models user.* as the identity that INITIATED the action and
               # user.effective.* as the identity whose privileges were used -
-              # the `sudo` model. When STS is configured to require a
-              # sourceIdentity, an assumed-role call gives us both: the human
-              # initiated it, the role's privileges carried it out.
+              # the `sudo` model. Where CloudTrail gives us both a human and
+              # the role they acted through, that maps exactly.
               #
-              # NOTE this makes user.name intentionally bimodal - the human
-              # where sourceIdentity is configured, otherwise the role or IAM
-              # user name, which is the only identity CloudTrail supplies.
-              # user.effective.* is populated ONLY when it differs from
-              # user.*, so it never merely duplicates it.
+              # NOTE user.name is intentionally bimodal: the human wherever one
+              # is identifiable (see IDENTITY RESOLUTION above), otherwise the
+              # role name, which is the only identity CloudTrail supplies for a
+              # plain assumed-role session. user.effective.* is populated ONLY
+              # when it differs from user.*, so it never merely duplicates it.
               user: (
-                if $source_identity != null and $issuer_name != null then {
-                  name: $source_identity,
-                  # CloudTrail carries no id for the source identity itself;
-                  # the role session principal becomes the effective id.
+                if $actor != null and $role_name != null then {
+                  # Identity Center supplies a stable, immutable user id; other
+                  # forms carry no id for the human, so user.id is omitted
+                  # rather than filled with the role session principal.
+                  id: $idc_user_id,
+                  name: $actor,
                   effective: {
-                    id: $r.userIdentity.principalId,
-                    name: $issuer_name
+                    id: $ui.principalId,
+                    name: $role_name
                   }
                 } else {
-                  # IdentityCenterUser events (and Identity Center events typed
-                  # "Unknown") carry no principalId; the Identity Store user id
-                  # in onBehalfOf is the only stable identifier available.
-                  id: ($r.userIdentity.principalId // $r.userIdentity.onBehalfOf.userId),
-                  name: ($source_identity // $user_name)
+                  id: ($idc_user_id // $ui.principalId),
+                  name: ($actor // $role_name)
                 } end
               ),
 
@@ -185,7 +228,16 @@ config:
 
               related: {
                 ip: ( if is_ip($r.sourceIPAddress) then [$r.sourceIPAddress] else [] end ),
-                user: ( [ $user_name, $source_identity ]
+                # Every identifier for the actor seen anywhere on the event, so
+                # a single related.user search finds the activity whichever
+                # sign-in form produced it.
+                user: ( [ $actor,
+                          $role_name,
+                          $source_identity,
+                          $idc_name,
+                          real_name($ui.userName),
+                          real_name(g($aed; "UserName")),
+                          real_name(g($re; "subject")) ]
                         | map(select(. != null)) | unique )
               }
             }
