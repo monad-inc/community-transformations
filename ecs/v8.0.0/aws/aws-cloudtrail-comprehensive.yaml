@@ -112,6 +112,10 @@ config:
               // sid($r.requestParameters)
               // sid($r.responseElements) ) as $source_identity
 
+          # The role name of an assumed-role session, i.e. the identity whose
+          # privileges are actually in effect. Null for non-session callers.
+          | ( real_name($sc.sessionIssuer.userName) ) as $issuer_name
+
           | {
               ecs: { version: "8.0.0" },
 
@@ -136,13 +140,34 @@ config:
                 account: { id: ($r.recipientAccountId // $ui.accountId) }
               },
 
-              user: {
-                # IdentityCenterUser events (and Identity Center events typed
-                # "Unknown") carry no principalId; the Identity Store user id
-                # in onBehalfOf is the only stable identifier available.
-                id: ($ui.principalId // $ui.onBehalfOf.userId),
-                name: $user_name
-              },
+              # ECS models user.* as the identity that INITIATED the action and
+              # user.effective.* as the identity whose privileges were used -
+              # the `sudo` model. When STS is configured to require a
+              # sourceIdentity, an assumed-role call gives us both: the human
+              # initiated it, the role's privileges carried it out.
+              #
+              # NOTE this makes user.name intentionally bimodal - the human
+              # where sourceIdentity is configured, otherwise the role or IAM
+              # user name, which is the only identity CloudTrail supplies.
+              # user.effective.* is populated ONLY when it differs from
+              # user.*, so it never merely duplicates it.
+              user: (
+                if $source_identity != null and $issuer_name != null then {
+                  name: $source_identity,
+                  # CloudTrail carries no id for the source identity itself;
+                  # the role session principal becomes the effective id.
+                  effective: {
+                    id: $ui.principalId,
+                    name: $issuer_name
+                  }
+                } else {
+                  # IdentityCenterUser events (and Identity Center events typed
+                  # "Unknown") carry no principalId; the Identity Store user id
+                  # in onBehalfOf is the only stable identifier available.
+                  id: ($ui.principalId // $ui.onBehalfOf.userId),
+                  name: ($source_identity // $user_name)
+                } end
+              ),
 
               source: {
                 address: $r.sourceIPAddress,
