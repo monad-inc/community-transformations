@@ -1,0 +1,156 @@
+name: "Tenable Vulnerability Findings to ECS v9.5.0"
+description: "Normalizes individual Tenable Vulnerability Management finding records into the Elastic Common Schema (ECS) v9.5.0 security fields (event, vulnerability, host, cloud, related), modeling each scan finding as an event.kind:alert in the vulnerability category."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "tenable-vulnerabilities"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "tenable"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Tenable Vulnerability Management  ->  ECS v9.5.0
+          #
+          # Input: ONE Tenable VM vulnerability finding per invocation.
+          # ECS has no "finding" concept: a vulnerability finding maps to
+          #   event.kind: alert + event.category: [vulnerability] (type info)
+          #   + the vulnerability.* field set. Host / cloud context comes from
+          #   the Tenable asset block.
+          # =================================================================
+
+          # An ES `ip`-mapped field rejects a document handed a hostname, so
+          # guard every ip-typed assignment.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # Tenable timestamps carry fractional seconds + Z; ECS @timestamp is
+          # ISO-8601 and tolerates the fraction, so pass strings through as-is.
+
+          # ECS host.os.type closed vocabulary from the Tenable OS string.
+          def os_type($o):
+            ($o // "" | ascii_downcase) as $s |
+            if   ($s | test("windows")) then "windows"
+            elif ($s | test("mac os|macos|os x")) then "macos"
+            elif ($s | test("android")) then "android"
+            elif ($s | test("ios")) then "ios"
+            elif ($s | test("linux|ubuntu|debian|red ?hat|centos|suse|fedora")) then "linux"
+            else null end;
+          def os_family($o):
+            ($o // "" | ascii_downcase) as $s |
+            if   ($s | test("windows")) then "windows"
+            elif ($s | test("mac os|macos|os x")) then "macos"
+            elif ($s | test("ubuntu|debian")) then "debian"
+            elif ($s | test("red ?hat|centos|fedora")) then "redhat"
+            elif ($s | test("suse")) then "suse"
+            elif ($s | test("linux")) then "linux"
+            else null end;
+
+          # Recursively drop null values and empty objects/arrays.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.plugin // {} ) as $p
+          | ( $r.asset  // {} ) as $a
+          | ( $a.operating_system // [] | first ) as $os
+
+          # CVEs: plugin.cve (prefixed) unioned with any CVE cross-references.
+          | ( ( ($p.cve // [])
+                + [ ($p.xrefs // [])[] | select(.type == "CVE") | "CVE-" + (.id | ltrimstr("CVE-")) ] )
+              | unique ) as $cves
+          # CWEs from cross-references -> vulnerability.enumeration / category.
+          | ( [ ($p.xrefs // [])[] | select(.type == "CWE") | "CWE-" + (.id | ltrimstr("CWE-")) ]
+              | unique ) as $cwes
+
+          # Cloud provider from the Tenable CSP asset identifiers.
+          | ( if   $a.aws_ec2_instance_id != null then "aws"
+              elif ($a.azure_vm_id // $a.azure_resource_id) != null then "azure"
+              elif ($a.gcp_instance_id // $a.gcp_project_id) != null then "gcp"
+              else null end ) as $cloud_provider
+
+          # A Tenable finding is a scanner assertion, not a success/failure
+          # action; ECS outcome is `unknown` for that.
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": ($r.scan.started_at // $r.last_found // $r.first_found),
+
+              event: {
+                kind: "alert",
+                module: "tenable",
+                dataset: "tenable.vulnerability",
+                provider: "Tenable Vulnerability Management",
+                category: ["vulnerability"],
+                type: ["info"],
+                outcome: "unknown",
+                severity: $r.severity_id,
+                id: ($p.id | tostring),
+                created: $r.indexed,
+                start: $r.first_found,
+                end: $r.last_found,
+                reference: ($p.see_also // [] | first),
+                url: ($p.see_also // [] | first)
+              },
+
+              vulnerability: {
+                id: ( if ($cves | length) > 0 then $cves else [($p.id | tostring)] end ),
+                enumeration: ( if ($cves | length) > 0 then "CVE"
+                               elif ($cwes | length) > 0 then "CWE" else null end ),
+                category: ( ($cwes + [$p.family]) | map(select(. != null)) | unique ),
+                classification: "CVSS",
+                description: ($p.synopsis // $p.description),
+                reference: ($p.see_also // [] | first),
+                report_id: ($p.id | tostring),
+                scanner: { vendor: "Tenable" },
+                severity: $r.severity,
+                score: (
+                  { version: (if $p.cvss3_base_score != null then "3.0"
+                              elif $p.cvss_base_score != null then "2.0" else null end),
+                    base: ($p.cvss3_base_score // $p.cvss_base_score) }
+                )
+              },
+
+              host: {
+                hostname: ($a.hostname // $a.netbios_name),
+                name: ($a.fqdn // $a.hostname // $a.netbios_name),
+                id: $a.uuid,
+                ip: ( [ $a.ipv4, $a.ipv6 ] | map(select(is_ip(.))) ),
+                mac: ( if $a.mac_address != null then [$a.mac_address] else null end ),
+                os: ( if $os != null then {
+                        full: $os,
+                        name: $os,
+                        type: os_type($os),
+                        family: os_family($os)
+                      } else null end )
+              },
+
+              cloud: ( if $cloud_provider != null then {
+                  provider: $cloud_provider,
+                  region: $a.aws_region,
+                  instance: { id: ($a.aws_ec2_instance_id // $a.azure_vm_id // $a.gcp_instance_id) },
+                  account: { id: ($a.aws_owner_id // $a.gcp_project_id) }
+                } else null end ),
+
+              related: {
+                ip: ( [ $a.ipv4, $a.ipv6 ] | map(select(is_ip(.))) ),
+                hosts: ( [ $a.hostname, $a.fqdn, $a.netbios_name ]
+                         | map(select(. != null)) | unique )
+              }
+            }
+          | prune

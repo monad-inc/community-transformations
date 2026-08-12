@@ -1,0 +1,73 @@
+name: "Monad Organization Logs to ECS v9.5.0"
+description: "Transforms Monad Organization Logs (monad-logs) into Elastic Common Schema (ECS) v9.5.0, covering event, http, url, user, client, user_agent, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "monad-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "monad"
+  - "organization"
+  - "logs"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Monad Organization Logs -> ECS v9.5.0 (nested document)
+          . as $r
+          | def is_ip($s):
+              ($s | type) == "string"
+              and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$|:"));
+            ({
+              "GET": "access",
+              "POST": "creation",
+              "PUT": "change",
+              "PATCH": "change",
+              "DELETE": "deletion"
+            }[$r.method] // "info") as $etype
+          | (
+              if ($r.status | tonumber) >= 200 and ($r.status | tonumber) < 400 then "success"
+              else "failure"
+              end
+            ) as $outcome
+          | {
+              "@timestamp": $r.timestamp,
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: ["api"],
+                type: [$etype],
+                action: ($r.method + " " + $r.resource),
+                id: $r.id,
+                outcome: $outcome,
+                provider: "monad",
+                dataset: "monad.organization_logs"
+              },
+              http: {
+                request: { method: $r.method },
+                response: { status_code: ($r.status | tonumber | floor) }
+              },
+              url: { path: $r.resource },
+              user: { email: $r.user_email },
+              client: (if is_ip($r.client_ip) then { ip: $r.client_ip } else {} end),
+              user_agent: { original: $r.client_info },
+              related: {
+                user: ([$r.user_email] | map(select(. != null)) | unique),
+                ip: ([ (if is_ip($r.client_ip) then $r.client_ip else null end) ] | map(select(. != null)) | unique)
+              },
+              labels: (
+                { log_version: $r.log_version, additional_info: $r.additional_info }
+                | with_entries(select(.value != null))
+              )
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else .
+              end
+            )

@@ -1,0 +1,85 @@
+name: "Box Enterprise Events to ECS v9.5.0"
+description: "Maps Box Enterprise Events into Elastic Common Schema (ECS) v9.5.0, populating the event categorization (file), user, source, file, and related field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "box-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "box"
+  - "file"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Box Enterprise Events -> ECS v9.5.0 (nested). One record in, one
+          # nested ECS document out. Single end-of-pipeline walk-based prune.
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") or test(":"));
+
+          def iso8601($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then
+              ((if $ts > 9999999999 then ($ts/1000) else $ts end) | todate)
+            else $ts
+            end;
+
+          . as $r
+          | ($r.created_by) as $cb
+          | ($r.source) as $src
+          | ($r.event_type) as $et
+          # file category -> allowed types: access, change, creation, deletion, info
+          | (if ($et | type) != "string" then "info"
+             elif ($et | test("UPLOAD|CREATE|COPY|ADD|NEW_|RESTORE|UNDELETE")) then "creation"
+             elif ($et | test("DOWNLOAD|PREVIEW|OPEN|VIEW|ACCESS")) then "access"
+             elif ($et | test("DELETE|TRASH|REMOVE|PURGE")) then "deletion"
+             elif ($et | test("EDIT|UPDATE|RENAME|MOVE|CHANGE|LOCK|UNLOCK|SHARE|COLLABORAT")) then "change"
+             else "info" end) as $etype
+          | (if ($et | type) == "string" and ($et | test("FAILED_|ERROR|REJECT|DECLINE|DENIED")) then "failure" else "success" end) as $outcome
+          | {
+              "@timestamp": iso8601($r.created_at),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "event",
+                "category": ["file"],
+                "type": [$etype],
+                "outcome": $outcome,
+                "action": ($et | ascii_downcase? // $et),
+                "id": $r.event_id,
+                "provider": "box",
+                "module": "box",
+                "dataset": "box.events"
+              },
+              "user": ( {
+                "id": ($cb.id | tostring?),
+                "name": ($cb.name // $cb.login),
+                "email": $cb.login,
+                "full_name": $cb.name
+              } ),
+              "source": ( if is_ip($r.ip_address) then { "ip": $r.ip_address } else null end ),
+              "file": ( {
+                "name": ($src.item_name // $src.name),
+                "type": ($src.item_type // $src.type),
+                "size": ($r.additional_details.size),
+                "directory": ($src.parent.name),
+                "owner": ($src.owned_by.name // $src.owned_by.login)
+              } ),
+              "organization": { "name": ($r.additional_details.service_name) },
+              "related": {
+                "ip": ( [ (if is_ip($r.ip_address) then $r.ip_address else null end) ] | map(select(. != null)) | unique ),
+                "user": ( [ $cb.name, $cb.login, $src.owned_by.name, $src.owned_by.login ] | map(select(. != null)) | unique )
+              },
+              "box": {
+                "session_id": $r.session_id,
+                "item_id": ($src.item_id // $src.id),
+                "service_id": ($r.additional_details.service_id)
+              }
+            }
+          # single recursive prune: drop nulls, empty objects, empty arrays
+          | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null))
+                  else . end )

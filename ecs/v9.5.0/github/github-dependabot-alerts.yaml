@@ -1,0 +1,106 @@
+name: "GitHub Dependabot Alerts to ECS v9.5.0"
+description: "Normalizes a GitHub Dependabot vulnerability alert record into the Elastic Common Schema (ECS) v9.5.0 (event categorization, vulnerability, package, organization, url, related), mapping the advisory CVE/GHSA identifiers, CVSS score, affected package, and repository context."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-dependabot-alerts"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "github"
+  - "dependabot"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # GitHub Dependabot Alert  ->  ECS v9.5.0
+          #   event.kind: alert; event.category: [vulnerability];
+          #   event.type: [info] (the only type ECS pairs with vulnerability)
+          #
+          #   .updated_at/.created_at   -> @timestamp / event.created
+          #   security_advisory.cve_id  -> vulnerability.id, related.hosts n/a
+          #   security_advisory.ghsa_id -> vulnerability.report_id
+          #   cwes[].cwe_id             -> vulnerability.enumeration/classification
+          #   cvss.score/version        -> vulnerability.score.base/version
+          #   dependency.package        -> package.name/type + vulnerability
+          #   repository.owner.login    -> organization.name
+          #   html_url                  -> url.full / event.reference
+          # =================================================================
+          . as $r
+          | ($r.security_advisory // {}) as $adv
+          | ($r.security_vulnerability // {}) as $sv
+          | ($r.dependency // {}) as $dep
+          | (($dep.package // $sv.package // $adv.vulnerabilities[0].package) // {}) as $pkg
+          | ($adv.severity // $sv.severity // null) as $sev
+          | ($adv.cve_id // $adv.ghsa_id) as $vid
+
+          | (if $r.state == "fixed" then "success"
+             elif ($r.state == "dismissed" or $r.state == "auto_dismissed") then "unknown"
+             else "unknown" end) as $outcome
+
+          | {
+              "@timestamp": ($r.updated_at // $r.created_at),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": ["vulnerability"],
+                "type": ["info"],
+                "outcome": $outcome,
+                "id": ($r.number | tostring),
+                "provider": "dependabot",
+                "module": "github",
+                "dataset": "github.dependabot_alerts",
+                "created": $r.created_at,
+                "url": $r.html_url,
+                "reference": ($adv.references[0].url // null),
+                "severity": ({ "low": 21, "medium": 47, "high": 73, "critical": 99 }[$sev] // null)
+              },
+
+              "vulnerability": {
+                "id": $vid,
+                "report_id": $adv.ghsa_id,
+                "description": ($adv.summary // $adv.description),
+                "severity": (if $sev != null then ($sev | (.[0:1] | ascii_upcase) + .[1:]) else null end),
+                "reference": ($adv.references[0].url // $r.html_url),
+                "scanner": { "vendor": "GitHub Dependabot" },
+                "status": $r.state,
+                "enumeration": (if $adv.cve_id then "CVE" else "GHSA" end),
+                "classification": ($adv.cwes[0].cwe_id // null),
+                "category": [ ($pkg.ecosystem // "dependency") ],
+                "score": ( if ($adv.cvss.score // null) != null then {
+                    "base": $adv.cvss.score,
+                    "version": ( ($adv.cvss.vector_string | capture("^CVSS:(?<v>[0-9.]+)").v) // null )
+                } else null end )
+              },
+
+              "package": {
+                "name": $pkg.name,
+                "type": $pkg.ecosystem,
+                "path": $dep.manifest_path,
+                "reference": $r.html_url
+              },
+
+              "organization": {
+                "name": ($r.repository.owner.login // null),
+                "id": (if ($r.repository.owner.id // null) != null then ($r.repository.owner.id | tostring) else null end)
+              },
+
+              "url": {
+                "full": $r.html_url,
+                "domain": "github.com"
+              },
+
+              "message": ($adv.summary // ("Dependabot alert " + ($r.number | tostring))),
+              "tags": [ ($r.repository.full_name // empty) ],
+
+              "related": {
+                "hosts": [ ($r.repository.full_name // empty) ]
+              }
+            }
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

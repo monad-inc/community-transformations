@@ -1,0 +1,125 @@
+name: "AlienVault OTX Indicators to ECS v9.5.0"
+description: "Normalizes AlienVault OTX IOC indicator records (enriched with parent-pulse threat context) into Elastic Common Schema (ECS) v9.5.0 threat-intelligence fields (event, threat.indicator, threat.feed, threat.group, threat.software, threat.technique, related)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-indicators"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "alienvault"
+  - "otx-indicators"
+  - "threat-intel"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AlienVault OTX Indicators  ->  ECS v9.5.0  (threat intelligence)
+          #
+          # Input: ONE OTX indicator record per invocation (indicator/type/
+          #   created/role/...) with a nested parent-pulse object under
+          #   `.pulse`, as emitted by the Monad `alienvault-otx-indicators`
+          #   connector.
+          #
+          # A threat-intel indicator maps to event.kind=enrichment,
+          # event.category=[threat], event.type=[indicator] and the
+          # threat.indicator.* field set.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$")
+                 or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          . as $r
+          | ($r.type // "") as $itype
+          | ($r.pulse // {}) as $p
+          | ($r.indicator // "") as $ioc
+
+          # OTX indicator type -> ECS threat.indicator.type value
+          | ( { "IPv4":"ipv4-addr", "IPv6":"ipv6-addr", "CIDR":"ipv4-addr",
+                "domain":"domain-name", "hostname":"domain-name",
+                "URL":"url", "URI":"url",
+                "FileHash-MD5":"file", "FileHash-SHA1":"file",
+                "FileHash-SHA256":"file", "FileHash-PEHASH":"file",
+                "FileHash-IMPHASH":"file", "FileHash-SSDEEP":"file",
+                "email":"email-addr",
+                "FilePath":"file", "Mutex":"process",
+                "CVE":"software" }[$itype] // "unknown" ) as $ecs_type
+
+          | {
+              "@timestamp": ($r.created // $p.created),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "enrichment",
+                "category": ["threat"],
+                "type": ["indicator"],
+                "outcome": "unknown",
+                "provider": "AlienVault OTX",
+                "created": ($r.created // null),
+                "module": "alienvault_otx"
+              },
+
+              "message": (($p.name // "OTX indicator")
+                          + " — " + $itype + " " + $ioc),
+              "tags": ($p.tags // null),
+
+              "threat": {
+                "feed": {
+                  "name": "AlienVault OTX",
+                  "reference": ($p.references[0]? // null)
+                },
+                "indicator": {
+                  "type": $ecs_type,
+                  "name": $ioc,
+                  "description": ($r.description // $r.content // null),
+                  "provider": ($p.author_name // "AlienVault"),
+                  "reference": ($p.references[0]? // null),
+                  "first_seen": ($r.created // null),
+                  "last_seen": ($p.modified // null),
+                  "marking": {
+                    "tlp": (if ($p.tlp // "") == "" then null
+                            else ($p.tlp | ascii_upcase) end)
+                  },
+                  "confidence": (if ($r.is_active // 0) == 1 then "High" else "Not Specified" end),
+                  "ip": (if ($ecs_type == "ipv4-addr" or $ecs_type == "ipv6-addr")
+                            and is_ip($ioc) then $ioc else null end),
+                  "url": (if $ecs_type == "url"
+                          then { "full": $ioc, "original": $ioc } else null end),
+                  "email": (if $ecs_type == "email-addr"
+                            then { "address": $ioc } else null end),
+                  "file": (
+                    if $itype == "FileHash-MD5" then { "hash": { "md5": $ioc } }
+                    elif $itype == "FileHash-SHA1" then { "hash": { "sha1": $ioc } }
+                    elif $itype == "FileHash-SHA256" then { "hash": { "sha256": $ioc } }
+                    else null end)
+                },
+                "group": (if ($p.adversary // "") == "" then null
+                          else { "name": $p.adversary } end),
+                "software": (if ($p.malware_families // []) | length > 0
+                             then { "name": $p.malware_families[0], "type": "Malware" }
+                             else null end),
+                "technique": (if ($p.attack_ids // []) | length > 0
+                              then { "id": $p.attack_ids } else null end)
+              },
+
+              "related": {
+                "ip": (if ($ecs_type == "ipv4-addr" or $ecs_type == "ipv6-addr")
+                          and is_ip($ioc) then [$ioc] else null end),
+                "hosts": (if $ecs_type == "domain-name" then [$ioc] else null end)
+              }
+            }
+          # Single end-of-pipeline recursive prune: ES rejects nulls, and the
+          # doc is deeply nested. Drops null, {}, [].
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

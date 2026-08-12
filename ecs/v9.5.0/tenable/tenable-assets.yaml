@@ -1,0 +1,96 @@
+name: "Tenable Assets to ECS v9.5.0"
+description: "Maps Tenable Vulnerability Management asset inventory records into Elastic Common Schema (ECS) v9.5.0, covering the event, host, os, cloud, and related field sets as an asset snapshot."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "tenable-assets"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "tenable"
+  - "asset"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Tenable asset inventory -> ECS v9.5.0 (nested). Asset snapshot:
+          # event.kind=asset, category=[host], type=[info].
+          def is_ip($s):
+            ($s | type) == "string" and
+            ( ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))
+              or ($s | test("^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$")) );
+          . as $r |
+          ( ($r.ipv4s // []) + ($r.ipv6s // []) | map(select(is_ip(.))) | unique ) as $ips |
+          ( ($r.hostnames // []) + ($r.netbios_names // []) + ($r.fqdns // []) | unique ) as $hosts |
+          ( ($r.operating_systems // [])[0] ) as $osfull |
+          ( ($osfull // "" | ascii_downcase) ) as $osl |
+          {
+            "@timestamp": ($r.updated_at // $r.last_seen),
+            "ecs": { "version": "9.5.0" },
+            "event": {
+              "kind": "asset",
+              "category": ["host"],
+              "type": ["info"],
+              "outcome": "unknown",
+              "module": "tenable",
+              "dataset": "tenable.asset",
+              "provider": "Tenable Vulnerability Management",
+              "id": $r.id,
+              "created": $r.first_seen,
+              "ingested": $r.last_seen
+            },
+            "host": {
+              "id": $r.id,
+              "name": ($hosts[0]),
+              "hostname": (($r.hostnames // [])[0]),
+              "domain": (($r.fqdns // [])[0]),
+              "ip": (if ($ips | length) > 0 then $ips else null end),
+              "mac": (if (($r.mac_addresses // []) | length) > 0 then $r.mac_addresses else null end),
+              "os": (
+                if $osfull then {
+                  "full": $osfull,
+                  "name": $osfull,
+                  "type": (
+                    if ($osl | contains("windows")) then "windows"
+                    elif ($osl | contains("linux")) then "linux"
+                    elif ($osl | contains("mac")) then "macos"
+                    elif ($osl | contains("android")) then "android"
+                    elif ($osl | contains("ios")) then "ios"
+                    else null end
+                  ),
+                  "platform": (
+                    if ($osl | contains("windows")) then "windows"
+                    elif ($osl | contains("linux")) then "linux"
+                    elif ($osl | contains("mac")) then "darwin"
+                    else null end
+                  )
+                } else null end
+              )
+            },
+            "cloud": (
+              if ($r.aws_region != null or $r.aws_ec2_instance_id != null) then {
+                "provider": "aws",
+                "region": $r.aws_region,
+                "availability_zone": $r.aws_availability_zone,
+                "account": (if $r.aws_owner_id then { "id": $r.aws_owner_id } else null end),
+                "instance": (if $r.aws_ec2_instance_id then { "id": $r.aws_ec2_instance_id } else null end),
+                "machine": (if $r.aws_ec2_instance_type then { "type": $r.aws_ec2_instance_type } else null end)
+              } else null end
+            ),
+            "related": {
+              "ip": $ips,
+              "hosts": $hosts
+            }
+          }
+          # Single end-of-pipeline prune: drop null / {} / [] so ES accepts the doc.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

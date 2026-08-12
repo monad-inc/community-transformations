@@ -1,0 +1,124 @@
+name: "CrowdStrike Event Stream Detections to ECS v9.5.0"
+description: "Transforms CrowdStrike Falcon Event Stream DetectionSummaryEvent records into a nested Elastic Common Schema (ECS) v9.5.0 document, populating event categorization plus host.*, user.*, process.*, file.*, threat.*, and related.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-event-stream"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "crowdstrike"
+  - "detection"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CrowdStrike Falcon Event Stream (DetectionSummaryEvent) -> ECS v9.5.0
+          # One nested ECS document per record. event.kind=alert; category
+          # [malware, intrusion_detection] with type [info] (the only type
+          # legal for the malware category).
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ( ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))
+                  or ($s | test(":")) );
+
+          def to_iso_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then ((if $ts > 1000000000000 then ($ts / 1000) else $ts end) | todateiso8601)
+            else null end;
+
+          . as $r
+          | ($r.event // {}) as $e
+          | ($r.metadata // {}) as $m
+          | ($e.PatternDispositionValue // 0) as $disp
+          | {
+              "@timestamp": to_iso_ms($m.eventCreationTime),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "alert",
+                category: ["malware", "intrusion_detection"],
+                type: ["info"],
+                outcome: (if $disp > 0 then "success" else "unknown" end),
+                provider: "CrowdStrike Falcon",
+                module: "crowdstrike",
+                dataset: "crowdstrike.event_stream",
+                action: $e.DetectName,
+                id: $e.DetectId,
+                reference: $e.FalconHostLink,
+                severity: $e.Severity,
+                original: ($r | tojson)
+              },
+
+              rule: {
+                name: $e.DetectName,
+                description: $e.DetectDescription
+              },
+
+              message: $e.DetectDescription,
+
+              host: {
+                name: $e.ComputerName,
+                hostname: $e.ComputerName,
+                domain: $e.MachineDomain,
+                id: $e.SensorId,
+                ip: (if is_ip($e.LocalIP) then [$e.LocalIP] else null end),
+                mac: (if ($e.MACAddress // "") != "" then [$e.MACAddress] else null end)
+              },
+
+              user: {
+                name: $e.UserName
+              },
+
+              process: {
+                pid: $e.ProcessId,
+                name: $e.FileName,
+                executable: $e.FilePath,
+                command_line: $e.CommandLine,
+                hash: {
+                  sha256: $e.SHA256String,
+                  md5: $e.MD5String
+                },
+                parent: {
+                  pid: $e.ParentProcessId,
+                  command_line: $e.ParentCommandLine
+                }
+              },
+
+              file: {
+                name: $e.FileName,
+                path: $e.FilePath,
+                hash: {
+                  sha256: $e.SHA256String,
+                  md5: $e.MD5String
+                }
+              },
+
+              threat: {
+                tactic: { name: (if ($e.Tactic // "") != "" then [$e.Tactic] else null end) },
+                technique: { name: (if ($e.Technique // "") != "" then [$e.Technique] else null end) }
+              },
+
+              related: {
+                ip: ( [ (if is_ip($e.LocalIP) then $e.LocalIP else null end) ]
+                      | map(select(. != null)) | unique ),
+                user: ( [ $e.UserName ] | map(select(. != null and . != "")) | unique ),
+                hosts: ( [ $e.ComputerName ] | map(select(. != null and . != "")) | unique ),
+                hash: ( [ $e.SHA256String, $e.MD5String ]
+                        | map(select(. != null and . != "")) | unique )
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != "" and . != {} and . != []))
+              else .
+              end
+            )

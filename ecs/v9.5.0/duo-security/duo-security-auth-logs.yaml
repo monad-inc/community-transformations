@@ -1,0 +1,100 @@
+name: "Duo Security Authentication Logs to ECS v9.5.0"
+description: "Maps Cisco Duo Security authentication log records into Elastic Common Schema (ECS) v9.5.0, covering event categorization, user, source, host/os, and related.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "duo-security-auth-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "duo-security"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # ECS v9.5.0 — Duo Security authentication log -> nested ECS doc.
+          # One record per invocation. Single construction pass, one prune.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") or test(":"));
+          def to_iso($r):
+            if ($r.isotimestamp // null) != null then ($r.isotimestamp | sub("\\+00:00$"; "Z"))
+            elif ($r.timestamp // null) != null then ($r.timestamp | todateiso8601)
+            else null end;
+
+          . as $r
+          | ($r.result // "" | ascii_downcase) as $result
+          | (if $result == "success" then "success"
+             elif $result == "" then "unknown"
+             else "failure" end) as $outcome
+          | {
+              "@timestamp": to_iso($r),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "event",
+                "category": ["authentication"],
+                "type": (if $outcome == "success" then ["start", "info"] else ["info"] end),
+                "outcome": $outcome,
+                "action": ($r.event_type // "authentication"),
+                "id": $r.txid,
+                "provider": "duo",
+                "module": "duo_security",
+                "dataset": "duo_security.auth",
+                "reason": ($r.reason // null),
+                "original": ($r | tostring)
+              },
+              "user": ({
+                "name": ($r.user.name // $r.email),
+                "id": ($r.user.key // null),
+                "email": ($r.email // null),
+                "domain": (($r.email // "") | (if index("@") then split("@")[1] else null end)),
+                "group": (($r.user.groups // []) | map(select(. != null and . != "")) | if length > 0 then { "name": . } else null end)
+              } | with_entries(select(.value != null and .value != ""))),
+              "source": ({
+                "ip": (if is_ip($r.access_device.ip // null) then $r.access_device.ip else null end),
+                "address": ($r.access_device.ip // null),
+                "geo": (if ($r.access_device.location // null) != null
+                        then { "city_name": ($r.access_device.location.city // null),
+                               "region_name": ($r.access_device.location.state // null),
+                               "country_name": ($r.access_device.location.country // null) }
+                             | with_entries(select(.value != null))
+                        else null end)
+              } | with_entries(select(.value != null and .value != {}))),
+              "host": ({
+                "hostname": ($r.access_device.hostname // null),
+                "os": (if ($r.access_device.os // null) != null
+                       then { "name": ($r.access_device.os // null),
+                              "version": ($r.access_device.os_version // null),
+                              "full": ((($r.access_device.os // "") + " " + ($r.access_device.os_version // "")) | sub("^ +| +$"; "")) }
+                            | with_entries(select(.value != null and .value != ""))
+                       else null end)
+              } | with_entries(select(.value != null and .value != {}))),
+              "user_agent": ({
+                "name": ($r.access_device.browser // null),
+                "version": ($r.access_device.browser_version // null)
+              } | with_entries(select(.value != null))),
+              "service": ({
+                "name": ($r.application.name // null),
+                "id": ($r.application.key // null)
+              } | with_entries(select(.value != null))),
+              "observer": {
+                "vendor": "Cisco",
+                "product": "Duo Security",
+                "type": "authentication"
+              },
+              "related": ({
+                "user": ([$r.user.name, $r.email] | map(select(. != null and . != "")) | unique),
+                "ip": ([$r.access_device.ip, $r.auth_device.ip] | map(select(is_ip(.))) | unique)
+              } | with_entries(select(.value != null and (.value | length) > 0))),
+              "labels": ({
+                "duo_factor": ($r.factor // null),
+                "duo_result": ($r.result // null),
+                "trusted_endpoint_status": ($r.trusted_endpoint_status // null)
+              } | with_entries(select(.value != null and .value != "")))
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)

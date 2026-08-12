@@ -1,0 +1,110 @@
+name: "CrowdStrike Falcon Data Replicator to ECS v9.5.0"
+description: "Transforms a CrowdStrike Falcon Data Replicator (FDR) ProcessRollup2 endpoint telemetry record into Elastic Common Schema (ECS) v9.5.0, covering the event, host, process, user, agent, observer, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-falcon-data-replicator"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "crowdstrike"
+  - "process"
+  - "falcon-data-replicator"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # ECS v9.5.0 — CrowdStrike Falcon Data Replicator ProcessRollup2
+          # One raw FDR endpoint record -> one nested ECS document.
+          # ---------------------------------------------------------------
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")
+                 or ($s | test(":")));
+
+          def basename($p):
+            if $p == null or $p == "" then null
+            else ($p | gsub("\\\\"; "/") | split("/") | last)
+            end;
+
+          # FDR .timestamp is epoch milliseconds (string) -> ISO-8601 UTC.
+          def to_iso_ms($ts):
+            if $ts == null or $ts == ""
+            then null
+            else (($ts | tonumber) / 1000 | todateiso8601)
+            end;
+
+          . as $r
+          | ($r.aip) as $aip
+          | {
+              "@timestamp": to_iso_ms($r.timestamp),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: ["process"],
+                type: ["start"],
+                outcome: "unknown",
+                action: $r.event_simpleName,
+                module: "crowdstrike",
+                dataset: "crowdstrike.fdr",
+                provider: "falcon-data-replicator"
+              },
+              agent: {
+                id: $r.aid,
+                type: "crowdstrike-falcon"
+              },
+              observer: {
+                vendor: "CrowdStrike",
+                product: "Falcon Data Replicator"
+              },
+              organization: {
+                id: $r.cid
+              },
+              host: {
+                name: $r.ComputerName,
+                hostname: $r.ComputerName,
+                id: $r.aid,
+                ip: (if is_ip($aip) then [$aip] else null end),
+                os: {
+                  type: "windows",
+                  family: "windows",
+                  name: "Windows"
+                }
+              },
+              process: {
+                pid: (if $r.RawProcessId != null then ($r.RawProcessId | tonumber) else null end),
+                name: basename($r.ImageFileName),
+                executable: ($r.ImageFileName | if . == null then null else gsub("\\\\"; "/") end),
+                command_line: $r.CommandLine,
+                start: to_iso_ms(($r.ProcessStartTime // "" | if . == "" then "" else ((tonumber * 1000) | floor | tostring) end)),
+                hash: {
+                  sha256: $r.SHA256HashData,
+                  md5: $r.MD5HashData
+                },
+                parent: {
+                  name: $r.ParentBaseFileName
+                }
+              },
+              user: {
+                name: $r.UserName,
+                id: $r.UserSid
+              },
+              related: {
+                user: ([$r.UserName] | map(select(. != null and . != "")) | unique),
+                hosts: ([$r.ComputerName] | map(select(. != null and . != "")) | unique),
+                hash: ([$r.SHA256HashData, $r.MD5HashData] | map(select(. != null and . != "")) | unique),
+                ip: ([$aip] | map(select(is_ip(.))) | unique)
+              }
+            }
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null and . != ""))
+              else .
+              end
+            )

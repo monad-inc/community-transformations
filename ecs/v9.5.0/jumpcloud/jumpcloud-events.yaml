@@ -1,0 +1,94 @@
+name: "JumpCloud Directory Insights Events to ECS v9.5.0"
+description: "Maps JumpCloud Directory Insights event records into Elastic Common Schema (ECS) v9.5.0, covering event categorization, user, source (ip + geo), user_agent, cloud, and related.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "jumpcloud-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "jumpcloud"
+  - "events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # JumpCloud Directory Insights -> ECS v9.5.0 (nested).
+          # One record per invocation; single construction pass; single
+          # end-of-pipeline walk prune (drops null/{}/[]).
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+
+          . as $r
+          | ($r.initiated_by // {}) as $ib
+          | ($r.geoip // {}) as $geo
+          | ($r.useragent // {}) as $ua
+          | (($r.event_type // "") | ascii_downcase) as $et
+          | ($r.username // $ib.username) as $uname
+
+          | {
+              "@timestamp": $r.timestamp,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": [ "authentication" ],
+                "type": (if ($et | test("logout|logoff")) then [ "end" ] else [ "start" ] end),
+                "outcome": (if $r.success == true then "success"
+                            elif $r.success == false then "failure" else "unknown" end),
+                "action": $r.event_type,
+                "id": $r.id,
+                "provider": "jumpcloud",
+                "module": "jumpcloud",
+                "dataset": "jumpcloud.events",
+                "original": ($r | tojson)
+              },
+
+              "message": $r.message,
+
+              "user": {
+                "name": $uname,
+                "id": (if $ib.type == "user" then $ib.id else null end)
+              },
+
+              "source": {
+                "ip": (if is_ip($r.client_ip) then $r.client_ip else null end),
+                "geo": {
+                  "country_iso_code": $geo.country_code,
+                  "region_iso_code": $geo.region_code,
+                  "region_name": $geo.region_name,
+                  "timezone": $geo.timezone,
+                  "location": (if ($geo.longitude != null and $geo.latitude != null)
+                               then "\($geo.latitude),\($geo.longitude)" else null end)
+                }
+              },
+
+              "user_agent": {
+                "name": $ua.name,
+                "version": $ua.version,
+                "os": {
+                  "name": $ua.os,
+                  "version": $ua.os_version
+                }
+              },
+
+              "cloud": {
+                "provider": "jumpcloud",
+                "account": { "id": $r.organization }
+              },
+
+              "related": {
+                "user": ( [ $uname, $ib.username ] | map(select(. != null)) | unique ),
+                "ip":   ( [ (if is_ip($r.client_ip) then $r.client_ip else null end) ]
+                          | map(select(. != null)) | unique )
+              }
+            }
+          | walk(if type == "object" then with_entries(select(
+                   .value != null and .value != "" and .value != [] and .value != {}))
+                 elif type == "array" then map(select(. != null))
+                 else . end)

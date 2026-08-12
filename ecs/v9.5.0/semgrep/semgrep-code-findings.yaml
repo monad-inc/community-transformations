@@ -1,0 +1,83 @@
+name: "Semgrep Code Vulnerability Findings to ECS v9.5.0"
+description: "Maps a Semgrep Code Vulnerability Finding into an Elastic Common Schema (ECS) v9.5.0 document, populating event categorization, the vulnerability.* and rule.* field sets, and file.* source-location fields."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-code-findings"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "semgrep"
+  - "code"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | (if $sev == "critical" then 99
+             elif $sev == "high" then 73
+             elif $sev == "medium" then 47
+             elif $sev == "low" then 21
+             elif $sev == "info" then 1
+             else 0 end) as $sev_num
+          | (($r.rule.cwe_names // []) | map(select(. != null))) as $cwes
+          | ($cwes | map(split(":")[0] | ascii_upcase) | map(select(startswith("CWE")))) as $cwe_ids
+          | ($r.location.file_path // "") as $fp
+          | {
+              "@timestamp": ($r.created_at // $r.state_updated_at),
+              "ecs": { "version": "9.5.0" },
+              "message": ($r.rule_message // $r.rule_name),
+              "event": {
+                "kind": "alert",
+                "category": ["vulnerability"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "provider": "semgrep",
+                "module": "semgrep",
+                "id": ($r.id | tostring),
+                "severity": $sev_num,
+                "url": $r.line_of_code_url,
+                "created": ($r.created_at // $r.state_updated_at),
+                "reference": $r.line_of_code_url
+              },
+              "vulnerability": {
+                "id": ($cwe_ids[0] // null),
+                "category": (($r.rule.vulnerability_classes // []) + ($r.categories // []) | unique),
+                "classification": (if ($cwe_ids | length) > 0 then "CWE" else null end),
+                "enumeration": (if ($cwe_ids | length) > 0 then "CWE" else null end),
+                "description": ($r.rule_message // $r.rule_name),
+                "reference": (($r.rule.owasp_names // []) + [$r.line_of_code_url] | map(select(. != null)) | unique),
+                "scanner": { "vendor": "Semgrep" },
+                "severity": $r.severity,
+                "status": ($r.status // $r.state)
+              },
+              "rule": {
+                "id": $r.rule_name,
+                "name": $r.rule_name,
+                "description": ($r.rule.message // $r.rule_message),
+                "category": ($r.rule.category // null),
+                "ruleset": (($r.sourcing_policy.name) // null)
+              },
+              "file": {
+                "path": (if $fp != "" then $fp else null end),
+                "name": (if $fp != "" then ($fp | split("/")[-1]) else null end),
+                "directory": (if ($fp | index("/")) then ($fp | split("/")[:-1] | join("/")) else null end),
+                "extension": (if ($fp | index(".")) then ($fp | split(".")[-1]) else null end)
+              },
+              "url": {
+                "full": $r.line_of_code_url,
+                "original": $r.line_of_code_url
+              },
+              "labels": {
+                "confidence": $r.confidence,
+                "triage_state": $r.triage_state,
+                "repository": $r.repository.name
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)

@@ -1,0 +1,116 @@
+name: "Microsoft Entra ID Sign-in Logs to ECS v9.5.0"
+description: "Normalizes Microsoft Entra ID (Azure AD) sign-in log records into the Elastic Common Schema (ECS) v9.5.0 authentication fields (event, user, source, source.geo, host, user_agent, cloud, organization, related)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-entra-id"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "microsoft"
+  - "entra-id"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Microsoft Entra ID sign-in logs -> ECS v9.5.0 (authentication)
+          # Input: ONE Entra ID sign-in record per invocation (Microsoft Graph
+          #   auditLogs/signIns resource shape) from the `microsoft-entra-id`
+          #   input connector.
+          # =================================================================
+
+          # An ES `ip`-mapped field rejects the whole document if handed a
+          # hostname, so guard every ip field.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.status // {} ) as $st
+          | ( $r.deviceDetail // {} ) as $dd
+          | ( $r.location // {} ) as $loc
+          | ( ($st.errorCode // 0) == 0 ) as $ok
+          | ( $r.ipAddress ) as $ip
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $r.createdDateTime,
+
+              event: {
+                kind: "event",
+                module: "azure",
+                dataset: "azure.signinlogs",
+                provider: "microsoft-entra-id",
+                # correlationId ties the multiple rows of one sign-in together.
+                id: $r.id,
+                action: "user-signin",
+                category: ["authentication"],
+                # An interactive sign-in is a session beginning -> start.
+                type: ["start"],
+                outcome: ( if $ok then "success" else "failure" end ),
+                reason: ($st.failureReason // $st.additionalDetails),
+                code: (($st.errorCode // 0) | tostring)
+              },
+
+              user: {
+                id: $r.userId,
+                name: $r.userPrincipalName,
+                email: $r.userPrincipalName,
+                full_name: $r.userDisplayName
+              },
+
+              source: {
+                address: $ip,
+                ip: ( if is_ip($ip) then $ip else null end ),
+                geo: {
+                  city_name: $loc.city,
+                  region_name: $loc.state,
+                  country_iso_code: $loc.countryOrRegion,
+                  # ES geo_point as a "lat,lon" string leaf (a nested
+                  # {lat,lon} object would surface as unknown sub-fields to
+                  # the static validator).
+                  location: (
+                    if ($loc.geoCoordinates.longitude != null and $loc.geoCoordinates.latitude != null)
+                    then (($loc.geoCoordinates.latitude | tostring) + "," + ($loc.geoCoordinates.longitude | tostring))
+                    else null end
+                  )
+                }
+              },
+
+              host: {
+                id: $dd.deviceId,
+                name: $dd.displayName,
+                os: { full: $dd.operatingSystem }
+              },
+
+              user_agent: { original: $r.clientAppUsed },
+
+              cloud: {
+                provider: "azure",
+                account: { id: ($r.homeTenantId // $r.resourceTenantId) }
+              },
+
+              organization: { id: ($r.resourceTenantId // $r.homeTenantId) },
+
+              related: {
+                ip: ( if is_ip($ip) then [$ip] else [] end ),
+                user: ( [ $r.userPrincipalName, $r.userDisplayName, $r.userId ]
+                        | map(select(. != null)) | unique ),
+                hosts: ( [ $dd.displayName ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune

@@ -1,0 +1,105 @@
+name: "NIST NVD CVE to ECS v9.5.0"
+description: "Transforms NIST NVD CVE records into Elastic Common Schema (ECS) v9.5.0 documents, populating the event.* categorization and vulnerability.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "nist-cve"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "nist"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # NIST NVD CVE -> ECS v9.5.0 (nested document).
+          # event.kind=enrichment, event.category=[vulnerability],
+          # event.type=[info] (the only type ECS allows for that category).
+          # Input: one NVD CVE record ({cve:{...}}) per invocation.
+          # ---------------------------------------------------------------
+
+          # NVD timestamps lack a zone (e.g. "2024-08-13T18:15:10.017");
+          # force a Z so downstream ES parses them as UTC.
+          def norm_ts($ts):
+            if $ts == null then null
+            elif ($ts | endswith("Z")) then $ts
+            else ($ts + "Z") end;
+
+          . as $r
+          | ($r.cve // $r) as $c
+          | (($c.descriptions // []) | (map(select(.lang == "en")) | .[0].value) // (.[0].value)) as $desc
+          | (($c.metrics.cvssMetricV31 // $c.metrics.cvssMetricV30 // $c.metrics.cvssMetricV2 // []) | .[0]) as $m
+          | ($m.cvssData // {}) as $cd
+          | ([ ($c.weaknesses // [])[].description[]? | select(.value | test("^CWE-")) | .value ] | unique) as $cwes
+          | ([ ($c.references // [])[].url ] | unique) as $refs
+          | ([ ($c.configurations // [])[].nodes[]?.cpeMatch[]?.criteria ] | unique) as $cpes
+          | {
+              "@timestamp": norm_ts($c.published),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "enrichment",
+                "category": ["vulnerability"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": $c.id,
+                "created": norm_ts($c.lastModified),
+                "provider": "nvd",
+                "module": "nist",
+                "dataset": "nist.cve",
+                "reference": ($refs | first),
+                "url": ($refs | first)
+              },
+
+              "message": $desc,
+
+              "vulnerability": {
+                "id": $c.id,
+                "enumeration": "CVE",
+                "classification": (if $cd.version != null then "CVSS" else null end),
+                "description": $desc,
+                "severity": $cd.baseSeverity,
+                "reference": ($refs | first),
+                "scanner": { "vendor": "NIST NVD" },
+                "status": $c.vulnStatus,
+                "category": $cwes,
+                "score": {
+                  "base": $cd.baseScore,
+                  "version": $cd.version
+                }
+              },
+
+              # Vendor namespace (ECS permits custom top-level keys) for the
+              # NVD-specific detail with no ECS home. Nested blobs kept simple.
+              "nist": {
+                "cve": {
+                  "source_identifier": $c.sourceIdentifier,
+                  "vuln_status": $c.vulnStatus,
+                  "published": norm_ts($c.published),
+                  "last_modified": norm_ts($c.lastModified),
+                  "cwe": $cwes,
+                  "cpe": $cpes,
+                  "cvss_vector": $cd.vectorString,
+                  "exploitability_score": $m.exploitabilityScore,
+                  "impact_score": $m.impactScore
+                }
+              },
+
+              "related": {
+                "hosts": []
+              }
+            }
+          # Single end-of-pipeline recursive prune: drop nulls, {}, [] (ES
+          # rejects nulls; the doc is deeply nested).
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

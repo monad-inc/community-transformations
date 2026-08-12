@@ -1,0 +1,162 @@
+name: "AWS GuardDuty Findings to ECS v9.5.0"
+description: "Normalizes Amazon GuardDuty finding records into Elastic Common Schema (ECS) v9.5.0 fields (event, cloud, host, source, destination, network, threat, rule, related), plus the aws.guardduty.* vendor namespace for finding detail."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-guardduty"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "guardduty"
+  - "intrusion_detection"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS GuardDuty finding  ->  ECS v9.5.0
+          # Input: ONE GuardDuty finding record per invocation.
+          #
+          #   event.kind      = alert          (a detection notification)
+          #   event.category  = intrusion_detection
+          #   event.type      = denied (if blocked) else info
+          #   .updatedAt      -> @timestamp
+          #   .type           -> event.action / rule.name / threat.*
+          #   .id             -> event.id
+          #   .severity       -> event.severity (numeric)
+          #   remoteIpDetails -> source.{ip,port,geo,as}
+          #   localIpDetails / instance NIC -> destination / host
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then ($ts | todateiso8601)
+            else $ts end;
+
+          . as $r
+          | ($r.service // {}) as $svc
+          | ($svc.action // {}) as $act
+          | ($act.networkConnectionAction // {}) as $nca
+          | ($nca.remoteIpDetails // {}) as $remote
+          | ($remote.organization // {}) as $org
+          | ($remote.geoLocation // {}) as $geo
+          | ($r.resource // {}) as $res
+          | (($res.instanceDetails // {}).networkInterfaces[0] // {}) as $nic
+          | ($nca.localIpDetails // {}) as $local
+          | ($nca.blocked == true) as $blocked
+          | {
+              "@timestamp": (to_iso($r.updatedAt // $r.createdAt)),
+              "ecs": { "version": "9.5.0" },
+
+              "message": $r.title,
+
+              "event": {
+                "kind": "alert",
+                "category": [ "intrusion_detection" ],
+                "type": [ (if $blocked then "denied" else "info" end) ],
+                "outcome": "unknown",
+                "action": $r.type,
+                "id": $r.id,
+                "severity": $r.severity,
+                "provider": ($svc.serviceName // "guardduty"),
+                "module": "guardduty",
+                "dataset": "aws.guardduty",
+                "reason": $r.description,
+                "created": (to_iso($r.createdAt)),
+                "start": (to_iso($svc.eventFirstSeen)),
+                "end": (to_iso($svc.eventLastSeen)),
+                "url": ("https://console.aws.amazon.com/guardduty/home?region=" + ($r.region // "") + "#/findings?fId=" + ($r.id // ""))
+              },
+
+              "rule": {
+                "name": $r.type,
+                "description": $r.title,
+                "ruleset": "Amazon GuardDuty"
+              },
+
+              "cloud": {
+                "provider": "aws",
+                "region": $r.region,
+                "account": { "id": $r.accountId },
+                "availability_zone": (($res.instanceDetails // {}).availabilityZone),
+                "instance": { "id": (($res.instanceDetails // {}).instanceId) },
+                "machine": { "type": (($res.instanceDetails // {}).instanceType) }
+              },
+
+              "host": {
+                "id": (($res.instanceDetails // {}).instanceId),
+                "type": (($res.instanceDetails // {}).instanceType),
+                "ip": ( [ (if is_ip($nic.privateIpAddress) then $nic.privateIpAddress else empty end),
+                          (if is_ip($nic.publicIp) then $nic.publicIp else empty end) ] ),
+                "hostname": ($nic.privateDnsName)
+              },
+
+              "source": {
+                "ip": (if is_ip($remote.ipAddressV4) then $remote.ipAddressV4 else null end),
+                "address": ($remote.ipAddressV4),
+                "port": (($nca.remotePortDetails // {}).port),
+                "geo": {
+                  "country_name": (($remote.country // {}).countryName),
+                  "city_name": (($remote.city // {}).cityName),
+                  "location": ( if ($geo.lat != null and $geo.lon != null)
+                                then (($geo.lat | tostring) + "," + ($geo.lon | tostring)) else null end )
+                },
+                "as": {
+                  "number": (if $org.asn then ($org.asn | tonumber? // null) else null end),
+                  "organization": { "name": $org.asnOrg }
+                }
+              },
+
+              "destination": {
+                "ip": (if is_ip($local.ipAddressV4) then $local.ipAddressV4 else null end),
+                "address": ($local.ipAddressV4),
+                "port": (($nca.localPortDetails // {}).port)
+              },
+
+              "network": {
+                "transport": (if $nca.protocol then ($nca.protocol | ascii_downcase) else null end),
+                "direction": (if $nca.connectionDirection then ($nca.connectionDirection | ascii_downcase) else null end)
+              },
+
+              "threat": {
+                "framework": "MITRE ATT&CK",
+                "indicator": {
+                  "ip": (if is_ip($remote.ipAddressV4) then $remote.ipAddressV4 else null end),
+                  "type": (if is_ip($remote.ipAddressV4) then "ipv4-addr" else null end)
+                }
+              },
+
+              "related": {
+                "ip": ( [ (if is_ip($remote.ipAddressV4) then $remote.ipAddressV4 else empty end),
+                          (if is_ip($local.ipAddressV4) then $local.ipAddressV4 else empty end),
+                          (if is_ip($nic.privateIpAddress) then $nic.privateIpAddress else empty end),
+                          (if is_ip($nic.publicIp) then $nic.publicIp else empty end) ] | unique ),
+                "hosts": ( [ (($res.instanceDetails // {}).instanceId) ] | map(select(. != null)) | unique )
+              },
+
+              "aws": {
+                "guardduty": {
+                  "finding_id": $r.id,
+                  "finding_type": $r.type,
+                  "schema_version": $r.schemaVersion,
+                  "partition": $r.partition,
+                  "detector_id": $svc.detectorId,
+                  "resource_type": ($res.resourceType),
+                  "resource_role": $svc.resourceRole,
+                  "action_type": $act.actionType,
+                  "count": $svc.count,
+                  "archived": $svc.archived,
+                  "blocked": $nca.blocked
+                }
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)

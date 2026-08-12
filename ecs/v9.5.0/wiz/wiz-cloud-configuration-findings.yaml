@@ -1,0 +1,106 @@
+name: "Wiz Cloud Configuration Findings to ECS v9.5.0"
+description: "Maps Wiz Cloud Configuration Findings records into Elastic Common Schema (ECS) v9.5.0, populating event categorization, rule.*, cloud.*, host.*, and related.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "wiz-cloud-configuration-findings"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "wiz"
+  - "cloud-configuration-findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Wiz Cloud Configuration Findings -> ECS v9.5.0 (nested)
+          # event.kind=alert, event.category=[configuration], event.type=[info]
+          # One jq pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else $ts
+            end;
+
+          . as $r
+          | ($r.resource // {}) as $res
+          | ($r.rule // {}) as $rule
+          | (($r.securitySubCategories // [])[0]) as $ssc
+          | {
+              "@timestamp": (to_iso($r.firstSeenAt // $r.analyzedAt)),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": [ "configuration" ],
+                "type": [ "info" ],
+                "outcome": (
+                  { "PASS": "success", "FAIL": "failure" }[($r.result // "") | ascii_upcase] // "unknown"
+                ),
+                "id": ($r.id // null),
+                "provider": "wiz-cloud-configuration-findings",
+                "module": "wiz",
+                "dataset": "wiz.cloud_configuration_findings",
+                "severity": (
+                  { "INFORMATIONAL": 1, "LOW": 21, "MEDIUM": 47, "HIGH": 73, "CRITICAL": 99 }[($r.severity // "") | ascii_upcase] // 0
+                ),
+                "created": (to_iso($r.firstSeenAt)),
+                "reason": ($rule.name // null),
+                "action": ($r.status // null)
+              },
+
+              "message": ($rule.name // null),
+
+              "rule": {
+                "id": ($rule.id // null),
+                "name": ($rule.name // null),
+                "description": ($rule.description // null),
+                "reference": ($rule.shortId // null),
+                "ruleset": ($ssc.category.framework.name // null),
+                "category": ($ssc.category.name // null),
+                "author": [ "Wiz" ]
+              },
+
+              "cloud": {
+                "provider": (($res.cloudPlatform // null) | if . == null then null else ascii_downcase end),
+                "region": ($res.region // null),
+                "account": {
+                  "id": ($res.subscription.externalId // null),
+                  "name": ($res.subscription.name // null)
+                }
+              },
+
+              "host": {
+                "id": ($res.id // null),
+                "name": ($res.name // null),
+                "type": ($res.nativeType // $res.type // null)
+              },
+
+              "observer": {
+                "vendor": "Wiz",
+                "product": "Wiz",
+                "type": "cspm"
+              },
+
+              "tags": (
+                [ ($r.severity // empty), ($r.status // empty) ]
+                | map(select(. != null)) | if length == 0 then null else . end
+              ),
+
+              "related": {
+                "hosts": (
+                  [ ($res.name // empty) ] | map(select(. != null)) | unique
+                  | if length == 0 then null else . end
+                )
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              else . end
+            )

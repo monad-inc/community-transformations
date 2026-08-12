@@ -1,0 +1,115 @@
+name: "CrowdStrike Vulnerabilities to ECS v9.5.0"
+description: "Normalizes individual CrowdStrike Spotlight vulnerability findings into the Elastic Common Schema (ECS) v9.5.0 (event categorization, vulnerability.*, host.*, os.*, cloud.*, related.*), emitting event.kind=alert in the vulnerability category."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-vulnerabilities"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "crowdstrike"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # CrowdStrike Spotlight vulnerabilities -> ECS v9.5.0
+          #
+          # Input: ONE Spotlight combined-vulnerability record per invocation,
+          #   as emitted by the `crowdstrike-vulnerabilities` input connector.
+          #
+          # A vulnerability finding is a security assessment, not an activity,
+          # so it maps to event.kind=alert + event.category=[vulnerability]
+          # (whose only allowed event.type is `info`). event.outcome is
+          # `unknown` — a finding has no success/failure outcome.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # Recursively drop nulls and empty objects/arrays so the emitted
+          # document stays compact (ES rejects null values). Single permitted
+          # recursive pass.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.cve // {} ) as $cve
+          | ( $r.host_info // {} ) as $h
+          | ( $r.remediation.entities // [] ) as $rem
+
+          # ECS vulnerability.severity is a normalized lowercase keyword.
+          | ( ($cve.severity // "") | ascii_downcase ) as $sev
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $r.created_timestamp,
+
+              event: {
+                kind: "alert",
+                module: "crowdstrike",
+                dataset: "crowdstrike.vulnerability",
+                provider: "CrowdStrike Falcon Spotlight",
+                id: $r.id,
+                category: ["vulnerability"],
+                type: ["info"],
+                outcome: "unknown",
+                severity: ($cve.base_score // null),
+                created: $r.created_timestamp
+              },
+
+              vulnerability: {
+                id: $r.vulnerability_id,
+                enumeration: "CVE",
+                description: $cve.description,
+                reference: ($cve.references // [])[0],
+                severity: ( if $sev == "" then null else $sev end ),
+                classification: "CVSS",
+                scanner: { vendor: "CrowdStrike" },
+                score: {
+                  base: ($cve.base_score // null),
+                  version: (if $cve.vector then ($cve.vector | ltrimstr("CVSS:") | split("/")[0]) else null end)
+                },
+                status: $r.status
+              },
+
+              host: {
+                name: $h.hostname,
+                hostname: $h.hostname,
+                id: $r.aid,
+                domain: $h.machine_domain,
+                ip: ( if is_ip($h.local_ip) then [$h.local_ip] else [] end ),
+                os: {
+                  platform: ( if $h.platform then ($h.platform | ascii_downcase) else null end ),
+                  name: $h.platform,
+                  version: $h.os_version,
+                  full: (($h.platform // "") + " " + ($h.os_version // "") | gsub("^\\s+|\\s+$"; ""))
+                }
+              },
+
+              cloud: (
+                if $h.service_provider then {
+                  provider: $h.service_provider,
+                  account: { id: $h.service_provider_account_id },
+                  instance: { id: $h.instance_id }
+                } else null end
+              ),
+
+              related: {
+                ip: ( if is_ip($h.local_ip) then [$h.local_ip] else [] end ),
+                hosts: ( [ $h.hostname ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune
