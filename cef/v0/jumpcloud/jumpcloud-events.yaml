@@ -1,0 +1,60 @@
+name: "JumpCloud Directory Insights Events to CEF"
+description: "Maps JumpCloud Directory Insights event records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "jumpcloud-events"
+tags:
+  - "v0"
+  - "cef"
+  - "jumpcloud"
+  - "events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # JumpCloud Directory Insights -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Final-form values: severity int 0-10, times epoch-MS, custom
+          # slots paired with their *Label. One pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.initiated_by // {}) as $ib
+          | ($r.useragent // {}) as $ua
+          | ($r.username // $ib.username) as $uname
+          | (if $r.success == true then "SUCCESS"
+             elif $r.success == false then "FAILURE" else null end) as $outcome
+
+          | { _cef: {
+                vendor: "JumpCloud",
+                product: "Directory Insights",
+                version: "",
+                signature_id: ($r.event_type // "unknown"),
+                name: ($r.message // ($r.event_type // "JumpCloud Directory Insights event")),
+                # Failed authentication is elevated; success/info stays low.
+                severity: (if $r.success == false then 6 else 3 end),
+                extension: ( {
+                  rt:      to_epoch_ms($r.timestamp),
+                  suser:   $uname,
+                  suid:    (if $ib.type == "user" then $ib.id else null end),
+                  src:     $r.client_ip,
+                  act:     $r.event_type,
+                  outcome: $outcome,
+                  externalId: $r.id,
+                  requestClientApplication: ([ $ua.name, $ua.version ] | map(select(. != null)) | join(" ") | (if . == "" then null else . end)),
+                  cs1Label: "service",      cs1: $r.service,
+                  cs2Label: "organization", cs2: $r.organization,
+                  cs3Label: "mfa",          cs3: (if ($r.mfa | type) == "boolean" then ($r.mfa | tostring) else null end),
+                  cs4Label: "geoCountry",   cs4: ($r.geoip.country_code // null)
+                } | with_entries(select(.value != null and .value != "")) )
+          } }

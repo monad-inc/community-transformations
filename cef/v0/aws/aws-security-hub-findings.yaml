@@ -1,0 +1,76 @@
+name: "AWS Security Hub Findings to CEF"
+description: "Maps AWS Security Hub findings (ASFF) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-hub-findings"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Security Hub finding (ASFF) -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Final-form values: severity int 0-10; times epoch-MILLISECONDS;
+          # custom cs*/cn* slots always paired with their *Label.
+          # One jq pass; shallow null-drop on extension (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # ASFF Severity.Label -> CEF severity bucket (0-10)
+          def cef_sev($lbl):
+            { "INFORMATIONAL": 1, "LOW": 3, "MEDIUM": 5,
+              "HIGH": 8, "CRITICAL": 10 }[$lbl] // 0;
+
+          . as $r
+          | ($r.Severity // {}) as $sev
+          | ($r.Network // {}) as $net
+          | ($r.Resources // []) as $res
+          | { _cef: {
+              vendor: ($r.CompanyName // "AWS"),
+              product: ($r.ProductName // "Security Hub"),
+              version: ($r.SchemaVersion // ""),
+              # Stable, low-cardinality finding type from the ASFF taxonomy.
+              signature_id: (($r.Types // [])[0] // "aws-security-hub-finding"),
+              name: ($r.Title // "AWS Security Hub Finding"),
+              severity: cef_sev($sev.Label),
+              extension: ( {
+                rt:       to_epoch_ms($r.UpdatedAt // $r.CreatedAt),
+                start:    to_epoch_ms($r.FirstObservedAt),
+                end:      to_epoch_ms($r.LastObservedAt),
+                externalId: $r.Id,
+                msg:      $r.Description,
+                act:      (($r.Workflow // {}).Status),
+                outcome:  (($r.Compliance // {}).Status),
+                cat:      ($r.RecordState // "ACTIVE"),
+                dvc:      ($net.DestinationIpV4),
+                src:      ($net.SourceIpV4),
+                spt:      ($net.SourcePort),
+                dst:      ($net.DestinationIpV4),
+                dpt:      ($net.DestinationPort),
+                proto:    ($net.Protocol),
+                deviceDirection: (if ($net.Direction) == "IN" then 0
+                                  elif ($net.Direction) == "OUT" then 1 else null end),
+                # Dictionary has no home for these -> custom slots WITH labels.
+                cs1Label: "awsAccountId",  cs1: ($r.AwsAccountId),
+                cs2Label: "awsRegion",     cs2: ($r.Region),
+                cs3Label: "resourceId",    cs3: ($res[0].Id),
+                cs4Label: "findingType",   cs4: (($r.Types // []) | join(",") | if . == "" then null else . end),
+                cs5Label: "remediation",   cs5: ($r.Remediation.Recommendation.Text),
+                cs6Label: "sourceUrl",     cs6: ($r.SourceUrl),
+                cn1Label: "normalizedSeverity", cn1: ($sev.Normalized),
+                cn2Label: "confidence",          cn2: ($r.Confidence)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

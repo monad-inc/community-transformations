@@ -1,0 +1,60 @@
+name: "Tenable Assets to CEF"
+description: "Maps Tenable Vulnerability Management asset inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "tenable-assets"
+tags:
+  - "v0"
+  - "cef"
+  - "tenable"
+  - "asset"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Tenable asset inventory -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Emit FINAL-FORM
+          # values: severity int 0-10; times epoch-MILLISECONDS; custom slots
+          # cs* paired with their *Label. One jq pass; shallow null-drop.
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r |
+          { _cef: {
+              vendor: "Tenable",
+              product: "Tenable Vulnerability Management",
+              version: "",
+              signature_id: "tenable:asset:inventory",
+              name: "Tenable Asset Inventory",
+              # Asset inventory snapshots are informational (CEF severity 2).
+              severity: 2,
+              extension: ( {
+                rt:               to_epoch_ms($r.updated_at),
+                start:            to_epoch_ms($r.first_seen),
+                end:              to_epoch_ms($r.last_seen),
+                externalId:       $r.id,
+                dhost:            (($r.hostnames // [])[0]),
+                dst:              (($r.ipv4s // [])[0]),
+                dmac:             (($r.mac_addresses // [])[0]),
+                act:              "inventory",
+                cs1Label:         "operatingSystem",
+                cs1:              (($r.operating_systems // [])[0]),
+                cs2Label:         "systemType",
+                cs2:              (($r.system_types // [])[0]),
+                cs3Label:         "cloudRegion",
+                cs3:              $r.aws_region,
+                cs4Label:         "cloudInstanceId",
+                cs4:              $r.aws_ec2_instance_id,
+                cs5Label:         "fqdn",
+                cs5:              (($r.fqdns // [])[0]),
+                cn1Label:         "exposureScore",
+                cn1:              $r.exposure_score
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

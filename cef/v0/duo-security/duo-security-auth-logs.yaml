@@ -1,0 +1,62 @@
+name: "Duo Security Authentication Logs to CEF"
+description: "Maps Cisco Duo Security authentication log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "duo-security-auth-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "duo-security"
+  - "auth-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Duo Security authentication log -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # severity: integer 0-10; times epoch-MS; custom slots + *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+"; "") | gsub("\\+00:00$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.result // "" | ascii_downcase) as $result
+          | {
+              _cef: {
+                vendor: "Cisco",
+                product: "Duo Security",
+                version: "",
+                signature_id: ($r.event_type // "authentication"),
+                name: ("Duo authentication " + (if $result == "success" then "succeeded"
+                                                elif $result == "" then "event"
+                                                else ($result + " (" + ($r.reason // "unknown") + ")") end)),
+                severity: (if $result == "success" then 2
+                           elif $result == "fraud" then 9
+                           elif ($result == "denied") or ($result == "failure") or ($result == "error") then 6
+                           else 0 end),
+                extension: ( {
+                  rt:      to_epoch_ms($r.timestamp // $r.isotimestamp),
+                  suser:   ($r.user.name // $r.email),
+                  suid:    $r.user.key,
+                  src:     ($r.access_device.ip // null),
+                  dvc:     ($r.auth_device.ip // null),
+                  act:     ($r.event_type // null),
+                  outcome: (($r.result // null) | if . == null then null else ascii_upcase end),
+                  reason:  ($r.reason // null),
+                  requestClientApplication: ((($r.access_device.browser // "") + " " + ($r.access_device.browser_version // "")) | sub("^ +| +$"; "") | if . == "" then null else . end),
+                  cs1Label: "duoFactor",              cs1: ($r.factor // null),
+                  cs2Label: "application",            cs2: ($r.application.name // null),
+                  cs3Label: "txid",                   cs3: ($r.txid // null),
+                  cs4Label: "trustedEndpointStatus",  cs4: ($r.trusted_endpoint_status // null),
+                  cs5Label: "srcCountry",             cs5: ($r.access_device.location.country // null)
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

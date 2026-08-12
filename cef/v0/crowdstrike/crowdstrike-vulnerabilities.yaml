@@ -1,0 +1,62 @@
+name: "CrowdStrike Vulnerabilities to CEF"
+description: "Maps CrowdStrike Spotlight vulnerability findings into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-vulnerabilities"
+tags:
+  - "v0"
+  - "cef"
+  - "crowdstrike"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CrowdStrike Spotlight vulnerabilities -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (mapped from CVE severity bucket)
+          #   - rt: epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass, per-record; shallow null-drop on extension only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.cve // {} ) as $cve
+          | ( $r.host_info // {} ) as $h
+          | ( $r.remediation.entities // [] ) as $rem
+          | { _cef: {
+              vendor: "CrowdStrike",
+              product: "Falcon Spotlight",
+              version: "",
+              signature_id: ($r.vulnerability_id // "UNKNOWN"),
+              name: ("Vulnerability detected: " + ($r.vulnerability_id // "UNKNOWN")),
+              severity: ( { "CRITICAL": 10, "HIGH": 8, "MEDIUM": 5, "LOW": 3 }[$cve.severity] // 0 ),
+              extension: ( {
+                rt:       to_epoch_ms($r.created_timestamp),
+                end:      to_epoch_ms($r.updated_timestamp),
+                msg:      $cve.description,
+                dhost:    $h.hostname,
+                dvc:      $h.local_ip,
+                externalId: $r.aid,
+                dntdom:   $h.machine_domain,
+                cs1Label: "CVE",           cs1: ($r.vulnerability_id // ""),
+                cs2Label: "CVSSVector",    cs2: ($cve.vector // ""),
+                cn1Label: "CVSSBaseScore", cn1: ($cve.base_score // null),
+                cs3Label: "Status",        cs3: ($r.status // ""),
+                cs4Label: "Confidence",    cs4: ($r.confidence // ""),
+                cs5Label: "Remediation",   cs5: ( if ($rem | length) > 0 then ($rem | map(.action) | join("; ")) else "" end ),
+                cs6Label: "OS",            cs6: (($h.platform // "") + " " + ($h.os_version // "") | gsub("^\\s+|\\s+$"; ""))
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

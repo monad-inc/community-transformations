@@ -1,0 +1,68 @@
+name: "AlienVault OTX Indicators to CEF"
+description: "Maps AlienVault OTX IOC indicator records (enriched with parent-pulse threat context) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-indicators"
+tags:
+  - "v0"
+  - "cef"
+  - "alienvault"
+  - "otx-indicators"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AlienVault OTX Indicators -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (derived from the indicator role)
+          #   - time fields (rt/end): epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # Input: ONE OTX indicator record with a nested `.pulse` object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z")
+                   | (if test("Z$") then . else . + "Z" end)
+                   | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.type // "indicator") as $itype
+          | ($r.pulse // {}) as $p
+          | ($r.role // "") as $role
+
+          # role -> CEF severity 0-10
+          | ( { "malware_hosting":8, "c2":9, "command_and_control":9,
+                "exploit_hosting":8, "phishing":7, "malware":8,
+                "scanning_host":5, "bruteforce":5 }[$role] // 5 ) as $sev
+
+          | { _cef: {
+              vendor: "AlienVault",
+              product: "OTX",
+              version: "",
+              signature_id: $itype,
+              name: ($p.name // $r.title // ("OTX " + $itype + " indicator")),
+              severity: $sev,
+              extension: ( {
+                rt:       to_epoch_ms($r.created),
+                end:      to_epoch_ms($r.expiration),
+                msg:      ($r.description // $r.content // $p.description),
+                externalId: ($r.id | tostring),
+                outcome:  (if ($r.is_active // 0) == 1 then "active" else "inactive" end),
+                # No CEF dictionary home for IOC value / pulse context:
+                # overflow to custom slots, each paired with its label.
+                cs1Label: "indicatorType",  cs1: $itype,
+                cs2Label: "indicatorValue", cs2: $r.indicator,
+                cs3Label: "pulseName",      cs3: $p.name,
+                cs4Label: "tlp",            cs4: (if ($p.tlp // "") == "" then null else ("TLP:" + ($p.tlp | ascii_upcase)) end),
+                cs5Label: "adversary",      cs5: (if ($p.adversary // "") == "" then null else $p.adversary end),
+                cs6Label: "role",           cs6: (if $role == "" then null else $role end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

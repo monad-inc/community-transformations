@@ -1,0 +1,68 @@
+name: "Semgrep Supply Chain Findings to CEF"
+description: "Maps Semgrep Supply Chain (dependency) Findings into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-chain-findings"
+tags:
+  - "v0"
+  - "cef"
+  - "semgrep"
+  - "supply-chain"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep Supply Chain Findings -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity int 0-10, times in
+          # epoch-MILLISECONDS, custom slots paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | ($r.found_dependency // {}) as $dep
+          | ($r.rule.cwe_names[0] // null) as $cwe0
+          | (if ($dep.package // null) != null
+             then ($dep.package + (if ($dep.version // null) != null then "@" + $dep.version else "" end))
+             else null end) as $pkg
+          | {
+              _cef: {
+                vendor: "Semgrep",
+                product: "Semgrep Supply Chain",
+                version: "",
+                signature_id: ($r.rule.vulnerability_identifier // $r.rule_name),
+                name: ($r.rule_message // $r.rule_name),
+                severity: (if   $sev == "critical" then 10
+                           elif $sev == "high"     then 8
+                           elif $sev == "medium"   then 5
+                           elif $sev == "low"      then 3
+                           else 2 end),
+                extension: ( {
+                  rt:            to_epoch_ms($r.created_at),
+                  start:         to_epoch_ms($r.relevant_since),
+                  externalId:    ($r.id | tostring),
+                  msg:           $r.rule_message,
+                  fname:         (if ($r.location.file_path // null) != null then ($r.location.file_path | split("/")[-1]) else null end),
+                  filePath:      ($r.location.file_path // null),
+                  outcome:       ($r.status // $r.state),
+                  cn1:           ($r.location.line // null), cn1Label: "startLine",
+                  cs1:           ($r.rule.vulnerability_identifier // null), cs1Label: "cve",
+                  cs2:           $cwe0, cs2Label: "cwe",
+                  cs3:           $pkg, cs3Label: "package",
+                  cs4:           ($dep.ecosystem // null), cs4Label: "ecosystem",
+                  cs5:           ($r.repository.name // null), cs5Label: "repository",
+                  cs6:           ($r.fix_recommendations // [] | (.[0].version // null)), cs6Label: "fixedVersion"
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

@@ -1,0 +1,60 @@
+name: "Google Cloud Audit Logs to CEF"
+description: "Maps Google Cloud (Cloud Audit) Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-cloud-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "google"
+  - "gcp"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Google Cloud Audit Logs -> CEF intermediate (T1). No escaping.
+          # severity: int 0-10; times epoch-MS; custom slots paired w/ labels.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.protoPayload // {}) as $pp
+          | ($pp.requestMetadata // {}) as $rm
+          | (($r.resource // {}).labels // {}) as $lbl
+          | (($pp.status // {}).code // 0) as $status_code
+          | { _cef: {
+              vendor: "Google",
+              product: "Google Cloud Platform",
+              version: "",
+              signature_id: ($pp.methodName // "gcp.audit.event"),
+              name: (($pp.methodName // "Google Cloud audit event") + " on " + ($pp.resourceName // "")),
+              severity: (
+                { "DEFAULT": 2, "DEBUG": 2, "INFO": 2, "NOTICE": 2,
+                  "WARNING": 5, "ERROR": 7, "CRITICAL": 8, "ALERT": 8,
+                  "EMERGENCY": 10 }[$r.severity] // 0
+              ),
+              extension: ( {
+                rt:      to_epoch_ms($r.timestamp),
+                suser:   ($pp.authenticationInfo // {}).principalEmail,
+                src:     $rm.callerIp,
+                act:     $pp.methodName,
+                outcome: (if $status_code == 0 then "SUCCESS" else "FAILURE" end),
+                requestClientApplication: $rm.callerSuppliedUserAgent,
+                deviceExternalId: $r.insertId,
+                cs1Label: "projectId",   cs1: $lbl.project_id,
+                cs2Label: "resourceName", cs2: $pp.resourceName,
+                cs3Label: "serviceName",  cs3: $pp.serviceName,
+                cs4Label: "logName",      cs4: $r.logName,
+                cn1Label: "statusCode",   cn1: ($status_code | tostring)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,88 @@
+name: "AWS GuardDuty Findings to CEF"
+description: "Maps Amazon GuardDuty finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-guardduty"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "guardduty"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Amazon GuardDuty finding -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity int 0-10, times as
+          # epoch-MILLISECONDS, custom slots paired with their *Label.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # GuardDuty severity (float 0-8.9) -> CEF severity bucket (int 0-10)
+          def cef_sev($s):
+            if $s == null then 0
+            elif $s < 1 then 1
+            elif $s < 4 then 3
+            elif $s < 7 then 6
+            else 9 end;
+
+          . as $r
+          | ($r.service // {}) as $svc
+          | ($svc.action // {}) as $act
+          | ($act.networkConnectionAction // {}) as $nca
+          | ($nca.remoteIpDetails // {}) as $remote
+          | ($remote.geoLocation // {}) as $geo
+          | ($nca.localIpDetails // {}) as $local
+          | ($r.resource // {}) as $res
+          | (($res.instanceDetails // {})) as $inst
+          | ($nca.blocked == true) as $blocked
+          | { _cef: {
+              vendor: "AWS",
+              product: "Amazon GuardDuty",
+              version: ($r.schemaVersion // ""),
+              signature_id: $r.type,
+              name: $r.title,
+              severity: cef_sev($r.severity),
+              extension: ( {
+                rt:     to_epoch_ms($r.updatedAt // $r.createdAt),
+                start:  to_epoch_ms($svc.eventFirstSeen),
+                end:    to_epoch_ms($svc.eventLastSeen),
+                msg:    $r.description,
+                reason: $r.title,
+                externalId: $r.id,
+                cat:    "intrusion_detection",
+                act:    ($act.actionType),
+                outcome: (if $blocked then "BLOCKED" else "DETECTED" end),
+                proto:  $nca.protocol,
+                deviceDirection: (if ($nca.connectionDirection == "OUTBOUND") then 1 else 0 end),
+                src:    ($remote.ipAddressV4),
+                spt:    (($nca.remotePortDetails // {}).port),
+                dst:    ($local.ipAddressV4),
+                dpt:    (($nca.localPortDetails // {}).port),
+                dvchost: ($inst.networkInterfaces[0] // {}).privateDnsName,
+                # counts / numeric custom slots (paired with labels)
+                cn1: $svc.count, cn1Label: "aggregateCount",
+                # string custom slots (paired with labels)
+                cs1: $r.accountId,        cs1Label: "awsAccountId",
+                cs2: $r.region,           cs2Label: "awsRegion",
+                cs3: $svc.detectorId,     cs3Label: "detectorId",
+                cs4: $inst.instanceId,    cs4Label: "instanceId",
+                cs5: (($remote.country // {}).countryName),  cs5Label: "sourceCountry",
+                cs6: (($remote.organization // {}).asnOrg),  cs6Label: "sourceAsnOrg",
+                # geo floats (paired with labels)
+                cfp1: $geo.lat, cfp1Label: "sourceLatitude",
+                cfp2: $geo.lon, cfp2Label: "sourceLongitude"
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

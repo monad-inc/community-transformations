@@ -1,0 +1,62 @@
+name: "Okta System Log to CEF"
+description: "Maps Okta System Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "okta-systemlog"
+tags:
+  - "v0"
+  - "cef"
+  - "okta"
+  - "systemlog"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Okta System Log -> CEF intermediate (T1). No escaping here — the
+          # shared CEF Serializer (T2) owns all escaping. Emit FINAL-FORM
+          # values: severity integer 0-10, times epoch-MILLISECONDS, custom
+          # cs* slots always paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $d
+          | ($d.actor // {}) as $actor
+          | ($d.client // {}) as $client
+          | ($client.geographicalContext // {}) as $geo
+          | ($d.outcome.result // "") as $result
+
+          | { _cef: {
+              vendor: "Okta",
+              product: "Okta System Log",
+              version: ($d.version // ""),
+              signature_id: ($d.eventType // "okta.system.event"),
+              name: ($d.displayMessage // $d.eventType // "Okta System Log Event"),
+              severity: ( { "DEBUG": 1, "INFO": 2, "WARN": 5, "ERROR": 8 }[$d.severity] // 0 ),
+              extension: ( {
+                rt:      to_epoch_ms($d.published),
+                suser:   $actor.alternateId,
+                suid:    $actor.id,
+                src:     $client.ipAddress,
+                act:     $d.eventType,
+                outcome: ( if $result == "" then null else ($result | ascii_upcase) end ),
+                request: $d.debugContext.debugData.requestUri,
+                requestClientApplication: $client.userAgent.rawUserAgent,
+                msg:     $d.displayMessage,
+                cs1Label: "sessionId",       cs1: $d.authenticationContext.externalSessionId,
+                cs2Label: "sourceCity",      cs2: $geo.city,
+                cs3Label: "legacyEventType", cs3: $d.legacyEventType,
+                cs4Label: "clientDevice",    cs4: $client.device,
+                cs5Label: "userDisplayName", cs5: $actor.displayName,
+                cs6Label: "sourceCountry",   cs6: $geo.country,
+                flexString1Label: "eventUuid", flexString1: $d.uuid
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

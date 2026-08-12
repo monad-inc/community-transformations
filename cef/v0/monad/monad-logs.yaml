@@ -1,0 +1,62 @@
+name: "Monad Organization Logs to CEF"
+description: "Maps Monad Organization Logs (monad-logs) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "monad-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "monad"
+  - "organization"
+  - "logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Monad Organization Logs -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Emit FINAL-FORM values:
+          #   severity: integer 0-10; time fields: epoch-MILLISECONDS;
+          #   custom slots cs*/cn* always paired with their *Label.
+          . as $r
+          | def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+            ($r.status | tonumber) as $status
+          | {
+              _cef: {
+                vendor: "Monad",
+                product: "Monad Organization Logs",
+                version: ($r.log_version // ""),
+                signature_id: $r.method,
+                name: ("Monad API " + $r.method + " " + $r.resource),
+                severity: (
+                  if   $status >= 500 then 8
+                  elif $status >= 400 then 5
+                  else 2
+                  end
+                ),
+                extension: ({
+                  rt: to_epoch_ms($r.timestamp),
+                  suser: $r.user_email,
+                  src: $r.client_ip,
+                  requestMethod: $r.method,
+                  request: $r.resource,
+                  act: $r.method,
+                  outcome: (if $status >= 200 and $status < 400 then "SUCCESS" else "FAILURE" end),
+                  cn1: $status,
+                  cn1Label: "httpStatusCode",
+                  cs1: $r.log_version,
+                  cs1Label: "logVersion",
+                  cs2: $r.additional_info,
+                  cs2Label: "additionalInfo",
+                  cs3: $r.id,
+                  cs3Label: "requestId"
+                } | with_entries(select(.value != null and .value != "")))
+              }
+            }

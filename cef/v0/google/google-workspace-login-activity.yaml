@@ -1,0 +1,86 @@
+name: "Google Workspace Login Activity to CEF"
+description: "Maps Google Workspace (Admin SDK Reports API) login activity records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-workspace-login-activity"
+tags:
+  - "v0"
+  - "cef"
+  - "google"
+  - "login"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Google Workspace login activity -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Emit FINAL-FORM values: severity int 0-10, times epoch-MS,
+          # custom slots paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.events[0] // {}) as $ev
+          | ($ev.parameters // []) as $params
+          | ($ev.name // "") as $ename
+          | def param($n): ($params | map(select(.name == $n)) | first);
+            def pstr($n): (param($n) | if . == null then null
+                           else (.value // ((.multiValue // []) | join(","))) end);
+            def pbool($n): (param($n) | if . == null then null else .boolValue end);
+            ($r.actor.email) as $email
+
+          # severity bucket 0-10
+          | ( if ($ename | startswith("suspicious")) or (pbool("is_suspicious") == true) then 8
+              elif ($ename | startswith("login_failure")) then 6
+              elif ($ename | startswith("logout")) then 2
+              else 3 end ) as $sev
+
+          # outcome
+          | ( if $ename == "login_success" then "SUCCESS"
+              elif ($ename | startswith("login_failure") or startswith("suspicious")) then "FAILURE"
+              else "UNKNOWN" end ) as $outcome
+
+          | { _cef: {
+              vendor: "Google",
+              product: "Google Workspace Login",
+              version: "",
+              signature_id: $ename,
+              name: ( { "login_success": "User login succeeded",
+                        "login_failure": "User login failed",
+                        "logout": "User logout",
+                        "suspicious_login": "Suspicious login blocked" }[$ename]
+                      // $ename ),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.id.time),
+                suser:   $email,
+                suid:    ($r.actor.profileId // null),
+                duser:   (pstr("affected_email_address")),
+                src:     ($r.ipAddress // null),
+                dhost:   "accounts.google.com",
+                act:     $ename,
+                outcome: $outcome,
+                externalId: ($r.id.uniqueQualifier | tostring),
+                cs1: (pstr("login_type")),
+                cs1Label: (if (pstr("login_type")) != null then "loginType" else null end),
+                cs2: (pstr("login_challenge_method")),
+                cs2Label: (if (pstr("login_challenge_method")) != null then "challengeMethod" else null end),
+                cs3: (pstr("login_challenge_status")),
+                cs3Label: (if (pstr("login_challenge_status")) != null then "loginChallengeStatus" else null end),
+                cs4: (pstr("login_failure_type")),
+                cs4Label: (if (pstr("login_failure_type")) != null then "loginFailureType" else null end),
+                cs5: ($r.id.customerId // null),
+                cs5Label: (if ($r.id.customerId // null) != null then "customerId" else null end),
+                cs6: (pbool("is_second_factor") | if . == null then null else tostring end),
+                cs6Label: (if (pbool("is_second_factor")) != null then "isSecondFactor" else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

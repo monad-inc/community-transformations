@@ -1,0 +1,70 @@
+name: "Microsoft Azure Activity Logs to CEF"
+description: "Maps Microsoft Azure Activity Log records (control-plane management operations) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-activity-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "microsoft"
+  - "azure-activity-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Microsoft Azure Activity Log -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity int 0-10; times epoch-MS; cs* slots
+          # paired with *Label. One jq pass; shallow null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # operationName / resultType may arrive as {value, localizedValue}.
+          def strv($f):
+            if ($f | type) == "object" then ($f.value // $f.localizedValue)
+            else $f end;
+
+          . as $r
+          | ( $r.identity.claims // {} ) as $claims
+          | ( strv($r.operationName) // "" ) as $op
+          | ( strv($r.resultType) // $r.status // "" ) as $result
+          | ( $r.caller
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"] ) as $caller
+          | ( $r.callerIpAddress // $claims.ipaddr ) as $caller_ip
+          | ( if ($result | ascii_downcase | startswith("succ")) then "SUCCESS"
+              elif ($result | ascii_downcase | startswith("fail")) then "FAILURE"
+              else "UNKNOWN" end ) as $outcome
+
+          | { _cef: {
+              vendor: "Microsoft",
+              product: "Azure Activity Log",
+              version: "",
+              signature_id: (if $op == "" then "Unknown" else $op end),
+              name: (if $op == "" then "Azure control-plane activity" else $op end),
+              # Azure level -> CEF severity bucket (0-10).
+              severity: ( { "Informational": 2, "Warning": 5, "Error": 7, "Critical": 9 }[$r.level] // 0 ),
+              extension: ( {
+                rt:          to_epoch_ms($r.time // $r.eventTimestamp),
+                suser:       $caller,
+                src:         $caller_ip,
+                act:         $op,
+                outcome:     $outcome,
+                externalId:  $r.correlationId,
+                deviceExternalId: $r.subscriptionId,
+                msg:         ($r.properties.message // strv($r.resultSignature)),
+                cs1Label: "category",       cs1: $r.category,
+                cs2Label: "resourceId",     cs2: $r.resourceId,
+                cs3Label: "tenantId",       cs3: $r.tenantId,
+                cs4Label: "eventDataId",    cs4: $r.eventDataId
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

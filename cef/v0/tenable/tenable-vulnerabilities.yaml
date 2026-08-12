@@ -1,0 +1,82 @@
+name: "Tenable Vulnerability Findings to CEF"
+description: "Maps Tenable Vulnerability Management finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "tenable-vulnerabilities"
+tags:
+  - "v0"
+  - "cef"
+  - "tenable"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Tenable Vulnerability Management -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (mapped from the Tenable severity label)
+          #   - time fields (rt/start/end): epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass, per-record only; shallow null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # Tenable severity label -> CEF severity 0-10.
+          def sev_0_10($s):
+            ($s // "" | ascii_downcase | gsub("^\\s+|\\s+$"; "")) as $x |
+            if   $x == "info" or $x == "informational" then 0
+            elif $x == "low"      then 3
+            elif $x == "medium"   then 5
+            elif $x == "high"     then 8
+            elif $x == "critical" then 10
+            else 0 end;
+
+          . as $r
+          | ( $r.plugin // {} ) as $p
+          | ( $r.asset  // {} ) as $a
+          | ( ( ($p.cve // [])
+                + [ ($p.xrefs // [])[] | select(.type == "CVE") | "CVE-" + (.id | ltrimstr("CVE-")) ] )
+              | unique ) as $cves
+          | { _cef: {
+              vendor: "Tenable",
+              product: "Tenable Vulnerability Management",
+              version: "",
+              signature_id: ($p.id | tostring),          # stable Tenable plugin id
+              name: ($p.name),                            # human-readable plugin title
+              severity: sev_0_10($r.severity),
+              extension: ( {
+                rt:       to_epoch_ms($r.scan.started_at),
+                start:    to_epoch_ms($r.first_found),
+                end:      to_epoch_ms($r.last_found),
+                dhost:    ($a.fqdn // $a.hostname),
+                dst:      $a.ipv4,
+                dmac:     $a.mac_address,
+                outcome:  $r.state,
+                msg:      ($p.synopsis // $p.description),
+                # CVSS base score -> numeric custom slot.
+                cn1Label: "cvssBaseScore",
+                cn1:      ($p.cvss3_base_score // $p.cvss_base_score),
+                # First CVE and full CVE list -> string custom slots.
+                cs1Label: "cve",
+                cs1:      ($cves | first),
+                cs2Label: "cveList",
+                cs2:      (if ($cves | length) > 0 then ($cves | join(",")) else null end),
+                cs3Label: "cvss3Vector",
+                cs3:      ($p.cvss3_vector.raw),
+                cs4Label: "solution",
+                cs4:      ($p.solution),
+                cs5Label: "pluginFamily",
+                cs5:      ($p.family)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

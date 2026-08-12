@@ -1,0 +1,60 @@
+name: "Snyk Issue Findings to CEF"
+description: "Maps Snyk Issue Findings into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-issues"
+tags:
+  - "v0"
+  - "cef"
+  - "snyk"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk /issues -> CEF intermediate (T1). NO escaping here.
+          # severity: integer 0-10 ; rt/start: epoch-MILLISECONDS ;
+          # custom slots cs*/cn* always paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($a.coordinates[0].representations[0].dependency // {}) as $dep
+          | ( [ $a.problems[]? | select(.source == "NVD") | .id ] | first ) as $cve
+          | ( [ $a.classes[]?  | select(.source == "CWE") | .id ] | first ) as $cwe
+          | ( [ $a.severities[]? | select(.score != null) | .score ] | first ) as $cvss
+          | { _cef: {
+              vendor: "Snyk",
+              product: "Snyk",
+              version: "",
+              signature_id: ($a.key // $r.id),
+              name: ($a.title // "Snyk Issue"),
+              severity: (
+                { "info": 1, "low": 3, "medium": 5, "high": 8, "critical": 10 }[$a.effective_severity_level] // 0
+              ),
+              extension: ( {
+                rt:      to_epoch_ms($a.updated_at),
+                start:   to_epoch_ms($a.created_at),
+                outcome: $a.status,
+                msg:     $a.description,
+                reason:  $a.effective_severity_level,
+                request: ($a.problems[0].url // null),
+                cs1Label: "packageName",   cs1: $dep.package_name,
+                cs2Label: "packageVersion", cs2: $dep.package_version,
+                cs3Label: "cve",           cs3: $cve,
+                cs4Label: "cwe",           cs4: $cwe,
+                cs5Label: "snykIssueId",   cs5: $r.id,
+                cs6Label: "issueType",     cs6: $a.type,
+                cn1Label: "cvssBaseScore", cn1: $cvss
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
