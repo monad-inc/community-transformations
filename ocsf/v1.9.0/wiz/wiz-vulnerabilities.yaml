@@ -1,0 +1,204 @@
+name: "Wiz Vulnerabilities to OCSF v1.9.0"
+description: "Transforms Wiz Vulnerabilities into the OCSF v1.9.0 Vulnerability Finding class (class_uid 2002)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+  - "https://github.com/Credgate"
+inputs:
+  - "wiz-vulnerabilities"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "wiz"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one Wiz vulnerability finding record per invocation.
+          # Handles both the camelCase (GraphQL) and PascalCase (report)
+          # field spellings Wiz emits.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def sev($s):
+            if   $s == "CRITICAL"      or $s == "Critical"      then 5
+            elif $s == "HIGH"          or $s == "High"          then 4
+            elif $s == "MEDIUM"        or $s == "Medium"        then 3
+            elif $s == "LOW"           or $s == "Low"           then 2
+            elif $s == "INFORMATIONAL" or $s == "Informational" then 1
+            else 0 end;
+
+          . as $r
+          | ($r.vulnerableAsset // {}) as $a
+          | ($r.name // $r.Name) as $cve_id
+          | ($r.vendorSeverity // $r.VendorSeverity) as $vsev
+          | ($r.cloudPlatform // $a.cloudPlatform // $r.CloudPlatform) as $provider
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid": 2002,
+              "activity_id": 1,
+              "type_uid": 200201,
+              "severity_id": (sev($vsev)),
+
+              # --- Time (REQUIRED) ---
+              "time": (
+                (to_epoch($r.firstDetectedAt // $r.FirstDetected)) // (now | floor)
+              ),
+              "start_time": (to_epoch($r.firstDetectedAt // $r.FirstDetected)),
+              "end_time": (to_epoch($r.lastDetectedAt // $r.LastDetected)),
+
+              # --- Status ---
+              "status_id": (
+                if   ($r.status // $r.FindingStatus) == "OPEN"        or ($r.status // $r.FindingStatus) == "Open"       then 1
+                elif ($r.status // $r.FindingStatus) == "IN_PROGRESS" or ($r.status // $r.FindingStatus) == "InProgress" then 2
+                elif ($r.status // $r.FindingStatus) == "RESOLVED"    or ($r.status // $r.FindingStatus) == "Resolved"   then 99
+                else 0 end
+              ),
+
+              # --- finding_info (REQUIRED; requires uid) ---
+              "finding_info": {
+                "uid": ($r.id // $r.ID),
+                "title": ($r.name // $r.Name),
+                "desc": ($r.description // $r.Description),
+                "types": ["Vulnerability"],
+                "src_url": ($r.portalUrl // $r.WizURL)
+              },
+
+              # --- vulnerabilities (REQUIRED) ---
+              "vulnerabilities": [
+                {
+                  "cve": {
+                    "uid": $cve_id,
+                    "cvss": (
+                      if ($r.score // $r.Score) then [
+                        {
+                          "base_score": ($r.score // $r.Score),
+                          "version": "3.1",
+                          "severity": ($r.cvssSeverity // $r.CVSSSeverity)
+                        }
+                      ] else null end
+                    )
+                  },
+                  "desc": ($r.CVEDescription // $r.description // $r.Description),
+                  "title": $cve_id,
+                  "severity": $vsev,
+                  "is_exploit_available": ($r.hasExploit // $r.HasExploit),
+                  "is_fix_available": (if ($r.fixedVersion // $r.FixedVersion) then true else false end),
+                  "first_seen_time": (to_epoch($r.firstDetectedAt // $r.FirstDetected)),
+                  "last_seen_time": (to_epoch($r.lastDetectedAt // $r.LastDetected)),
+                  "affected_packages": [
+                    {
+                      "name": ($r.detailedName // $r.DetailedName),
+                      "version": ($r.version // $r.Version),
+                      "fixed_in_version": ($r.fixedVersion // $r.FixedVersion),
+                      "path": ($r.locationPath // $r.LocationPath)
+                    }
+                  ],
+                  "references": (
+                    if   ($r.link // $r.Link) then [($r.link // $r.Link)]
+                    else [] end
+                  ),
+                  "remediation": (
+                    if ($r.remediation // $r.Remediation) then {
+                      "desc": ($r.remediation // $r.Remediation)
+                    } else null end
+                  ),
+                  "vendor_name": "Wiz"
+                }
+              ],
+
+              # --- osint (REQUIRED in 1.9.0; value + type_id) ---
+              "osint": [
+                {
+                  "value": $cve_id,
+                  "type_id": 10
+                }
+              ],
+
+              # --- resources ---
+              "resources": [
+                {
+                  "uid": ($a.id // $r.AssetID),
+                  "name": ($a.name // $r.AssetName),
+                  "type": ($a.type // $r.OperatingSystem // "Unknown"),
+                  "region": ($a.region // $r.AssetRegion),
+                  "cloud_partition": $provider,
+                  "labels": (
+                    if $a.tags then [$a.tags | to_entries[] | (.key + ":" + (.value | tostring))]
+                    elif $r.Tags then [$r.Tags | to_entries[] | (.key + ":" + (.value | tostring))]
+                    else [] end
+                  )
+                }
+              ],
+
+              # --- cloud (REQUIRED; requires provider) ---
+              "cloud": {
+                "provider": ($provider // "Unknown"),
+                "region": ($a.region // $r.AssetRegion),
+                "account": {
+                  "uid": ($a.subscriptionId // $r.SubscriptionId),
+                  "name": ($a.subscriptionName // $r.SubscriptionName)
+                }
+              },
+
+              # --- confidence / impact ---
+              "confidence_id": 3,
+              "impact_id": (sev($vsev)),
+
+              # --- metadata (REQUIRED; requires product + version) ---
+              "metadata": {
+                "uid": ($r.id // $r.ID),
+                "version": "1.9.0",
+                "product": {
+                  "name": "Wiz",
+                  "vendor_name": "Wiz, Inc.",
+                  "version": "1.0"
+                },
+                "labels": (
+                  [
+                    (if ($r.detectionMethod // $r.DetectionMethod) then ("detection_method:" + ($r.detectionMethod // $r.DetectionMethod)) else empty end),
+                    (if ($r.hasCisaKevExploit // $r.HasCisaKevExploit) then "cisa_kev:true" else empty end),
+                    (if $r.validatedInRuntime then ("validated_in_runtime:" + ($r.validatedInRuntime | tostring)) else empty end),
+                    (if $r.dataSourceName then ("data_source:" + $r.dataSourceName) else empty end),
+                    (if $r.projects then ($r.projects[] | ("project:" + .)) else empty end)
+                  ]
+                )
+              },
+
+              # --- observables ---
+              "observables": (
+                [
+                  (if ($a.id // $r.AssetID) then {
+                    "name": "resource.uid",
+                    "type": "Resource UID",
+                    "type_id": 10,
+                    "value": ($a.id // $r.AssetID)
+                  } else empty end),
+                  (if ($cve_id | type) == "string" and ($cve_id | startswith("CVE-")) then {
+                    "name": "cve.uid",
+                    "type": "CVE ID",
+                    "type_id": 10,
+                    "value": $cve_id
+                  } else empty end)
+                ]
+              ),
+
+              # --- Original record for audit / debugging ---
+              "raw_data": (. | tostring)
+            }
+          # Prune null / empty leaves while keeping required objects present.
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

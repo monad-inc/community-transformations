@@ -1,0 +1,143 @@
+name: "Google Workspace Login Activity to OCSF v1.9.0"
+description: "Transforms Google Workspace (Admin SDK Reports API) login activity records into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-workspace-login-activity"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "google"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002, category_uid=3) — v1.9.0
+          # Input: one Google Workspace login activity record per invocation
+          # (Admin SDK Reports API, applicationName="login").
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.events[0] // {}) as $ev
+          | ($ev.parameters // []) as $params
+          | ($ev.name // "") as $ename
+
+          # parameter lookup helpers (Google's name/value/boolValue/multiValue shape)
+          | def param($n): ($params | map(select(.name == $n)) | first);
+            def pstr($n): (param($n) | if . == null then null
+                           else (.value // ((.multiValue // []) | join(","))) end);
+            def pbool($n): (param($n) | if . == null then null else .boolValue end);
+            (pstr("login_type")) as $login_type
+          | ($r.actor.email // pstr("affected_email_address")) as $email
+
+          # activity_id: Logon(1) / Logoff(2) / Other(99)
+          | ( if ($ename | startswith("logout")) then 2
+              elif ($ename | startswith("login") or startswith("suspicious")) then 1
+              else 99 end ) as $activity_id
+
+          # status_id: Success(1) / Failure(2) / Other(99)
+          | ( if $ename == "login_success" then 1
+              elif ($ename | startswith("login_failure") or startswith("suspicious")) then 2
+              else 99 end ) as $status_id
+
+          # severity_id: Informational(1) / Medium(3) / High(4)
+          | ( if ($ename | startswith("suspicious")) or (pbool("is_suspicious") == true) then 4
+              elif ($ename | startswith("login_failure")) then 3
+              else 1 end ) as $severity_id
+
+          # auth_protocol from login_type
+          | ( if $login_type == "saml" then {auth_protocol: "SAML", auth_protocol_id: 8}
+              elif $login_type == "reauth" then {auth_protocol: "Other", auth_protocol_id: 99}
+              else {auth_protocol: "Other", auth_protocol_id: 99} end ) as $auth
+
+          | {
+              category_uid: 3,
+              class_uid: 3002,
+              type_uid: (3002 * 100 + $activity_id),
+              activity_id: $activity_id,
+              activity_name: ( if $activity_id == 1 then "Logon"
+                               elif $activity_id == 2 then "Logoff"
+                               else "Other" end ),
+
+              time: to_epoch($r.id.time),
+              severity_id: $severity_id,
+              status_id: $status_id,
+              status: ( if $status_id == 1 then "Success"
+                        elif $status_id == 2 then "Failure" else "Other" end ),
+
+              # Authentication-flavored recommended fields (flat, per OCSF)
+              auth_protocol: $auth.auth_protocol,
+              auth_protocol_id: $auth.auth_protocol_id,
+              logon_type: $login_type,
+              is_mfa: (pbool("is_second_factor")),
+
+              # REQUIRED: user (the authenticating principal)
+              user: {
+                type_id: 1,
+                name: $email,
+                email_addr: $email,
+                uid: ($r.actor.profileId // null),
+                domain: ($r.ownerDomain // null)
+              },
+
+              # Actor mirrors the acting user for this source
+              actor: {
+                user: {
+                  type_id: 1,
+                  name: $email,
+                  email_addr: $email,
+                  uid: ($r.actor.profileId // null)
+                }
+              },
+
+              src_endpoint: {
+                ip: ($r.ipAddress // null)
+              },
+
+              # Satisfies the class at_least_one [service, dst_endpoint] constraint
+              dst_endpoint: {
+                hostname: "accounts.google.com",
+                svc_name: ($r.id.applicationName // "login")
+              },
+
+              # REQUIRED top-level in v1.9.0 base
+              osint: [],
+              cloud: {
+                provider: "Google Workspace",
+                account: { uid: ($r.id.customerId // null) }
+              },
+
+              metadata: {
+                version: "1.9.0",
+                uid: ($r.id.uniqueQualifier | tostring),
+                original_time: ($r.id.time // ""),
+                product: {
+                  vendor_name: "Google",
+                  name: "Google Workspace"
+                }
+              },
+
+              message: ($ename),
+
+              unmapped: {
+                caller_type: ($r.actor.callerType // null),
+                login_challenge_method: (pstr("login_challenge_method")),
+                login_challenge_status: (pstr("login_challenge_status")),
+                login_failure_type: (pstr("login_failure_type")),
+                is_suspicious: (pbool("is_suspicious")),
+                event_type: ($ev.type // null)
+              },
+
+              raw_data: ($r | tostring)
+            }

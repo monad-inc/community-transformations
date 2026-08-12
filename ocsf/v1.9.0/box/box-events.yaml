@@ -1,0 +1,131 @@
+name: "Box Enterprise Events to OCSF v1.9.0"
+description: "Transforms Box Enterprise Events into the OCSF v1.9.0 API Activity (6003) class"
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "box-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "box"
+  - "application"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Box Enterprise Events -> OCSF v1.9.0 API Activity (class_uid 6003).
+          # Box Admin/Enterprise events are CRUD-style API activities on the Box
+          # platform, so they map cleanly to the API Activity class (the same
+          # class the OCSF spec cites for AWS CloudTrail). One record in, one
+          # OCSF event out. No recursive prune: fields are conditionally built.
+          . as $event
+          | (
+              # epoch-milliseconds (OCSF timestamp_t) from ISO-8601 or numeric
+              def to_ms($ts):
+                if $ts == null then (now * 1000 | floor)
+                elif ($ts | type) == "number" then
+                  (if $ts > 9999999999 then $ts else ($ts * 1000) end | floor)
+                else (($ts | gsub("\\.[0-9]+"; "") | sub("([+-][0-9]{2}:[0-9]{2}|Z)$"; "Z") | fromdateiso8601) * 1000)
+                end;
+
+              # API Activity activity_id: 1 Create, 2 Read, 3 Update, 4 Delete, 0 Unknown, 99 Other
+              def activity($et):
+                if ($et | type) != "string" then {id: 0, name: "Unknown"}
+                elif ($et | test("UPLOAD|CREATE|COPY|ADD|NEW_|MOVE_TO")) then {id: 1, name: "Create"}
+                elif ($et | test("DOWNLOAD|PREVIEW|OPEN|VIEW|ACCESS")) then {id: 2, name: "Read"}
+                elif ($et | test("EDIT|UPDATE|RENAME|MOVE|CHANGE|LOCK|UNLOCK|SHARE|COLLABORAT")) then {id: 3, name: "Update"}
+                elif ($et | test("DELETE|TRASH|REMOVE|UNDELETE")) then {id: 4, name: "Delete"}
+                else {id: 99, name: "Other"}
+                end;
+
+              def severity($et):
+                if ($et | type) != "string" then 1
+                elif ($et | test("FILE_MARKED_MALICIOUS|DEVICE_TRUST_CHECK_FAILED|SHIELD_")) then 4
+                elif ($et | test("FAILED_|ERROR|REJECT|DECLINE")) then 3
+                else 1
+                end;
+
+              def user_of($u):
+                if $u == null then null else
+                  ( {}
+                    + (if ($u.id // "") != "" then {uid: ($u.id | tostring)} else {} end)
+                    + (if ($u.name // $u.login // "") != "" then {name: ($u.name // $u.login)} else {} end)
+                    + (if ($u.login // "") != "" then {email_addr: $u.login} else {} end)
+                  )
+                end;
+
+              (activity($event.event_type)) as $act
+              | (severity($event.event_type)) as $sev
+              | (6003) as $class_uid
+              | {
+                  category_uid: 6,
+                  category_name: "Application Activity",
+                  class_uid: $class_uid,
+                  class_name: "API Activity",
+                  activity_id: $act.id,
+                  activity_name: $act.name,
+                  type_uid: ($class_uid * 100 + $act.id),
+                  type_name: ("API Activity: " + $act.name),
+                  time: to_ms($event.created_at),
+                  severity_id: $sev,
+                  severity: (if $sev == 4 then "High" elif $sev == 3 then "Medium" else "Informational" end),
+                  status_id: 1,
+                  status: "Success",
+
+                  metadata: {
+                    version: "1.9.0",
+                    product: { name: "Box", vendor_name: "Box" },
+                    profiles: ["cloud"],
+                    event_code: ($event.event_type // "")
+                  },
+
+                  # cloud + osint are base-required on 6003 in OCSF 1.9.0
+                  cloud: { provider: "Box" },
+                  osint: [],
+
+                  actor: ( { user: (user_of($event.created_by) // {}) } ),
+
+                  api: ( {
+                    operation: ($event.event_type // "unknown")
+                  }
+                  + (if ($event.additional_details.service_name // "") != "" or ($event.additional_details.service_id // "") != "" then {
+                       service: ( {}
+                         + (if ($event.additional_details.service_name // "") != "" then {name: $event.additional_details.service_name} else {} end)
+                         + (if ($event.additional_details.service_id // "") != "" then {uid: ($event.additional_details.service_id | tostring)} else {} end) )
+                     } else {} end)
+                  + (if ($event.session_id // $event.event_id // "") != "" then {
+                       request: { uid: (($event.session_id // $event.event_id) | tostring) }
+                     } else {} end) ),
+
+                  src_endpoint: ( {}
+                    + (if ($event.ip_address // "") != "" then {ip: $event.ip_address} else {} end)
+                    + (if ($event.session_id // "") != "" then {uid: $event.session_id} else {} end) ),
+
+                  resources: ( if $event.source == null then [] else
+                    [ ( {}
+                        + (if ($event.source.item_type // $event.source.type // "") != "" then {type: ($event.source.item_type // $event.source.type)} else {} end)
+                        + (if ($event.source.item_name // $event.source.name // "") != "" then {name: ($event.source.item_name // $event.source.name)} else {} end)
+                        + (if ($event.source.item_id // $event.source.id // "") != "" then {uid: (($event.source.item_id // $event.source.id) | tostring)} else {} end)
+                        + (if $event.source.owned_by != null then {owner: (user_of($event.source.owned_by) // {})} else {} end)
+                      ) ]
+                    end ),
+
+                  message: ( ("Box " + ($act.name) + ": " + ($event.event_type // "event"))
+                             + (if ($event.created_by.name // $event.created_by.login // "") != "" then " by " + ($event.created_by.name // $event.created_by.login) else "" end)
+                             + (if ($event.source.item_name // $event.source.name // "") != "" then " on " + ($event.source.item_name // $event.source.name) else "" end) ),
+
+                  observables: ( [
+                      (if ($event.ip_address // "") != "" then {name: "src_endpoint.ip", type: "IP Address", type_id: 2, value: $event.ip_address} else null end),
+                      (if ($event.created_by.login // "") != "" then {name: "actor.user.email_addr", type: "Email Address", type_id: 5, value: $event.created_by.login} else null end),
+                      (if ($event.source.item_id // $event.source.id // "") != "" then {name: "resources.uid", type: "Resource UID", type_id: 10, value: (($event.source.item_id // $event.source.id) | tostring)} else null end)
+                    ] | map(select(. != null)) ),
+
+                  enrichments: ( if $event.additional_details != null then [ {name: "additional_details", data: $event.additional_details} ] else [] end),
+
+                  unmapped: ( { box_event_id: $event.event_id } )
+                }
+            )

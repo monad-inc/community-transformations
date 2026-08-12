@@ -1,0 +1,123 @@
+name: "CrowdStrike Falcon Data Replicator to OCSF v1.9.0"
+description: "Transforms a CrowdStrike Falcon Data Replicator (FDR) ProcessRollup2 endpoint telemetry record into the OCSF v1.9.0 Process Activity (class_uid 1007) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-falcon-data-replicator"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "crowdstrike"
+  - "system"
+  - "process_activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Process Activity (class_uid=1007) — v1.9.0
+          # Input: one CrowdStrike Falcon Data Replicator ProcessRollup2
+          # record per invocation (raw endpoint sensor telemetry).
+          # ---------------------------------------------------------------
+
+          def basename($p):
+            if $p == null or $p == "" then null
+            else ($p | gsub("\\\\"; "/") | split("/") | last)
+            end;
+
+          # FDR .timestamp is epoch milliseconds (string); event time in secs.
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            else (($ts | tonumber) / 1000 | floor)
+            end;
+
+          # FDR fractional-second epoch strings (ProcessStartTime, etc.)
+          def to_epoch_secs($ts):
+            if $ts == null or $ts == "" then null
+            else ($ts | tonumber | floor)
+            end;
+
+          . as $r
+          | {
+              category_uid: 1,
+              class_uid:    1007,
+              type_uid:     100701,
+              activity_id:  1,
+              severity_id:  1,
+              time:         to_epoch_ms($r.timestamp),
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "CrowdStrike",
+                  name: "Falcon Data Replicator"
+                },
+                uid: $r.aid,
+                log_name: $r.event_simpleName,
+                event_code: $r.event_simpleName,
+                tenant_uid: $r.cid
+              },
+              device: {
+                type_id: 2,
+                hostname: $r.ComputerName,
+                uid: $r.aid,
+                ip: $r.aip,
+                os: {
+                  name: "Windows",
+                  type: "Windows",
+                  type_id: 100
+                }
+              },
+              process: {
+                pid: (if $r.RawProcessId != null then ($r.RawProcessId | tonumber) else null end),
+                uid: $r.TargetProcessId,
+                name: basename($r.ImageFileName),
+                cmd_line: $r.CommandLine,
+                created_time: to_epoch_secs($r.ProcessStartTime),
+                file: {
+                  type_id: 1,
+                  path: $r.ImageFileName,
+                  name: basename($r.ImageFileName),
+                  hashes: [
+                    (if $r.SHA256HashData != null and $r.SHA256HashData != ""
+                     then {algorithm_id: 3, value: $r.SHA256HashData} else empty end),
+                    (if $r.MD5HashData != null and $r.MD5HashData != ""
+                     then {algorithm_id: 1, value: $r.MD5HashData} else empty end)
+                  ]
+                },
+                user: {
+                  name: $r.UserName,
+                  uid: $r.UserSid
+                }
+              },
+              actor: {
+                process: {
+                  uid: $r.ParentProcessId,
+                  name: $r.ParentBaseFileName
+                }
+              },
+              cloud: {
+                provider: "CrowdStrike Falcon"
+              },
+              osint: [],
+              observables: [
+                (if $r.ComputerName != null and $r.ComputerName != ""
+                 then {name: "device.hostname", type_id: 1, value: $r.ComputerName} else empty end),
+                (if $r.UserName != null and $r.UserName != ""
+                 then {name: "process.user.name", type_id: 4, value: $r.UserName} else empty end),
+                (if $r.SHA256HashData != null and $r.SHA256HashData != ""
+                 then {name: "process.file.hashes.value", type_id: 8, value: $r.SHA256HashData} else empty end),
+                (if $r.aip != null and $r.aip != ""
+                 then {name: "device.ip", type_id: 2, value: $r.aip} else empty end)
+              ],
+              raw_data: ($r | tostring)
+            }
+          # Drop null / empty-string leaves; keep empty arrays (osint) and objects.
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != ""))
+              else .
+              end
+            )

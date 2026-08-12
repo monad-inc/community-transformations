@@ -1,0 +1,138 @@
+name: "Microsoft Azure Activity Logs to OCSF v1.9.0"
+description: "Transforms Microsoft Azure Activity Log records (control-plane management operations) into the OCSF v1.9.0 API Activity class (class_uid 6003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-activity-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "microsoft"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one Microsoft Azure Activity Log record per invocation
+          #   (Azure Monitor resource-log schema exported via Diagnostic
+          #   Settings / Event Hub / the microsoft-azure-activity-logs input).
+          #
+          # Azure control-plane operations name a verb via the trailing
+          # segment of operationName (/write, /read, /delete, /action). That
+          # verb selects the OCSF API Activity activity_id.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Azure Monitor sometimes wraps operationName / resultType as
+          # {value, localizedValue}; read whichever shape arrives.
+          def strv($f):
+            if ($f | type) == "object" then ($f.value // $f.localizedValue)
+            else $f end;
+
+          . as $r
+          | ( $r.identity.claims // {} ) as $claims
+          | ( strv($r.operationName) // "" ) as $op
+          | ( $op | ascii_downcase ) as $opl
+          | ( strv($r.resultType) // $r.status // "" ) as $result
+          | ( $r.caller
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"] ) as $caller
+          | ( $claims["http://schemas.microsoft.com/identity/claims/objectidentifier"] ) as $caller_uid
+          | ( $r.callerIpAddress // $claims.ipaddr ) as $caller_ip
+
+          # ---- activity_id (API Activity: 1 Create, 2 Read, 3 Update,
+          #      4 Delete, 99 Other, 0 Unknown) --------------------------
+          | ( if ($opl | endswith("/write")) then 3
+              elif ($opl | endswith("/read")) then 2
+              elif ($opl | endswith("/delete")) then 4
+              elif ($opl | endswith("/action")) then 99
+              elif $op == "" then 0
+              else 99 end ) as $activity_id
+
+          # ---- severity_id from Azure level ------------------------------
+          | ( { "Informational": 1, "Warning": 3, "Error": 4, "Critical": 5 }[$r.level] // 0 ) as $sev
+
+          # ---- status_id (1 Success, 2 Failure) --------------------------
+          | ( if ($result | ascii_downcase | startswith("succ")) then 1
+              elif ($result | ascii_downcase | startswith("fail")) then 2
+              else 0 end ) as $status_id
+
+          | {
+              category_uid: 6,
+              class_uid: 6003,
+              type_uid: (6003 * 100 + $activity_id),
+              activity_id: $activity_id,
+              severity_id: $sev,
+
+              time: to_epoch($r.time // $r.eventTimestamp),
+
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Microsoft",
+                  name: "Azure Activity Log"
+                },
+                correlation_uid: $r.correlationId,
+                uid: $r.eventDataId,
+                log_provider: "Azure Monitor"
+              },
+
+              # API Activity requires an actor, api, cloud, src_endpoint.
+              actor: {
+                user: {
+                  name: $caller,
+                  uid: $caller_uid,
+                  type_id: 1
+                },
+                app_name: $claims.appid
+              },
+
+              api: {
+                operation: (if $op == "" then "Unknown" else $op end),
+                service: { name: ($op | split("/")[0]) }
+              },
+
+              cloud: {
+                provider: "Azure",
+                region: $r.location,
+                account: { uid: ($r.subscriptionId // $claims["http://schemas.microsoft.com/identity/claims/tenantid"]) }
+              },
+
+              src_endpoint: {
+                ip: $caller_ip
+              },
+
+              # OCSF 1.9.0 marks osint required on API Activity; no OSINT
+              # indicators are present on an Azure control-plane record.
+              osint: [],
+
+              status_id: $status_id,
+              status: $result,
+              status_detail: (strv($r.resultSignature)),
+              message: ($r.properties.message // $op),
+
+              resources: [
+                { uid: $r.resourceId, type: "azure-resource" }
+              ],
+
+              unmapped: {
+                category: $r.category,
+                correlationId: $r.correlationId,
+                tenantId: $r.tenantId,
+                level: $r.level
+              },
+
+              raw_data: ($r | tostring)
+            }
+          # Drop only null values; keep osint:[] and any required empty object.
+          | walk(if type == "object" then with_entries(select(.value != null)) else . end)

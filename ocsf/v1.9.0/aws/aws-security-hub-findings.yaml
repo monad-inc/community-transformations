@@ -1,0 +1,155 @@
+name: "AWS Security Hub Findings to OCSF v1.9.0"
+description: "Transforms AWS Security Hub findings (ASFF) into the OCSF v1.9.0 Detection Finding (class_uid 2004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-hub-findings"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: one AWS Security Hub finding (ASFF) record per invocation.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # ASFF Severity.Label -> OCSF severity_id
+          # (0 Unknown,1 Info,2 Low,3 Medium,4 High,5 Critical,6 Fatal)
+          def severity_id($lbl):
+            { "INFORMATIONAL": 1, "LOW": 2, "MEDIUM": 3,
+              "HIGH": 4, "CRITICAL": 5 }[$lbl] // 0;
+
+          # ASFF Workflow.Status -> OCSF finding status_id
+          # (0 Unknown,1 New,2 In Progress,3 Suppressed,4 Resolved,99 Other)
+          def status_id($s):
+            { "NEW": 1, "NOTIFIED": 2, "RESOLVED": 4, "SUPPRESSED": 3 }[$s] // 0;
+
+          . as $r
+          | ($r.Severity // {}) as $sev
+          | ($r.Resources // []) as $res
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  1,
+              "type_uid":     (2004 * 100 + 1),
+              "severity_id":  severity_id($sev.Label),
+              "severity":     ({ "INFORMATIONAL": "Informational", "LOW": "Low",
+                                 "MEDIUM": "Medium", "HIGH": "High",
+                                 "CRITICAL": "Critical" }[$sev.Label] // "Unknown"),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.UpdatedAt // $r.CreatedAt),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": ($r.CompanyName // "AWS"),
+                  "name": ($r.ProductName // "AWS Security Hub"),
+                  "feature": { "name": "Security Hub" }
+                }
+              },
+
+              # --- Finding Information (REQUIRED) ---
+              "finding_info": {
+                "uid":   ($r.Id // "unknown"),
+                "title": ($r.Title // "AWS Security Hub Finding"),
+                "desc":  ($r.Description // ""),
+                "types": ($r.Types // []),
+                "src_url": $r.SourceUrl,
+                "created_time":  to_epoch($r.CreatedAt),
+                "modified_time": to_epoch($r.UpdatedAt),
+                "first_seen_time": to_epoch($r.FirstObservedAt),
+                "last_seen_time":  to_epoch($r.LastObservedAt)
+              },
+
+              # --- Cloud (REQUIRED in Detection Finding) ---
+              "cloud": {
+                "provider": "AWS",
+                "region":   $r.Region,
+                "account":  { "uid": $r.AwsAccountId }
+              },
+
+              # --- OSINT (REQUIRED array in Detection Finding) ---
+              # Security Hub findings are not OSINT indicators; emit a single
+              # Other-type entry keyed on the finding's primary resource so the
+              # required object is populated with real, non-fabricated context.
+              "osint": [
+                {
+                  "value": (($res[0].Id) // ($r.Id) // "unknown"),
+                  "type_id": 99
+                }
+              ],
+
+              # --- Recommended ---
+              "status_id": status_id(($r.Workflow // {}).Status),
+              "status": ({ "NEW": "New", "NOTIFIED": "In Progress",
+                           "RESOLVED": "Resolved", "SUPPRESSED": "Suppressed" }[($r.Workflow // {}).Status]),
+              "confidence_id": (
+                if ($r.Confidence // null) == null then null
+                elif $r.Confidence >= 67 then 3
+                elif $r.Confidence >= 34 then 2
+                elif $r.Confidence >= 1  then 1
+                else 0 end),
+              "confidence": (
+                if ($r.Confidence // null) == null then null
+                elif $r.Confidence >= 67 then "High"
+                elif $r.Confidence >= 34 then "Medium"
+                elif $r.Confidence >= 1  then "Low"
+                else null end),
+              "is_alert": true,
+              "message": ($r.Title // ""),
+              "src_url": $r.SourceUrl,
+
+              # --- Affected resources ---
+              "resources": [
+                $res[] | {
+                  "uid":    .Id,
+                  "type":   .Type,
+                  "region": .Region,
+                  "cloud_partition": .Partition,
+                  "cloud":  { "provider": "AWS" }
+                }
+              ],
+
+              # --- Remediation ---
+              "remediation": (
+                if ($r.Remediation.Recommendation // null) != null then {
+                  "desc": ($r.Remediation.Recommendation.Text // ""),
+                  "references": (
+                    if ($r.Remediation.Recommendation.Url // null) != null
+                    then [ $r.Remediation.Recommendation.Url ] else null end)
+                } else null end),
+
+              # --- Observables ---
+              "observables": (
+                [ { "name": "finding_info.uid", "type_id": 10, "value": ($r.Id) },
+                  (if ($res[0].Id // null) != null
+                   then { "name": "resources.uid", "type_id": 10, "value": $res[0].Id }
+                   else empty end) ]),
+
+              # --- Original record for audit ---
+              "raw_data": ($r | tostring)
+            }
+            # Prune nulls/empties; required objects stay populated above.
+            | walk(
+                if type == "object" then
+                  with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                elif type == "array" then
+                  map(select(. != null))
+                else . end)

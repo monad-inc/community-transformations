@@ -1,0 +1,151 @@
+name: "Wiz Cloud Configuration Findings to OCSF v1.9.0"
+description: "Transforms Wiz Cloud Configuration Findings records into the OCSF v1.9.0 Compliance Finding (2003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "wiz-cloud-configuration-findings"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "wiz"
+  - "findings"
+  - "compliance"
+  - "cloud"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Compliance Finding (class_uid=2003) — v1.9.0
+          # Input: one Wiz Cloud Configuration Finding record per invocation.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.resource // {}) as $res
+          | ($r.rule // {}) as $rule
+          | (($r.securitySubCategories // [])[0]) as $ssc
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid": 2003,
+              "activity_id": 2,
+              "type_uid": 200302,
+              "category_name": "Findings",
+              "class_name": "Compliance Finding",
+              "activity_name": "Update",
+              "type_name": "Compliance Finding: Update",
+
+              # --- Severity (REQUIRED severity_id) ---
+              "severity": ($r.severity // null),
+              "severity_id": (
+                {
+                  "INFORMATIONAL": 1, "LOW": 2, "MEDIUM": 3,
+                  "HIGH": 4, "CRITICAL": 5
+                }[($r.severity // "") | ascii_upcase] // 0
+              ),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.firstSeenAt // $r.analyzedAt),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "name": "Wiz",
+                  "vendor_name": "Wiz"
+                },
+                "original_time": ($r.analyzedAt // $r.firstSeenAt // null)
+              },
+
+              # --- Compliance (REQUIRED for this class) ---
+              "compliance": {
+                "control": ($ssc.title // null),
+                "standards": [ ($ssc.category.framework.name // empty) ],
+                "status": ($r.result // null),
+                "status_id": (
+                  { "PASS": 1, "FAIL": 3 }[($r.result // "") | ascii_upcase] // 0
+                )
+              },
+
+              # --- Cloud (REQUIRED for this class; provider required in-object) ---
+              "cloud": {
+                "provider": ($res.cloudPlatform // "Other"),
+                "region": ($res.region // null),
+                "account": {
+                  "uid": ($res.subscription.externalId // null),
+                  "name": ($res.subscription.name // null)
+                }
+              },
+
+              # --- Finding info (REQUIRED for this class; uid required in-object) ---
+              "finding_info": {
+                "uid": ($r.id // "unknown"),
+                "title": ($rule.name // null),
+                "desc": ($rule.description // null),
+                "types": [ "Configuration" ],
+                "first_seen_time": to_epoch($r.firstSeenAt),
+                "modified_time": to_epoch($r.updatedAt),
+                "src_url": ($rule.shortId // null)
+              },
+
+              # --- OSINT (REQUIRED for this class; no indicators for config findings) ---
+              "osint": [],
+
+              # --- Recommended ---
+              "status": ($r.status // null),
+              "status_id": (
+                {
+                  "OPEN": 1, "IN_PROGRESS": 2, "RESOLVED": 4,
+                  "REJECTED": 3, "REOPENED": 1
+                }[($r.status // "") | ascii_upcase] // 0
+              ),
+              "message": ($rule.name // null),
+              "remediation": (
+                if $r.remediation then { "desc": $r.remediation } else null end
+              ),
+              "resource": {
+                "type": ($res.type // null),
+                "uid": ($res.providerId // $res.id // null),
+                "name": ($res.name // null),
+                "region": ($res.region // null),
+                "cloud_partition": ($res.cloudPlatform // null),
+                "labels": (
+                  if $res.labels
+                  then ($res.labels | to_entries | map("\(.key):\(.value)"))
+                  else null end
+                ),
+                "owner": (
+                  if $res.owner then {
+                    "name": ($res.owner // null),
+                    "uid": ($res.ownerId // null),
+                    "type": ($res.ownerType // null),
+                    "type_id": (
+                      { "USER": 1, "ADMIN": 2, "SYSTEM": 3 }[($res.ownerType // "") | ascii_upcase] // 0
+                    )
+                  } else null end
+                )
+              },
+              "observables": [
+                (if $r.targetExternalId then {
+                  "name": "resource.uid",
+                  "value": $r.targetExternalId,
+                  "type": "Resource UID",
+                  "type_id": 10
+                } else empty end)
+              ],
+
+              # --- Audit ---
+              "raw_data": ($r | tostring)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null))
+              else . end
+            )

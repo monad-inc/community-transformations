@@ -1,0 +1,168 @@
+name: "Crowdstrike Device Details to OCSF v1.9.0"
+description: "Transforms CrowdStrike Falcon device details records into the OCSF v1.9.0 Device Inventory Info (5001) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+  - "https://github.com/Credgate"
+inputs:
+  - "crowdstrike-device-details"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "crowdstrike"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # CrowdStrike Falcon device details -> OCSF v1.9.0
+          #   Device Inventory Info (class_uid 5001, category_uid 5 Discovery)
+          #
+          # One device record per invocation, as emitted by the Monad
+          # `crowdstrike-device-details` input connector (Falcon Hosts API
+          # /devices/entities/devices/v2). This is a collected inventory
+          # snapshot, so activity_id = 2 (Collect), type_uid = 500102.
+          # =================================================================
+
+          # CrowdStrike stamps ISO-8601 timestamps with a trailing Z and, on
+          # some fields, fractional seconds. OCSF `time`/`*_time` are integer
+          # epoch SECONDS, so strip the fraction + Z before strptime.
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "")
+                  | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+            end;
+
+          . as $r
+          | {
+              # ---- classification (required) ----
+              "activity_id": 2,
+              "activity_name": "Collect",
+              "category_uid": 5,
+              "category_name": "Discovery",
+              "class_uid": 5001,
+              "class_name": "Device Inventory Info",
+              "type_uid": 500102,
+              "type_name": "Device Inventory Info: Collect",
+              "severity_id": 1,
+              "severity": "Informational",
+              "time": to_epoch($r.agent_local_time),
+              "status": "Success",
+              "status_id": 1,
+
+              # ---- metadata (required: product, version) ----
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "name": "Falcon",
+                  "vendor_name": "CrowdStrike",
+                  "version": $r.agent_version,
+                  "feature": {
+                    "name": "Endpoint Detection and Response"
+                  }
+                },
+                "original_time": $r.agent_local_time
+              },
+
+              # ---- osint (required in 1.9.0; no threat-intel in an inventory
+              #      snapshot, so emit an empty array honestly) ----
+              "osint": [],
+
+              # ---- cloud (required in 1.9.0). CrowdStrike reports the hosting
+              #      cloud for cloud-provisioned sensors via service_provider. ----
+              "cloud": {
+                "provider": ($r.service_provider // "Unknown"),
+                "account": (
+                  if $r.service_provider_account_id
+                  then { "uid": $r.service_provider_account_id } else null end
+                )
+              },
+
+              # ---- device (required object; type_id required) ----
+              "device": {
+                "type_id": (
+                  if $r.product_type_desc == "Workstation" then 1
+                  elif $r.product_type_desc == "Server" then 2
+                  elif $r.product_type_desc == "Mobile" then 4
+                  else 99
+                  end
+                ),
+                "type": $r.product_type_desc,
+                "uid": $r.device_id,
+                "hostname": $r.hostname,
+                "name": $r.hostname,
+                "domain": $r.machine_domain,
+                "ip": $r.local_ip,
+                "mac": $r.mac_address,
+                "instance_uid": $r.instance_id,
+                "vendor_name": "CrowdStrike",
+                "first_seen_time": to_epoch($r.first_seen),
+                "last_seen_time": to_epoch($r.last_seen),
+                "modified_time": to_epoch($r.modified_timestamp),
+                "is_managed": ($r.provision_status == "Provisioned"),
+
+                "network_interfaces": ([
+                  {
+                    "type_id": 0,
+                    "hostname": $r.hostname,
+                    "ip": $r.local_ip,
+                    "mac": $r.mac_address,
+                    "name": $r.interface_name
+                  },
+                  (if $r.external_ip then {
+                     "type_id": 0,
+                     "hostname": $r.hostname,
+                     "ip": $r.external_ip,
+                     "mac": $r.mac_address,
+                     "name": $r.interface_name
+                   } else empty end)
+                ]),
+
+                "hw_info": {
+                  "bios_manufacturer": $r.bios_manufacturer,
+                  "bios_ver": $r.bios_version,
+                  "chassis": $r.chassis_type_desc,
+                  "cpu_type": ($r.cpu_signature // null),
+                  "serial_number": $r.serial_number,
+                  "vendor_name": $r.system_manufacturer,
+                  "name": $r.system_product_name
+                },
+
+                "os": {
+                  "name": $r.os_version,
+                  "type_id": (
+                    if $r.platform_name == "Mac" then 300
+                    elif $r.platform_name == "Windows" then 100
+                    elif $r.platform_name == "Linux" then 200
+                    else 0
+                    end
+                  ),
+                  "type": $r.platform_name,
+                  "version": $r.os_version,
+                  "build": $r.os_build,
+                  "kernel_release": $r.kernel_version
+                }
+              },
+
+              "raw_data": ($r | tostring),
+
+              "unmapped": {
+                "agent_load_flags": $r.agent_load_flags,
+                "config_id_base": $r.config_id_base,
+                "config_id_build": $r.config_id_build,
+                "config_id_platform": $r.config_id_platform,
+                "platform_id": $r.platform_id,
+                "reduced_functionality_mode": $r.reduced_functionality_mode,
+                "provision_status": $r.provision_status,
+                "status": $r.status,
+                "cid": $r.cid,
+                "tags": $r.tags,
+                "groups": $r.groups,
+                "device_policies": $r.device_policies
+              }
+            }

@@ -1,0 +1,151 @@
+name: "AWS GuardDuty Findings to OCSF v1.9.0"
+description: "Transforms Amazon GuardDuty finding records into the OCSF v1.9.0 Detection Finding (2004) class."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-guardduty"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: one Amazon GuardDuty finding record per invocation.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # GuardDuty severity (float 0-8.9) -> OCSF severity_id (1-6)
+          def sev_id($s):
+            if $s == null then 0
+            elif $s < 1 then 1        # Informational
+            elif $s < 4 then 2        # Low
+            elif $s < 7 then 3        # Medium
+            elif $s < 9 then 4        # High
+            else 5 end;               # Critical
+
+          . as $r
+          | ($r.service // {}) as $svc
+          | ($svc.action // {}) as $act
+          | (($act.networkConnectionAction // {}).remoteIpDetails // {}) as $remote
+          | ($r.resource // {}) as $res
+          | (($res.instanceDetails // {}).networkInterfaces[0] // {}) as $nic
+          | ( if ($r.updatedAt != null and $r.updatedAt != $r.createdAt) then 2 else 1 end ) as $activity
+          | ($remote.ipAddressV4 // $r.arn) as $osint_val
+          | {
+              # --- Classification (REQUIRED for every OCSF event) ---
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  $activity,
+              "type_uid":     (2004 * 100 + $activity),
+              "severity_id":  sev_id($r.severity),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.updatedAt // $r.createdAt),
+              "start_time": to_epoch($svc.eventFirstSeen),
+              "end_time":   to_epoch($svc.eventLastSeen),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "uid": $r.id,
+                "product": {
+                  "vendor_name": "AWS",
+                  "name": "Amazon GuardDuty",
+                  "feature": { "name": ($svc.serviceName // "guardduty") }
+                }
+              },
+
+              # --- Cloud (REQUIRED on Detection Finding) ---
+              "cloud": {
+                "provider": "AWS",
+                "region": $r.region,
+                "account": { "uid": $r.accountId, "type_id": 10 },
+                "zone": (($res.instanceDetails // {}).availabilityZone)
+              },
+
+              # --- OSINT (REQUIRED on Detection Finding) ---
+              "osint": [
+                { "type_id": 1, "value": $osint_val }
+              ],
+
+              # --- Finding info (REQUIRED) ---
+              "finding_info": {
+                "uid": $r.id,
+                "title": $r.title,
+                "desc": $r.description,
+                "types": [ $r.type ],
+                "created_time": to_epoch($r.createdAt),
+                "first_seen_time": to_epoch($svc.eventFirstSeen),
+                "last_seen_time": to_epoch($svc.eventLastSeen),
+                "src_url": ("https://console.aws.amazon.com/guardduty/home?region=" + ($r.region // "") + "#/findings?fId=" + ($r.id // ""))
+              },
+
+              # --- Recommended fields ---
+              "status_id": (if ($svc.archived == true) then 4 else 1 end),
+              "is_alert": true,
+              "confidence_id": 0,
+              "action_id": (if ((($act.networkConnectionAction // {}).blocked) == true) then 2 else 1 end),
+              "disposition_id": (if ((($act.networkConnectionAction // {}).blocked) == true) then 3 else 1 end),
+              "priority_id": (
+                (if $r.severity == null then 0
+                 elif $r.severity < 4 then 1
+                 elif $r.severity < 7 then 2
+                 elif $r.severity < 9 then 3
+                 else 4 end)
+              ),
+              "count": $svc.count,
+              "message": $r.description,
+              "observables": (
+                [ { "name": "finding_info.uid", "type_id": 8, "value": $r.id },
+                  { "name": "cloud.account.uid", "type_id": 35, "value": $r.accountId },
+                  (if $remote.ipAddressV4 then { "name": "device.ip", "type_id": 2, "value": $remote.ipAddressV4 } else empty end)
+                ]
+              ),
+              "resources": [
+                {
+                  "type": ($res.resourceType),
+                  "uid": (($res.instanceDetails // {}).instanceId),
+                  "cloud_partition": $r.partition,
+                  "region": $r.region
+                }
+              ],
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "actionType": ($act.actionType),
+                "connectionDirection": (($act.networkConnectionAction // {}).connectionDirection),
+                "protocol": (($act.networkConnectionAction // {}).protocol),
+                "blocked": (($act.networkConnectionAction // {}).blocked),
+                "remoteIp": ($remote.ipAddressV4),
+                "remoteCountry": (($remote.country // {}).countryName),
+                "remoteCity": (($remote.city // {}).cityName),
+                "remoteAsnOrg": (($remote.organization // {}).asnOrg),
+                "localPort": ((($act.networkConnectionAction // {}).localPortDetails // {}).port),
+                "remotePort": ((($act.networkConnectionAction // {}).remotePortDetails // {}).port),
+                "privateIp": ($nic.privateIpAddress),
+                "publicIp": ($nic.publicIp),
+                "vpcId": ($nic.vpcId),
+                "subnetId": ($nic.subnetId),
+                "instanceType": (($res.instanceDetails // {}).instanceType),
+                "detectorId": ($svc.detectorId),
+                "resourceRole": ($svc.resourceRole)
+              },
+
+              # --- Original record for audit / debugging ---
+              "raw_data": (. | tostring)
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)
