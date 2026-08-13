@@ -1,0 +1,54 @@
+name: "Cisco Meraki Configuration Changes to CEF"
+description: "Maps Cisco Meraki Dashboard configuration change (audit) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cisco-meraki-config-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "cisco-meraki"
+  - "config-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cisco Meraki Dashboard configurationChanges -> CEF intermediate (T1).
+          # No escaping here (the shared serializer owns it). Times epoch-ms;
+          # custom cs*/cn* slots always paired with their *Label. One jq pass;
+          # shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | { _cef: {
+              vendor: "Cisco",
+              product: "Meraki Dashboard",
+              version: "",
+              signature_id: "configuration_change",
+              name: ($r.label // $r.page // "Configuration change"),
+              severity: 2,
+              extension: ( {
+                rt:      to_epoch_ms($r.ts),
+                suser:   $r.adminName,
+                suid:    $r.adminId,
+                act:     $r.page,
+                outcome: "SUCCESS",
+                deviceExternalId: $r.networkId,
+                cs1Label: "label",       cs1: $r.label,
+                cs2Label: "oldValue",    cs2: $r.oldValue,
+                cs3Label: "newValue",    cs3: $r.newValue,
+                cs4Label: "networkName", cs4: $r.networkName,
+                cs5Label: "ssidName",    cs5: $r.ssidName,
+                cs6Label: "adminEmail",  cs6: $r.adminEmail,
+                cn1Label: "ssidNumber",  cn1: $r.ssidNumber
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

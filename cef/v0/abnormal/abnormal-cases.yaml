@@ -1,0 +1,60 @@
+name: "Abnormal Security Cases to CEF"
+description: "Maps Abnormal Security case records (account-takeover / email-security cases from the /v1/cases API) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-cases"
+tags:
+  - "v0"
+  - "cef"
+  - "abnormal"
+  - "cases"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Abnormal Security case -> CEF intermediate (T1). No escaping here;
+          # the shared CEF Serializer (T2) owns all escaping. Emit final-form
+          # values: severity int 0-10, times epoch-MILLISECONDS, custom slots
+          # paired with *Label. One jq pass; shallow null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ((($r.severity // "") | ascii_downcase)) as $sev
+          # Source severity text -> CEF severity bucket (0-10).
+          | (if   ($sev | test("takeover|compromis|exfiltrat")) then 8
+             elif  ($sev | test("phish|fraud|impersonat"))      then 6
+             elif  ($sev == "")                                 then 0
+             else                                                    5
+             end) as $severity
+
+          | { _cef: {
+                vendor:  "Abnormal Security",
+                product: "Abnormal Behavior Platform",
+                version: "",
+                signature_id: ($r.severity // "Abnormal Case"),   # case classification
+                name: ("Abnormal case: " + ($r.severity // "Case")
+                        + (if $r.affectedEmployee != null then " for " + $r.affectedEmployee else "" end)),
+                severity: $severity,
+                extension: ( {
+                    rt:     to_epoch_ms($r.firstObserved),
+                    suser:  $r.affectedEmployee,
+                    cat:    $r.analysis,
+                    reason: $r.description,
+                    msg:    ($r.genai_summary // $r.description),
+                    cs1Label: "abnormalCaseId",     cs1: ($r.caseId | tostring),
+                    cs2Label: "caseStatus",         cs2: $r.case_status,
+                    cs3Label: "remediationStatus",  cs3: $r.remediation_status,
+                    cs4Label: "abnormalSeverity",   cs4: $r.severity,
+                    cs5Label: "threatIds",          cs5: (($r.threatIds // []) | join(","))
+                  } | with_entries(select(.value != null and .value != "")) )
+            } }

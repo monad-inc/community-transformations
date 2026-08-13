@@ -1,0 +1,57 @@
+name: "CaptivateIQ Audit Logs to CEF"
+description: "Maps CaptivateIQ Audit Logs records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "captivate-iq-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "captivateiq"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CaptivateIQ audit_log -> CEF intermediate (T1). No escaping here;
+          # the shared serializer (T2) owns escaping/header assembly. Emit
+          # final-form values: severity int 0-10, times epoch-ms, every cs*
+          # slot paired with its label. One jq pass; shallow null-drop only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.event_type // "" | ascii_downcase) as $et
+          | ( { "create": 4, "update": 4, "delete": 6 }[$et] // 3 ) as $sev
+          | { _cef: {
+              vendor: "CaptivateIQ",
+              product: "CaptivateIQ Audit Log",
+              version: (if $r.version != null then ($r.version | tostring) else "" end),
+              signature_id: ($r.event_type // "event"),
+              name: ( ($r.event_type // "event") + " " + ($r.object_type // "object")
+                      + ( if $r.object_name != null then ": " + $r.object_name else "" end ) ),
+              severity: $sev,
+              extension: ( {
+                rt:          to_epoch_ms($r.created_at),
+                suser:       ($r.user_email // $r.user_name),
+                suid:        $r.user_id,
+                src:         $r.ip_address,
+                act:         $r.event_type,
+                outcome:     "SUCCESS",
+                externalId:  $r.id,
+                cs1Label: "objectType",           cs1: $r.object_type,
+                cs2Label: "objectName",           cs2: $r.object_name,
+                cs3Label: "objectId",             cs3: $r.object_id,
+                cs4Label: "organizationName",     cs4: $r.organization_name,
+                cs5Label: "loggedInUserEmail",    cs5: ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id) then $r.logged_in_user_email else null end ),
+                cs6Label: "organizationId",       cs6: $r.organization_id
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

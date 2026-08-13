@@ -1,0 +1,58 @@
+name: "Coda Audit Events to CEF"
+description: "Maps Coda Admin Audit API events into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "coda-audit-events"
+tags:
+  - "v0"
+  - "cef"
+  - "coda"
+  - "audit-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Coda Admin Audit API event -> CEF intermediate (T1).
+          # No escaping here (T2 serializer owns it). Final-form values:
+          #   severity integer 0-10; times epoch-MILLISECONDS;
+          #   custom cs* slots always paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+          . as $r
+          | ($r.action // "") as $action
+          | ($r.result // "") as $result
+          # denied/blocked -> higher severity; login/logout are informational
+          | (if   ($result | ascii_downcase) != "allowed" and $result != "" then 6
+             elif $action == "LogInUser" or $action == "LogOutUser" then 2
+             else 3 end) as $severity
+          | { _cef: {
+              vendor: "Coda",
+              product: "Coda Admin Audit",
+              version: "",
+              signature_id: $action,
+              name: ($action + " (" + $result + ")"),
+              severity: $severity,
+              extension: ( {
+                rt:      to_epoch_ms($r.timestamp),
+                suser:   $r.user.email,
+                suid:    (if $r.user.id != null then ($r.user.id | tostring) else null end),
+                src:     $r.userContext.ipAddress,
+                act:     $action,
+                outcome: $result,
+                requestClientApplication: $r.userContext.browser.ua,
+                cs1Label: "sessionId",      cs1: $r.userContext.sessionId,
+                cs2Label: "clientSource",   cs2: $r.userContext.source,
+                cs3Label: "organizationId", cs3: $r.organizationId,
+                cs4Label: "providerName",   cs4: $r.eventDetails.providerName,
+                cs5Label: "entityType",     cs5: $r.entity.type
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

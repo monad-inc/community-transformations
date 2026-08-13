@@ -1,0 +1,71 @@
+name: "AWS Config Resource Inventory to CEF"
+description: "Maps AWS Config configuration item records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-config-inventory"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "config"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Config configuration item -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Values are FINAL FORM: severity integer 0-10, times epoch-ms,
+          # every cs*/cn* slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object.
+          #
+          #   signature_id = .resourceType  (stable, low cardinality)
+          #   name         = human sentence about the inventoried resource
+          #   severity     = 2 (informational inventory) / 5 when not recorded
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.configuration // {} ) as $cfg
+          | ( $r.configurationItemStatus // "" ) as $ci_status
+          | ( if ($ci_status | test("NotRecorded|Deleted")) then 5 else 2 end ) as $sev
+          | ( if ($ci_status | test("NotRecorded|DeletedNotRecorded"))
+              then "FAILURE" else "SUCCESS" end ) as $outcome
+          | ( ($cfg.publicIpAddress // $cfg.privateIpAddress) ) as $ip
+          | ( if ($r.tags | type) == "object"
+              then ( $r.tags | to_entries | map(.key + "=" + (.value | tostring)) | join(",") )
+              else null end ) as $tags_str
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "AWS Config",
+              version: ($r.version // ""),
+              signature_id: ($r.resourceType // "AWS::Resource"),
+              name: ( "AWS Config inventory: " + ($r.resourceType // "resource")
+                      + " " + ($r.resourceId // "") ),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.configurationItemCaptureTime),
+                deviceExternalId: $r.resourceId,
+                dvchost: $r.resourceName,
+                src:     $ip,
+                act:     "inventory",
+                outcome: $outcome,
+                externalId: $r.configurationStateId,
+                cs1Label: "resourceType",  cs1: $r.resourceType,
+                cs2Label: "resourceArn",   cs2: $r.arn,
+                cs3Label: "awsRegion",     cs3: $r.awsRegion,
+                cs4Label: "accountId",     cs4: $r.accountId,
+                cs5Label: "itemStatus",    cs5: ($ci_status | select(. != "")),
+                cs6Label: "tags",          cs6: $tags_str
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

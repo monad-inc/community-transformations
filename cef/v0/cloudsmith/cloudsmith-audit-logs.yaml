@@ -1,0 +1,62 @@
+name: "Cloudsmith Audit Logs to CEF"
+description: "Maps Cloudsmith Audit Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudsmith-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudsmith"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudsmith Audit Logs -> CEF intermediate (T1). No escaping here;
+          # the shared CEF Serializer (T2) owns all escaping/header assembly.
+          # severity: integer 0-10 bucketed from the verb; rt in epoch-ms;
+          # custom cs* slots always paired with their *Label. One jq pass.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.event // "") as $ev
+          | (
+              if ($ev|contains(".delete")) or ($ev|contains(".revoked")) or ($ev|contains(".removed")) then 6
+              elif ($ev|contains(".update")) or ($ev|contains(".changed")) or ($ev|contains(".refreshed")) or ($ev|contains(".rotated")) then 4
+              elif ($ev|endswith(".created")) or ($ev|contains(".create")) then 3
+              else 2 end
+            ) as $sev
+          | { _cef: {
+              vendor: "Cloudsmith",
+              product: "Cloudsmith Audit Logs",
+              version: "",
+              signature_id: $ev,
+              name: ([$r.actor, $ev, "on", $r.object] | map(select(. != null)) | join(" ")),
+              severity: $sev,
+              extension: ( {
+                rt:         to_epoch_ms($r.event_at),
+                suser:      $r.actor,
+                suid:       $r.actor_slug_perm,
+                src:        $r.actor_ip_address,
+                act:        $ev,
+                outcome:    "SUCCESS",
+                externalId: $r.uuid,
+                sourceServiceName: $r.context,
+                cs1Label: "object",       cs1: $r.object,
+                cs2Label: "objectKind",   cs2: $r.object_kind,
+                cs3Label: "target",       cs3: $r.target,
+                cs4Label: "targetKind",   cs4: $r.target_kind,
+                cs5Label: "actorKind",    cs5: $r.actor_kind,
+                cs6Label: "sourceCountry", cs6: ($r.actor_location.country_code // $r.actor_location.country)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

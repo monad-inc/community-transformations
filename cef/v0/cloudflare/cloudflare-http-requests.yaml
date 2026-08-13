@@ -1,0 +1,93 @@
+name: "Cloudflare HTTP Requests to CEF"
+description: "Maps Cloudflare HTTP Requests (Logpush http_requests) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-http-requests"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "http-requests"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare HTTP Requests -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity int 0-10; rt epoch-MILLISECONDS;
+          # every cs*/cn* slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then ($ts/1e6 | floor) else ($ts * 1000 | floor) end)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( ($r.EdgeResponseStatus // 0) | if type == "string" then tonumber else . end ) as $status
+          | ( ($r.SecurityAction // "") | ascii_downcase ) as $sec_action
+          | ( ($sec_action | test("block|challenge|drop|jschallenge|managed_challenge")) ) as $is_security
+          | {
+              _cef: {
+                vendor: "Cloudflare",
+                product: "Cloudflare HTTP Requests",
+                version: "",
+                # Low-cardinality event type: the security action when one fired,
+                # otherwise a generic request signature.
+                signature_id: ( if $sec_action != "" then $sec_action else "http.request" end ),
+                name: ( $r.SecurityRuleDescription
+                        // ( [ ($r.ClientRequestMethod // "GET"),
+                               ($r.ClientRequestHost // ""),
+                               ("(" + ($status | tostring) + ")") ] | join(" ") ) ),
+                severity: ( if ($sec_action | test("block|drop")) then 8
+                            elif ($sec_action | test("challenge")) then 6
+                            elif $status >= 500 then 6
+                            elif $status >= 400 then 4
+                            else 2 end ),
+                extension: ( {
+                  rt:      to_epoch_ms($r.EdgeStartTimestamp),
+                  end:     to_epoch_ms($r.EdgeEndTimestamp),
+                  src:     $r.ClientIP,
+                  spt:     $r.ClientSrcPort,
+                  dst:     $r.OriginIP,
+                  dhost:   $r.ClientRequestHost,
+                  app:     $r.ClientRequestScheme,
+                  requestMethod: $r.ClientRequestMethod,
+                  request: ( if $r.ClientRequestScheme != null and $r.ClientRequestHost != null and $r.ClientRequestURI != null
+                             then ($r.ClientRequestScheme + "://" + $r.ClientRequestHost + $r.ClientRequestURI)
+                             else $r.ClientRequestURI end ),
+                  requestClientApplication: $r.ClientRequestUserAgent,
+                  "in":    $r.ClientRequestBytes,
+                  "out":   $r.EdgeResponseBytes,
+                  act:     $r.SecurityAction,
+                  outcome: ( if $is_security or $status >= 400 then "FAILURE"
+                             elif $status > 0 then "SUCCESS" else null end ),
+                  # Custom slots — each *Label is gated on its value so a
+                  # missing value never leaves an orphan label behind.
+                  cn1: ( if $status > 0 then $status else null end ),
+                  cn1Label: ( if $status > 0 then "httpResponseStatus" else null end ),
+                  cn2: $r.WAFAttackScore,
+                  cn2Label: ( if $r.WAFAttackScore != null then "wafAttackScore" else null end ),
+                  cn3: $r.BotScore,
+                  cn3Label: ( if $r.BotScore != null then "botScore" else null end ),
+                  cs1: $r.RayID,
+                  cs1Label: ( if $r.RayID != null then "rayId" else null end ),
+                  cs2: ( $r.ClientCountry | if . == null then null else ascii_upcase end ),
+                  cs2Label: ( if $r.ClientCountry != null then "clientCountry" else null end ),
+                  cs3: $r.SecurityRuleID,
+                  cs3Label: ( if $r.SecurityRuleID != null then "securityRuleId" else null end ),
+                  cs4: $r.JA3Hash,
+                  cs4Label: ( if $r.JA3Hash != null then "ja3Hash" else null end ),
+                  cs5: $r.EdgeColoCode,
+                  cs5Label: ( if $r.EdgeColoCode != null then "edgeColo" else null end ),
+                  cs6: $r.CacheCacheStatus,
+                  cs6Label: ( if $r.CacheCacheStatus != null then "cacheStatus" else null end )
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

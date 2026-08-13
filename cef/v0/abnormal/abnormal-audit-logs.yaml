@@ -1,0 +1,61 @@
+name: "Abnormal Security Audit Logs to CEF"
+description: "Maps Abnormal Security portal/API audit-log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "abnormal"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Abnormal Security Audit Logs -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns that.
+          # Emit FINAL-FORM values: severity int 0-10, times epoch-MS,
+          # custom slots paired with *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.abx_metadata // {}) as $m
+          | ($r.abx_body // {}) as $b
+          | ($b.action_details // {}) as $ad
+          | ($b.user // {}) as $u
+          | (($b.status // "") | ascii_upcase) as $status
+          | {
+              _cef: {
+                vendor:  "Abnormal Security",
+                product: "Abnormal Audit Logs",
+                version: "",
+                signature_id: ($b.action // $b.category // "audit_log"),
+                name: (($b.action // $b.category // "audit log event")
+                       + (if $status != "" then " (" + $status + ")" else "" end)),
+                # SUCCESS = low/informational (3); FAILURE = elevated (6).
+                severity: (if $status == "FAILURE" then 6 else 3 end),
+                extension: ( {
+                  rt:       to_epoch_ms($b.timestamp // $m.timestamp),
+                  suser:    $u.email,
+                  src:      $b.source_ip,
+                  act:      $b.action,
+                  outcome:  $status,
+                  request:  $ad.request_url,
+                  reason:   $ad.provided_reason,
+                  cs1Label: "tenantName",   cs1: $b.tenant_name,
+                  cs2Label: "category",     cs2: $b.category,
+                  cs3Label: "traceId",      cs3: $m.trace_id,
+                  cs4Label: "messageId",    cs4: $ad.message_id
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

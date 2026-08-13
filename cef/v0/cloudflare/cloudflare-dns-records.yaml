@@ -1,0 +1,66 @@
+name: "Cloudflare DNS Records to CEF"
+description: "Maps Cloudflare DNS Records inventory into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-dns-records"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "dns-records"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare DNS Records -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity 0-10, times epoch-MILLISECONDS,
+          # cs*/cn* slots always paired with their *Label. One jq pass;
+          # shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) or ($s | test(":")));
+
+          . as $r
+          | ($r.content // null) as $content
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare DNS",
+              version: "",
+              signature_id: ("dns.record." + ($r.type // "UNKNOWN")),
+              name: ("Cloudflare DNS " + ($r.type // "") + " record: " + ($r.name // "")),
+              severity: 2,
+              extension: ( {
+                rt:    to_epoch_ms($r.modified_on),
+                start: to_epoch_ms($r.created_on),
+                dhost: $r.name,
+                dst:   (if is_ip($content) then $content else null end),
+                externalId: $r.id,
+                outcome: "SUCCESS",
+                cn1: $r.ttl,
+                cn1Label: (if $r.ttl != null then "ttl" else null end),
+                cs1: $r.type,
+                cs1Label: (if $r.type != null then "recordType" else null end),
+                cs2: $r.zone_name,
+                cs2Label: (if $r.zone_name != null then "zoneName" else null end),
+                cs3: $content,
+                cs3Label: (if $content != null then "content" else null end),
+                cs4: (if $r.proxied != null then ($r.proxied | tostring) else null end),
+                cs4Label: (if $r.proxied != null then "proxied" else null end),
+                cs5: $r.zone_id,
+                cs5Label: (if $r.zone_id != null then "zoneId" else null end),
+                cs6: (if ($r.tags // []) | length > 0 then ($r.tags | join(",")) else null end),
+                cs6Label: (if ($r.tags // []) | length > 0 then "tags" else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,56 @@
+name: "Cloudflare Access Login Events to CEF"
+description: "Maps Cloudflare Access authentication (login) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-access-login-events"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "access-login-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Access authentication log -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # severity: integer 0-10; rt: epoch-ms; custom slots paired w/ label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          . as $r
+          | (truthy($r.allowed)) as $ok
+          | ($r.action // "access") as $act
+          | ($r.app_domain // "" | split("/")[0]) as $app_host
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Access",
+              version: "",
+              signature_id: $act,
+              name: ("Access " + $act + (if $ok then " allowed" else " denied" end)),
+              severity: (if $ok then 2 else 7 end),
+              extension: ( {
+                rt:         to_epoch_ms($r.created_at),
+                suser:      $r.user_email,
+                src:        $r.ip_address,
+                act:        $r.action,
+                outcome:    (if $ok then "SUCCESS" else "FAILURE" end),
+                dhost:      (if $app_host == "" then null else $app_host end),
+                request:    (if ($r.app_domain // "") == "" then null else ("https://" + $r.app_domain) end),
+                externalId: $r.ray_id,
+                cs1Label: (if ($r.connection // "") == "" then null else "idpConnection" end), cs1: $r.connection,
+                cs2Label: (if ($r.app_uid // "") == "" then null else "appUid" end),        cs2: $r.app_uid,
+                cs3Label: (if ($r.country // "") == "" then null else "srcCountry" end),    cs3: $r.country
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,64 @@
+name: "BugSnag Org Events to CEF"
+description: "Maps BugSnag organization error/crash events into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bugsnag-org-events"
+tags:
+  - "v0"
+  - "cef"
+  - "bugsnag"
+  - "org-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # BugSnag org error event -> CEF intermediate (T1). No escaping.
+          # severity: integer 0-10; times epoch-ms; cs*/cn* paired with labels.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.exceptions[0] // {}) as $ex
+          | ($r.app // {}) as $app
+          | ($r.device // {}) as $dev
+          | ($r.user // {}) as $usr
+          | ($r.request // {}) as $req
+
+          | def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+
+          { _cef: {
+              vendor: "BugSnag",
+              product: "BugSnag",
+              version: ($app.version // ""),
+              signature_id: ($ex.error_class // "UnknownError"),
+              name: ($ex.message // $r.context // "Application error"),
+              severity: ( { "error": 8, "warning": 5, "info": 3 }[$r.severity] // 0 ),
+              extension: ( {
+                rt:            to_epoch_ms($r.received_at),
+                msg:           ($ex.message // $r.context),
+                outcome:       "FAILURE",
+                suid:          $usr.id,
+                suser:         ($usr.email // $usr.name),
+                src:           $req.client_ip,
+                request:       $req.url,
+                requestMethod: $req.http_method,
+                dhost:         $dev.hostname,
+                deviceExternalId: $dev.id,
+                app:           $app.id,
+                # Custom slots (each paired with its *Label).
+                cs1Label: "errorClass",   cs1: $ex.error_class,
+                cs2Label: "releaseStage",  cs2: $app.release_stage,
+                cs3Label: "context",       cs3: $r.context,
+                cs4Label: "os",            cs4: (if $dev.os_name != null then ($dev.os_name + " " + ($dev.os_version // "")) else null end),
+                cs5Label: "unhandled",     cs5: (if $r.unhandled == null then null else ($r.unhandled | tostring) end),
+                cs6Label: "errorId",       cs6: $r.error_id,
+                cn1Label: "durationMs",    cn1: $app.duration
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,65 @@
+name: "Anthropic Claude.ai Chat Messages to CEF"
+description: "Maps Anthropic Compliance API chat message records (anthropic-chat-messages) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-chat-messages"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "chat-messages"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Compliance API chat message -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity int 0-10, times as
+          # epoch-MILLISECONDS, every cs*/cn* slot paired with its *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.chat_user // {}) as $cu
+          | ($r.role // "unknown") as $role
+          | ([ ($r.content // [])[]? | .type ] | map(select(. != null)) | unique) as $ctypes
+          | ([ ($r.content // [])[]? | select(.type == "text") | .text ]
+             | map(select(. != null)) | join(" ")) as $text
+          | (if ($text | length) > 512 then ($text[0:512]) else $text end) as $preview
+
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Claude.ai",
+              version: "",
+              signature_id: ("chat.message." + $role),
+              name: ("Claude.ai " + $role + " chat message"),
+              severity: 2,
+              extension: ( {
+                rt:      to_epoch_ms($r.created_at),
+                suser:   $cu.email_address,
+                suid:    $cu.id,
+                act:     $role,
+                outcome: "SUCCESS",
+                cat:     "chat-message",
+                externalId: $r.id,
+                msg:     (if $preview == "" then null else $preview end),
+                cs1Label: "chatId",            cs1: $r.chat_id,
+                cs2Label: "chatName",          cs2: $r.chat_name,
+                cs3Label: "projectId",         cs3: $r.project_id,
+                cs4Label: "contentTypes",      cs4: ($ctypes | join(",")),
+                cs5Label: "organizationUuid",  cs5: $r.organization_uuid,
+                cs6Label: "organizationId",    cs6: $r.organization_id,
+                cn1Label: "contentChars",      cn1: (if ($text | length) > 0 then ($text | length) else null end),
+                cn2Label: "fileCount",         cn2: (($r.files // []) | length),
+                cn3Label: "artifactCount",     cn3: (($r.artifacts // []) | length)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

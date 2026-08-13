@@ -1,0 +1,54 @@
+name: "Anthropic Organization Roles to CEF"
+description: "Maps Anthropic Admin API organization user/role records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-roles"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "roles"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Admin API organization user/role -> CEF intermediate (T1).
+          # Input: one org user record (GET /v1/organizations/users):
+          #   { id, added_at, email, name, role, type }
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Severity buckets by org role privilege; rt is epoch-MILLISECONDS.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | ($r.role // "user") as $role
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Anthropic Admin API",
+              version: "",
+              signature_id: "organization.user.role",
+              name: ("Organization member role: " + $role),
+              # Privileged org roles rank higher on the 0-10 CEF scale.
+              severity: ( { "primary_owner": 8, "owner": 8, "admin": 7,
+                            "membership_admin": 7, "billing": 5, "developer": 4,
+                            "claude_code_user": 3, "managed": 3, "user": 3 }[$role] // 3 ),
+              extension: ( {
+                rt:      to_epoch_ms($r.added_at),
+                suser:   $r.email,
+                suid:    $r.id,
+                outcome: "SUCCESS",
+                msg:     (($r.name // $r.email // "user") + " has organization role " + $role),
+                cs1Label: "role",     cs1: $role,
+                cs2Label: "userType", cs2: ($r.type // null),
+                cs3Label: "fullName", cs3: ($r.name // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

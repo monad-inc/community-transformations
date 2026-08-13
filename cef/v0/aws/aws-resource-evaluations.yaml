@@ -1,0 +1,67 @@
+name: "AWS Config Resource Evaluations to CEF"
+description: "Maps AWS Config resource compliance evaluation results (EvaluationResult) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-resource-evaluations"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "config"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Config resource evaluations -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Emit FINAL-FORM values: severity int 0-10, times epoch-MS,
+          # custom cs*/flexString* slots each paired with a *Label.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.EvaluationResultIdentifier // {} ) as $id
+          | ( $id.EvaluationResultQualifier // {} ) as $q
+          | ( $r.ComplianceType // "" ) as $ct
+
+          # Source compliance -> CEF severity bucket (0-10):
+          #   NON_COMPLIANT is a High-severity finding; a passing / N/A
+          #   result is low; missing data is medium-low.
+          | ( { "NON_COMPLIANT": 7, "COMPLIANT": 2,
+                "NOT_APPLICABLE": 2, "INSUFFICIENT_DATA": 3 }[$ct] // 0 ) as $sev
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "AWS Config",
+              version: "",
+              signature_id: ($q.ConfigRuleName // "aws-config-rule"),
+              name: ( ($q.ConfigRuleName // "AWS Config rule")
+                      + ": " + (if $ct != "" then $ct else "UNKNOWN" end) ),
+              severity: $sev,
+              extension: ( {
+                rt:       to_epoch_ms($r.ResultRecordedTime // $id.OrderingTimestamp),
+                act:      "resource-evaluation",
+                outcome:  (if $ct != "" then $ct else null end),
+                msg:      $r.Annotation,
+                externalId: $id.ResourceEvaluationId,
+                deviceCustomDate1Label: "ConfigRuleInvokedTime",
+                deviceCustomDate1: to_epoch_ms($r.ConfigRuleInvokedTime),
+                cs1Label: "ConfigRuleName", cs1: $q.ConfigRuleName,
+                cs2Label: "ResourceType",   cs2: $q.ResourceType,
+                cs3Label: "ResourceId",     cs3: $q.ResourceId,
+                cs4Label: "ComplianceType", cs4: (if $ct != "" then $ct else null end),
+                cs5Label: "EvaluationMode", cs5: $q.EvaluationMode,
+                cs6Label: "AwsRegion",      cs6: $r.AwsRegion,
+                flexString1Label: "AwsAccountId", flexString1: $r.AwsAccountId
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,65 @@
+name: "Cloudflare Zones to CEF"
+description: "Maps Cloudflare Zones inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zones"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "zones"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Zone (GET /zones) -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity int 0-10; times epoch-MS; custom
+          # slots paired with *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.account // {}) as $acct
+          | ($r.plan // {}) as $plan
+          | ($r.meta // {}) as $meta
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Zones",
+              version: "",
+              signature_id: "zone.inventory",
+              name: ("Cloudflare zone inventory: " + ($r.name // "unknown")),
+              # Not an alert stream — informational, escalated on risk signals.
+              severity: ( if ($meta.phishing_detected == true) then 8
+                          elif ($r.paused == true) then 4
+                          elif ($r.status != null and $r.status != "active") then 4
+                          else 2 end ),
+              # Each custom slot label+value is emitted as a unit so a label is
+              # never orphaned when its value is absent.
+              extension: ( (
+                { rt:      to_epoch_ms($r.modified_on // $r.created_on),
+                  start:   to_epoch_ms($r.created_on),
+                  end:     to_epoch_ms($r.activated_on),
+                  dhost:   $r.name,
+                  externalId: $r.id,
+                  act:     "zone-inventory",
+                  outcome: (if $r.status == "active" then "SUCCESS" else ($r.status // null) end) }
+                + (if $r.status then { cs1Label: "zoneStatus", cs1: $r.status } else {} end)
+                + (if $plan.name then { cs2Label: "zonePlan", cs2: $plan.name } else {} end)
+                + (if $r.type then { cs3Label: "zoneType", cs3: $r.type } else {} end)
+                + (if $acct.name then { cs4Label: "accountName", cs4: $acct.name } else {} end)
+                + ((($r.name_servers // []) | join(",")) as $ns | if $ns != "" then { cs5Label: "nameServers", cs5: $ns } else {} end)
+                + (if $r.original_registrar then { cs6Label: "originalRegistrar", cs6: $r.original_registrar } else {} end)
+                + (if $r.development_mode != null then { cn1Label: "developmentMode", cn1: $r.development_mode } else {} end)
+                + (if $meta.phishing_detected == true then { cfp1Label: "phishingDetected", cfp1: 1 } else {} end)
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

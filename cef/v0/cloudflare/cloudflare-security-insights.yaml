@@ -1,0 +1,59 @@
+name: "Cloudflare Security Insights to CEF"
+description: "Maps Cloudflare Security Center Insights (security posture / misconfiguration findings) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-security-insights"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "security_insights"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Security Center Insights -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (Low=3, Moderate=5, Critical=9)
+          #   - time fields (rt/start): epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass; drop nulls with a shallow with_entries on the
+          # extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.payload ) as $p
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Security Center",
+              version: "",
+              signature_id: ($r.issue_type // "security_insight"),
+              name: ($r.resolve_text // $r.issue_type // "Cloudflare Security Insight"),
+              severity: ( { "Low": 3, "Moderate": 5, "Critical": 9 }[$r.severity] // 0 ),
+              extension: ( {
+                rt:      to_epoch_ms($r.timestamp),
+                start:   to_epoch_ms($r.since),
+                dhost:   $r.subject,
+                act:     $r.issue_type,
+                outcome: $r.status,
+                msg:     $r.resolve_text,
+                cs1Label: "issueClass",          cs1: $r.issue_class,
+                cs2Label: "zoneTag",             cs2: ( if ($p | type) == "object" then $p.zone_tag else null end ),
+                cs3Label: "detectionMethod",     cs3: ( if ($p | type) == "object" then $p.detection_method else null end ),
+                cs4Label: "userClassification",  cs4: $r.user_classification,
+                cs5Label: "insightId",           cs5: $r.id,
+                cs6Label: "resolveLink",         cs6: $r.resolve_link,
+                cn1Label: "dismissed",           cn1: ( if $r.dismissed == true then 1 elif $r.dismissed == false then 0 else null end )
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

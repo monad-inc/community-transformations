@@ -1,0 +1,71 @@
+name: "Cloudflare Firewall Events to CEF"
+description: "Maps Cloudflare firewall_events (WAF / firewall rule matches) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-firewall-events"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "firewall-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare firewall_events -> CEF intermediate (T1). NO escaping.
+          # Final-form values: severity int 0-10; times epoch-MS; cs*/cn*
+          # slots paired with their *Label. One pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then $ts elif $ts > 1e10 then ($ts*1000) else ($ts*1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | ($r.Action // "" | ascii_downcase) as $action
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare WAF",
+              version: "",
+              signature_id: (($r.RuleID // "") | if . == "" then ($r.Source // "firewall") else . end),
+              name: (($r.Description // "") | if . == "" then ("Cloudflare firewall " + ($r.Action // "event")) else . end),
+              severity: ( { "block":8, "drop":8, "connectionclose":8,
+                            "challenge":5, "managedchallenge":5, "jschallenge":5,
+                            "log":3, "allow":2, "bypass":2, "skip":2 }[$action] // 5 ),
+              extension: ( {
+                rt:      to_epoch_ms($r.Datetime),
+                src:     $r.ClientIP,
+                dhost:   $r.ClientRequestHost,
+                request: (if ($r.ClientRequestHost // "") != ""
+                          then (($r.ClientRequestScheme // "https") + "://" + $r.ClientRequestHost + ($r.ClientRequestPath // "") + ($r.ClientRequestQuery // "")) else null end),
+                requestMethod: $r.ClientRequestMethod,
+                requestClientApplication: $r.ClientRequestUserAgent,
+                app:     $r.ClientRequestScheme,
+                act:     $r.Action,
+                outcome: ($r.Action // null | if . == null then null else ascii_upcase end),
+                deviceExternalId: $r.RayID,
+                # custom slots (always paired with a *Label)
+                cs1Label: "SecuritySource",           cs1: $r.Source,
+                cs2Label: "RayID",                     cs2: $r.RayID,
+                cs3Label: "ClientCountry",             cs3: $r.ClientCountry,
+                cs4Label: "RulesetID",                 cs4: ($r.Metadata.ruleset_id // null),
+                cs5Label: "EdgeColoCode",              cs5: $r.EdgeColoCode,
+                cs6Label: "ClientIPClass",             cs6: $r.ClientIPClass,
+                cn1Label: "ClientASN",                 cn1: $r.ClientASN,
+                cn2Label: "EdgeResponseStatus",        cn2: (if ($r.EdgeResponseStatus // 0) > 0 then $r.EdgeResponseStatus else null end),
+                cn3Label: "OriginResponseStatus",      cn3: (if ($r.OriginResponseStatus // 0) > 0 then $r.OriginResponseStatus else null end)
+              }
+              | with_entries(select(.value != null and .value != ""))
+              # Drop any orphaned *Label whose paired value slot got pruned,
+              # so every custom slot stays label+value paired.
+              | ( . as $e
+                  | with_entries(select(
+                      (.key | endswith("Label") | not)
+                      or ($e[(.key | rtrimstr("Label"))] != null) )) ) )
+          } }

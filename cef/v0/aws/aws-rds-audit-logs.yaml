@@ -1,0 +1,72 @@
+name: "AWS RDS Audit Logs to CEF"
+description: "Maps AWS RDS (MySQL / MariaDB) audit log records — the MariaDB Audit Plugin CSV line in the connector's message field — into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-rds-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "rds"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS RDS Audit Logs -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Emit final-form
+          # values: severity int 0-10, rt in epoch-MILLISECONDS, every cs*/cn*
+          # slot paired with its *Label.
+          #
+          # The connector envelope carries the raw MariaDB Audit Plugin CSV
+          # line in `message`:
+          #   ts,serverhost,username,host,connectionid,queryid,
+          #     operation,database,object,retcode
+          # `object` may contain commas and is single-quoted, so it is grabbed
+          # greedily up to the final comma (retcode is always last).
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ( $r.message
+              | capture("^(?<ts>[^,]*),(?<serverhost>[^,]*),(?<username>[^,]*),(?<host>[^,]*),(?<connectionid>[^,]*),(?<queryid>[^,]*),(?<operation>[^,]*),(?<database>[^,]*),(?<object>.*),(?<retcode>[^,]*)$")
+            ) as $m
+          | ( ($m.object // "") | sub("^'"; "") | sub("'$"; "") | gsub("''"; "'") ) as $obj
+          | ( ($m.operation // "") | ascii_upcase ) as $op
+          | ( $m.retcode // "" ) as $ret
+          | ( try ($m.ts | strptime("%Y%m%d %H:%M:%S") | mktime * 1000) catch null ) as $rt
+          | ( if $ret == "0" or $ret == "" then "SUCCESS" else "FAILURE" end ) as $outcome
+          | ( if $ret != "0" and $ret != "" then 6
+              else ( { "DROP":7, "WRITE":5, "CREATE":5, "ALTER":5, "RENAME":5,
+                       "QUERY":3, "READ":3, "CONNECT":2, "DISCONNECT":2 }[$op] // 3 ) end ) as $severity
+
+          | { _cef: {
+              vendor: "Amazon",
+              product: "Amazon RDS",
+              version: "",
+              signature_id: $op,
+              name: ("RDS " + ($r.engine // "database") + " audit: " + $op),
+              severity: $severity,
+              extension: ( {
+                rt:      $rt,
+                suser:   $m.username,
+                src:     ( if ($m.host | test("^(\\d{1,3}\\.){3}\\d{1,3}$")) then $m.host else null end ),
+                shost:   $m.host,
+                dvchost: $m.serverhost,
+                act:     $op,
+                outcome: $outcome,
+                fname:   $r.log_file_name,
+                deviceExternalId: $r.instance_id,
+                cs1Label: "database",   cs1: (if ($m.database // "") == "" then null else $m.database end),
+                cs2Label: "query",      cs2: (if $obj == "" then null else $obj end),
+                cs3Label: "engine",     cs3: $r.engine,
+                cs4Label: "awsRegion",  cs4: $r.region,
+                cn1Label: "connectionId", cn1: (if ($m.connectionid | test("^-?[0-9]+$")) then ($m.connectionid | tonumber) else null end),
+                cn2Label: "queryId",      cn2: (if ($m.queryid | test("^-?[0-9]+$")) then ($m.queryid | tonumber) else null end),
+                cn3Label: "returnCode",   cn3: (if ($ret | test("^-?[0-9]+$")) then ($ret | tonumber) else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

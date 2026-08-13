@@ -1,0 +1,58 @@
+name: "Clumio Individual Alerts to CEF"
+description: "Maps Clumio Individual Alert records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-individual-alerts"
+tags:
+  - "v0"
+  - "cef"
+  - "clumio"
+  - "individual-alerts"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Clumio Individual Alert -> CEF intermediate (T1). No escaping here;
+          # the shared CEF Serializer (T2) owns all escaping. Final-form values:
+          #   severity int 0-10; time fields epoch-MILLISECONDS; cs*/cn* + labels.
+          # One jq pass, shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.primary_entity // {}) as $pe
+          | ($r.details // {}) as $d
+          | { _cef: {
+              vendor: "Clumio",
+              product: "Clumio",
+              version: "",
+              signature_id: ($r.type // "clumio_alert"),
+              name: ($r.cause // $d.cause // "Clumio Alert"),
+              severity: ( { "error": 7, "warning": 4 }[$r.severity] // 0 ),
+              extension: ( {
+                rt:         to_epoch_ms($r.raised_timestamp),
+                end:        to_epoch_ms($r.cleared_timestamp),
+                externalId: ($r.id // null),
+                cat:        ($r.type // null),
+                act:        ($r.type // null),
+                outcome:    ($r.status // null),
+                msg:        ($d.description // null),
+                reason:     ($r.cause // null),
+                cnt:        ($r.raised_count // null),
+                cs1Label:   "primaryEntityType",  cs1: ($pe.type // null),
+                cs2Label:   "primaryEntityValue", cs2: ($pe.value // null),
+                cs3Label:   "primaryEntityId",    cs3: ($pe.id // null),
+                cs4Label:   "consolidatedAlertId", cs4: ($r.consolidated_alert_id // null),
+                cs5Label:   "alertStatus",        cs5: ($r.status // null),
+                cs6Label:   "cloudAccountId",     cs6: ($d.variables.account_native_id // null | tostring)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

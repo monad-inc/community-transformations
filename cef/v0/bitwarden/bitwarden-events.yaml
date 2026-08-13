@@ -1,0 +1,85 @@
+name: "Bitwarden Event Logs to CEF"
+description: "Maps Bitwarden Events (organization audit log) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bitwarden-events"
+tags:
+  - "v0"
+  - "cef"
+  - "bitwarden"
+  - "events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Bitwarden Events -> CEF intermediate (T1). No escaping here — the
+          # shared CEF Serializer (T2) owns all escaping. Final-form values:
+          #   severity integer 0-10; rt epoch-MILLISECONDS; cs*/cn* + *Label.
+          # Input: one Bitwarden Public API /public/events record.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def device_name($d):
+            {
+              "0":"Android","1":"iOS","2":"Chrome Extension","3":"Firefox Extension",
+              "4":"Opera Extension","5":"Edge Extension","6":"Windows Desktop",
+              "7":"macOS Desktop","8":"Linux Desktop","9":"Chrome Browser",
+              "10":"Firefox Browser","11":"Opera Browser","12":"Edge Browser",
+              "13":"IE Browser","14":"Unknown Browser","15":"Android (Amazon)",
+              "16":"UWP","17":"Safari Browser","18":"Vivaldi Browser",
+              "19":"Vivaldi Extension","20":"Safari Extension","21":"SDK"
+            }[$d | tostring];
+
+          def event_name($t):
+            {
+              "1000":"Logged in","1001":"Changed account password",
+              "1002":"Enabled/updated two-step login","1003":"Disabled two-step login",
+              "1004":"Recovered account from two-step login","1005":"Login attempt failed (bad password)",
+              "1006":"Login attempt failed (bad two-step)","1007":"Exported individual vault",
+              "1008":"Account recovery requested","1009":"Account recovery key migrated"
+            }[$t | tostring] // "Bitwarden event";
+
+          . as $r
+          | ($r.type) as $t
+          | (($t == 1005) or ($t == 1006)) as $failed
+          | ($r.actingUserId // $r.memberId) as $uid
+          | { _cef: {
+                vendor: "Bitwarden",
+                product: "Bitwarden Event Logs",
+                version: "",
+                signature_id: ($t | tostring),
+                name: event_name($t),
+                severity: ( if $failed then 7
+                            elif ($t == 1002 or $t == 1003 or $t == 1007) then 5
+                            else 2 end ),
+                # Each custom slot is added as a Label+value PAIR only when its
+                # source field is present, so a *Label never appears orphaned.
+                extension: ( (
+                  {
+                    rt:      to_epoch_ms($r.date),
+                    suser:   $uid,
+                    src:     $r.ipAddress,
+                    act:     event_name($t),
+                    outcome: ( if $t == 1000 then "SUCCESS"
+                               elif $failed then "FAILURE" else "UNKNOWN" end),
+                    cs1Label: "bitwardenEventType", cs1: ($t | tostring)
+                  }
+                  + ( if $r.device != null
+                      then { cs2Label: "deviceType", cs2: device_name($r.device),
+                             cn1Label: "deviceCode", cn1: $r.device }
+                      else {} end )
+                  + ( if $r.memberId != null
+                      then { cs3Label: "memberId", cs3: $r.memberId } else {} end )
+                  + ( if $r.itemId != null
+                      then { cs4Label: "itemId", cs4: $r.itemId } else {} end )
+                ) | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,71 @@
+name: "Cloudflare URL Scanner to CEF"
+description: "Maps Cloudflare URL Scanner scan-result records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-url-scanner"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "url-scanner"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare URL Scanner -> CEF intermediate (T1). No escaping here;
+          # the shared CEF Serializer (T2) owns all escaping. Emit final-form
+          # values: severity 0-10, times epoch-MILLISECONDS, custom slots
+          # paired with their *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.task // {}) as $t
+          | ($r.page // {}) as $p
+          | (($r.verdicts // {}).overall // {}) as $v
+          | (($v.malicious) == true) as $bad
+          | (($v.categories // []) | join(", ")) as $cats
+          | (($v.tags // []) | join(", ")) as $tags
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "URL Scanner",
+              version: "",
+              signature_id: (if $bad then "url.scan.malicious" else "url.scan.clean" end),
+              name: (if $bad
+                     then ("Malicious URL detected: " + ($t.url // ""))
+                     else ("URL scanned clean: " + ($t.url // "")) end),
+              severity: (if $bad then 8 else 2 end),
+              extension: ( {
+                rt:         to_epoch_ms($t.time),
+                request:    $t.url,
+                dhost:      $p.domain,
+                dst:        $p.ip,
+                act:        "url_scan",
+                outcome:    (if $t.success == true then "SUCCESS" else "FAILURE" end),
+                externalId: $t.uuid,
+                msg:        (if $bad
+                             then ("Cloudflare URL Scanner flagged " + ($t.url // "") + " as malicious")
+                             else ("Cloudflare URL Scanner found no threat for " + ($t.url // "")) end),
+                cn1:       $p.status,
+                cn1Label:  (if $p.status != null then "httpStatus" else null end),
+                cs1:       $cats,
+                cs1Label:  (if $cats != "" then "verdictCategories" else null end),
+                cs2:       $p.country,
+                cs2Label:  (if $p.country != null then "pageCountry" else null end),
+                cs3:       $tags,
+                cs3Label:  (if $tags != "" then "threatTags" else null end),
+                cs4:       $t.reportURL,
+                cs4Label:  (if $t.reportURL != null then "reportUrl" else null end),
+                cs5:       $p.asnname,
+                cs5Label:  (if $p.asnname != null then "asnName" else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

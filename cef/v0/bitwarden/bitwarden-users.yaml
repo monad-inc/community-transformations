@@ -1,0 +1,51 @@
+name: "Bitwarden Organization Members to CEF"
+description: "Maps Bitwarden Public API organization member records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bitwarden-users"
+tags:
+  - "v0"
+  - "cef"
+  - "bitwarden"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Bitwarden organization member -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity int 0-10; times epoch-MS; every
+          # cs*/cn* slot paired with its *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          . as $m
+          | ( { "0": "Owner", "1": "Admin", "2": "User", "3": "Manager" }[($m.type // -1 | tostring)] // "Unknown" ) as $role
+          | ( { "-1": "Revoked", "0": "Invited", "1": "Accepted", "2": "Confirmed" }[($m.status // -99 | tostring)] // "Unknown" ) as $status
+          # privileged roles rank higher on the 0-10 severity scale
+          | ( { "0": 6, "1": 5, "2": 3, "3": 4 }[($m.type // -1 | tostring)] // 2 ) as $sev
+          | { _cef: {
+              vendor:  "Bitwarden",
+              product: "Bitwarden Password Manager",
+              version: "",
+              signature_id: "org.member.inventory",
+              name: ("Organization member inventory: " + ($m.email // $m.id // "unknown")),
+              severity: $sev,
+              extension: ( {
+                rt:      (now * 1000 | floor),
+                suser:   $m.email,
+                suid:    $m.userId,
+                act:     "member-inventory",
+                outcome: $status,
+                cs1Label: "role",              cs1: $role,
+                cs2Label: "membershipStatus",  cs2: $status,
+                cs3Label: "externalId",        cs3: $m.externalId,
+                cs4Label: "collections",       cs4: (if $m.collections then ($m.collections | tostring) else null end),
+                cs5Label: "memberId",          cs5: $m.id,
+                cn1Label: "twoFactorEnabled",  cn1: (if $m.twoFactorEnabled == true then 1 elif $m.twoFactorEnabled == false then 0 else null end),
+                cn2Label: "accessAll",         cn2: (if $m.accessAll == true then 1 elif $m.accessAll == false then 0 else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

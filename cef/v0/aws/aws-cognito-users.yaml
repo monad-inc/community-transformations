@@ -1,0 +1,76 @@
+name: "AWS Cognito Users to CEF"
+description: "Maps AWS Cognito user-pool user records (ListUsers UserType) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-cognito-users"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "cognito"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Cognito Users -> CEF intermediate (T1).
+          # Input: one Cognito user-pool user record (ListUsers UserType)
+          #   from the Monad `aws-cognito-users` connector.
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values (severity 0-10; times
+          # epoch-MILLISECONDS; every cs*/cn* slot paired with its *Label).
+          # One jq pass; shallow null-drop on `extension`; no recursive walk.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          . as $r
+          | ( ( $r.Attributes // [] )
+              | map(select(.Name != null))
+              | map({ (.Name): .Value }) | add // {} ) as $a
+          | ( $a["email"] ) as $email
+          | ( $a["sub"] // $r.Username ) as $uid
+          | ( $r.UserStatus // "UNKNOWN" ) as $status
+          | ( (( $r.MFAOptions // [] ) | length) > 0 ) as $has_mfa
+          | ( if ($r.Enabled != null) then truthy($r.Enabled) else true end ) as $enabled
+
+          | { _cef: {
+              vendor: "Amazon",
+              product: "AWS Cognito",
+              version: "",
+              signature_id: "cognito-user-inventory",
+              name: ("AWS Cognito user inventory: " + ($r.Username // "unknown")),
+              # Inventory is informational; escalate for risky account states.
+              severity: (
+                if ($status == "COMPROMISED") then 9
+                elif ($enabled | not) then 5
+                elif ($status == "RESET_REQUIRED" or $status == "FORCE_CHANGE_PASSWORD") then 4
+                else 2 end
+              ),
+              extension: ( {
+                rt:      to_epoch_ms($r.UserLastModifiedDate // $r.UserCreateDate),
+                end:     to_epoch_ms($r.UserLastModifiedDate),
+                start:   to_epoch_ms($r.UserCreateDate),
+                suser:   ($email // $r.Username),
+                suid:    $uid,
+                act:     "user-inventory",
+                outcome: (if $enabled then "SUCCESS" else "FAILURE" end),
+                cs1Label: "userStatus",           cs1: $status,
+                cs2Label: "enabled",              cs2: ($enabled | tostring),
+                cs3Label: "mfaEnabled",           cs3: ($has_mfa | tostring),
+                cs4Label: "emailVerified",        cs4: $a["email_verified"],
+                cs5Label: "preferredUsername",    cs5: $a["preferred_username"],
+                cs6Label: "phoneNumber",          cs6: $a["phone_number"]
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

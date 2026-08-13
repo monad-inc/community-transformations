@@ -1,0 +1,72 @@
+name: "AWS Inspector Findings to CEF"
+description: "Maps AWS Inspector (Inspector2) finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-inspector"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "inspector"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Inspector (Inspector2) Finding -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping/header assembly. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (mapped from Inspector severity)
+          #   - time fields (rt/start/end): epoch-MILLISECONDS
+          #   - custom cs*/cn* slots ALWAYS paired with their *Label
+          # One jq pass; shallow with_entries null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.packageVulnerabilityDetails // {} ) as $pvd
+          | ( ($r.resources // [])[0] // {} ) as $r0
+          | ( $r0.details.awsEc2Instance // {} ) as $ec2
+          | ( ($pvd.cvss // []) | (.[0] // {}) ) as $cvss0
+
+          # Inspector severity -> CEF severity bucket 0-10
+          | ( { "INFORMATIONAL": 1, "LOW": 3, "MEDIUM": 5,
+                "HIGH": 8, "CRITICAL": 10, "UNTRIAGED": 0 }[$r.severity] // 0 ) as $sev
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "Amazon Inspector",
+              version: "",
+              signature_id: ( $pvd.vulnerabilityId // $r.type ),
+              name: ( $r.title // $r.description // "AWS Inspector finding" ),
+              severity: $sev,
+              extension: ( {
+                rt:         to_epoch_ms($r.updatedAt // $r.lastObservedAt // $r.firstObservedAt),
+                start:      to_epoch_ms($r.firstObservedAt),
+                end:        to_epoch_ms($r.lastObservedAt),
+                msg:        $r.description,
+                externalId: $r.findingArn,
+                outcome:    $r.status,
+                cat:        $r.type,
+                dvchost:    $r0.id,
+                src:        ( ($ec2.ipV4Addresses // [])[0] ),
+                cs1Label: "cveId",           cs1: $pvd.vulnerabilityId,
+                cs2Label: "awsAccountId",    cs2: $r.awsAccountId,
+                cs3Label: "awsRegion",       cs3: $r0.region,
+                cs4Label: "resourceId",      cs4: $r0.id,
+                cs5Label: "fixAvailable",    cs5: $r.fixAvailable,
+                cs6Label: "exploitAvailable", cs6: $r.exploitAvailable,
+                cn1Label: "inspectorScore",  cn1: $r.inspectorScore,
+                cn2Label: "cvssBaseScore",   cn2: $cvss0.baseScore,
+                cfp1Label: "epssScore",      cfp1: ($r.epss.score // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

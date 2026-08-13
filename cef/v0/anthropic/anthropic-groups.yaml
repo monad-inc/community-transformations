@@ -1,0 +1,56 @@
+name: "Anthropic Claude Enterprise Groups to CEF"
+description: "Maps Anthropic Claude Enterprise RBAC/SCIM group directory records (Admin/Compliance API groups endpoint) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-groups"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "groups"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Enterprise group directory record -> CEF T1.
+          # Input: one group record per invocation:
+          #   { id, name, description, source_type("direct"|"scim"),
+          #     roles[], created_at, updated_at }
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Times emitted as epoch-MILLISECONDS; custom cs* slots paired
+          # with their *Label; one jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | (($r.roles // []) | map(select(. != null and . != "")) | join(",")) as $rolestr
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Claude Enterprise",
+              version: "",
+              signature_id: "rbac_group.snapshot",
+              name: (($r.name // "group") + " group (" + ($r.source_type // "direct") + ")"),
+              severity: 2,
+              # Each custom cs* slot is added with its *Label as a pair, and only
+              # when the source value is present, so a label never orphans.
+              extension: ( (
+                { rt:   (to_epoch_ms($r.updated_at) // to_epoch_ms($r.created_at)),
+                  act:  "group-directory-snapshot",
+                  outcome: "SUCCESS",
+                  deviceCustomDate1Label: "groupCreated",
+                  deviceCustomDate1: to_epoch_ms($r.created_at) }
+                + (if ($r.id // "") != ""          then { cs1Label: "groupId",     cs1: $r.id } else {} end)
+                + (if ($r.name // "") != ""        then { cs2Label: "groupName",   cs2: $r.name } else {} end)
+                + (if ($r.source_type // "") != "" then { cs3Label: "sourceType",  cs3: $r.source_type } else {} end)
+                + (if $rolestr != ""               then { cs4Label: "roles",       cs4: $rolestr } else {} end)
+                + (if ($r.description // "") != ""  then { cs5Label: "description", cs5: $r.description } else {} end)
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

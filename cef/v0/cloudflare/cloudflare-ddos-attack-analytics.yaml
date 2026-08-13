@@ -1,0 +1,68 @@
+name: "Cloudflare DDoS Attack Analytics to CEF"
+description: "Maps Cloudflare DDoS Attack Analytics (dosdAttackAnalyticsGroups GraphQL) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-ddos-attack-analytics"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "ddos-attack-analytics"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare DDoS Attack Analytics -> CEF intermediate (T1).
+          # One dosdAttackAnalyticsGroups row (dimensions{} + sum{}) per
+          # invocation. NO escaping here — the shared serializer (T2) owns
+          # all escaping. Times epoch-MS; custom slots paired with *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.dimensions // {}) as $d
+          | ($r.sum // {}) as $s
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "DDoS Protection",
+              version: "",
+              # Low-cardinality, stable event type for the signature.
+              signature_id: ($d.attackVector // $d.attackType // "ddos.attack"),
+              name: ( [ ($d.attackType // "DDoS attack"), " mitigated" ] | add ),
+              # DDoS attacks are high severity; a mitigated attack is a
+              # confirmed, actioned attack event.
+              severity: 8,
+              extension: ( {
+                rt:    to_epoch_ms($d.datetime),
+                start: to_epoch_ms($d.startDatetime),
+                end:   to_epoch_ms($d.endDatetime),
+                dst:   $d.destinationIP,
+                dpt:   $d.destinationPort,
+                spt:   $d.sourcePort,
+                proto: $d.attackProtocol,
+                act:   $d.action,
+                # ingress -> inbound(0), egress -> outbound(1)
+                deviceDirection: ( if $d.direction == "ingress" then 0
+                                   elif $d.direction == "egress" then 1
+                                   else null end ),
+                cn1: $s.packets,           cn1Label: "packets",
+                cn2: $s.droppedPackets,    cn2Label: "droppedPackets",
+                cn3: $s.bits,              cn3Label: "bits",
+                cs1: $d.attackId,          cs1Label: "attackId",
+                cs2: $d.attackType,        cs2Label: "attackType",
+                cs3: $d.attackVector,      cs3Label: "attackVector",
+                cs4: $d.mitigationType,    cs4Label: "mitigationType",
+                cs5: ( [ ($d.coloCity // ""), ($d.coloCountry // "") ] | map(select(. != "")) | join(", ") ),
+                cs5Label: "coloDatacenter",
+                externalId: $d.attackId
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

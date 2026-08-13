@@ -1,0 +1,62 @@
+name: "Buildkite Audit Logs to CEF"
+description: "Maps Buildkite Audit Log events into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "buildkite-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "buildkite"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Buildkite Audit Logs -> CEF intermediate (T1). NO escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Final-form values:
+          #   severity integer 0-10; times epoch-MILLISECONDS; cs*/cn* + *Label.
+          # One jq pass; shallow null-drop on extension (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.type // "") as $t
+          # Deletions/removals weigh heavier than creations/reads.
+          | (if   ($t | test("_DELETED$|_REVOKED$|_REMOVED$")) then 6
+             elif ($t | test("_CREATED$|_UPDATED$|_ADDED$"))   then 3
+             else 2 end) as $sev
+          | { _cef: {
+              vendor: "Buildkite",
+              product: "Buildkite Audit Log",
+              version: "",
+              signature_id: $t,
+              name: ($t | gsub("_"; " ") | ascii_downcase),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.occurred_at),
+                externalId: $r.uuid,
+                # Acting administrator (actor)
+                suser:   ($r.actor.name // null),
+                suid:    ($r.actor.uuid // null),
+                # Target of the action (subject)
+                duser:   ($r.subject.name // null),
+                duid:    ($r.subject.uuid // null),
+                src:     ($r.context.request_ip // null),
+                requestClientApplication: ($r.context.request_user_agent // null),
+                act:     $t,
+                outcome: "SUCCESS",
+                cs1Label: "subjectType",  cs1: ($r.subject.type // null),
+                cs2Label: "actorType",    cs2: ($r.actor.type // null),
+                cs3Label: "eventUrl",     cs3: ($r.url // null),
+                cs4Label: "targetEmail",  cs4: ($r.data.email // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

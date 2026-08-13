@@ -1,0 +1,72 @@
+name: "AlienVault OTX Subscribed Pulses to CEF"
+description: "Maps AlienVault OTX subscribed-pulse threat-intelligence records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-subscribed-pulses"
+tags:
+  - "v0"
+  - "cef"
+  - "alienvault"
+  - "subscribed-pulses"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AlienVault OTX subscribed pulse -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Final-form values only: severity integer 0-10, times
+          # epoch-MS, custom slots paired with *Label. One jq pass; shallow
+          # null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | (try fromdateiso8601 catch null)) as $e
+                  | if $e == null then null else ($e * 1000) end)
+            end;
+          def joinlist($a): if ($a | length) == 0 then null else ($a | map(tostring) | join(", ")) end;
+
+          . as $p
+          | ($p.indicators // []) as $ind
+          | (($p.TLP // "") | ascii_upcase) as $tlp
+          | ($p.references // []) as $refs
+          | {
+              _cef: {
+                vendor:  "AlienVault",
+                product: "Open Threat Exchange",
+                version: (($p.revision // "") | tostring),
+                signature_id: "otx.pulse.subscribed",
+                name: ($p.name // "OTX Pulse"),
+                # TLP used as an urgency proxy (0-10); OTX carries no severity.
+                severity: ({ "RED": 8, "AMBER": 6, "GREEN": 4, "WHITE": 2, "CLEAR": 2 }[$tlp] // 3),
+                extension: ( {
+                  rt:         to_epoch_ms($p.modified),
+                  start:      to_epoch_ms($p.created),
+                  end:        to_epoch_ms($p.modified),
+                  externalId: ($p.id | tostring),
+                  msg:        $p.description,
+                  cat:        "Threat Intelligence",
+                  request:    ($refs[0]),
+                  suser:      $p.author_name,
+                  cnt:        ($ind | length),
+                  # first IP / hash indicator surfaced into standard slots
+                  src:      ([ $ind[] | select(.type // "" | ascii_downcase | startswith("ipv")) | .indicator ][0]),
+                  fileHash: ([ $ind[] | select(.type // "" | ascii_downcase | startswith("filehash")) | .indicator ][0]),
+                  dhost:    ([ $ind[] | select((.type // "") == "domain" or (.type // "") == "hostname") | .indicator ][0]),
+                  # custom slots (always paired with a *Label)
+                  cs1Label: "tlp",                cs1: (if $tlp == "" then null else $tlp end),
+                  cs2Label: "adversary",          cs2: $p.adversary,
+                  cs3Label: "malwareFamilies",    cs3: joinlist($p.malware_families // []),
+                  cs4Label: "attackIds",          cs4: joinlist($p.attack_ids // []),
+                  cs5Label: "targetedCountries",  cs5: joinlist($p.targeted_countries // []),
+                  cs6Label: "tags",               cs6: joinlist($p.tags // []),
+                  cn1Label: "indicatorCount",     cn1: ($ind | length),
+                  cn2Label: "revision",           cn2: $p.revision
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

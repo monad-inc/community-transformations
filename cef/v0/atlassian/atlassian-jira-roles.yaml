@@ -1,0 +1,64 @@
+name: "Atlassian Jira Project Roles to CEF"
+description: "Maps Atlassian Jira project-role membership records (atlassian-jira-roles) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-roles"
+tags:
+  - "v0"
+  - "cef"
+  - "atlassian"
+  - "roles"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Atlassian Jira ProjectRole (atlassian-jira-roles) -> CEF T1.
+          # Emits the normalized {_cef:{...}} intermediate; NO escaping here
+          # (the shared CEF Serializer / T2 owns all escaping). Final-form
+          # values only: severity int 0-10, times epoch-MILLISECONDS, every
+          # cs*/cn* slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.actors // []) as $actors
+          | ($r.scope.project // {}) as $proj
+          | { _cef: {
+              vendor: "Atlassian",
+              product: "Jira",
+              version: "",
+              signature_id: "jira.project.role.membership",
+              name: ("Jira project role membership: " + ($r.name // "unknown")),
+              # Admin-bearing roles carry higher weight than ordinary roles.
+              severity: (if $r.admin == true then 6 else 3 end),
+              # Build cs*/cn* slots as whole label+value pairs, added only
+              # when the value exists, so a dropped value never orphans its
+              # *Label. One pass; shallow null-drop closes out rt/act/outcome.
+              extension: (
+                {
+                  rt:      (to_epoch_ms($r.collected_at) // ((now * 1000) | floor)),
+                  act:     "project-role-membership",
+                  outcome: "SUCCESS"
+                }
+                + (if $r.name != null       then { cs1Label: "roleName",    cs1: $r.name }       else {} end)
+                + (if $r.id != null         then { cn1Label: "roleId",      cn1: $r.id }         else {} end)
+                + (if $proj.key != null     then { cs2Label: "projectKey",  cs2: $proj.key }     else {} end)
+                + (if $proj.name != null    then { cs3Label: "projectName", cs3: $proj.name }    else {} end)
+                + ( ($actors | map(.actorUser.accountId // .actorGroup.name // .displayName) | join(",")) as $m
+                    | if $m != "" then { cs4Label: "roleMembers", cs4: $m } else {} end )
+                + { cn2Label: "memberCount", cn2: ($actors | length) }
+                + (if $r.description != null then { cs5Label: "roleDescription", cs5: $r.description } else {} end)
+                | with_entries(select(.value != null and .value != ""))
+              )
+          } }

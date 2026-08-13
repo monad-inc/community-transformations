@@ -1,0 +1,52 @@
+name: "Cloudflare Rulesets to CEF"
+description: "Maps Cloudflare Rulesets inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-rulesets"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "rulesets"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Rulesets -> CEF intermediate (T1). No escaping here;
+          # the shared serializer (T2) owns all escaping. Emit FINAL-FORM:
+          #   severity int 0-10; times epoch-MS; cs*/cn* paired with *Label.
+          # Inventory records are informational -> severity 2.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.rules // []) as $rules
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Rulesets",
+              version: ($r.version // ""),
+              signature_id: ($r.phase // "ruleset"),
+              name: ("Cloudflare ruleset: " + ($r.name // $r.id // "unknown")),
+              severity: 2,
+              extension: ( {
+                rt:         to_epoch_ms($r.last_updated),
+                externalId: $r.id,
+                msg:        ($r.description // $r.name),
+                cat:        "Asset Inventory",
+                cs1Label: "rulesetKind",  cs1: $r.kind,
+                cs2Label: "rulesetPhase", cs2: $r.phase,
+                cs3Label: "rulesetName",  cs3: $r.name,
+                cs4Label: "zoneId",       cs4: $r.zone_id,
+                cs5Label: "accountId",    cs5: $r.account_id,
+                cn1Label: "ruleCount",    cn1: ($rules | length)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

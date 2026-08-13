@@ -1,0 +1,73 @@
+name: "Anthropic Compliance Activities to CEF"
+description: "Maps Anthropic Claude Compliance API activity-feed records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-activities"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "compliance-activities"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Compliance API activity feed -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Emit FINAL-FORM values: severity int 0-10, times epoch-MILLISECONDS,
+          # every cs* slot paired with its cs*Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.actor // {}) as $a
+          | ($a.email_address // $a.unauthenticated_email_address) as $email
+          | ($a.user_id // $a.api_key_id // $a.admin_api_key_id // $a.directory_id) as $auid
+          | ($r.type // "") as $t
+          | ($t | ascii_downcase) as $tl
+          | (def has($s): ($tl | contains($s));
+             (has("failed") or has("denied") or has("rejected")
+              or has("blocked") or has("error"))) as $fail
+          | (def has($s): ($tl | contains($s));
+             if $fail then 7
+             elif (has("deleted") or has("removed") or has("revoked") or has("archived")) then 5
+             else 2 end) as $severity
+          | ($t | gsub("_"; " ")) as $nm
+          | {
+              _cef: {
+                vendor: "Anthropic",
+                product: "Claude Compliance API",
+                version: "",
+                signature_id: $t,
+                name: (if ($nm | length) > 0 then (($nm[0:1] | ascii_upcase) + $nm[1:]) else "Compliance activity" end),
+                severity: $severity,
+                extension: (
+                  {
+                    rt: to_epoch_ms($r.created_at),
+                    externalId: $r.id,
+                    suser: $email,
+                    suid: $auid,
+                    src: $a.ip_address,
+                    requestClientApplication: $a.user_agent,
+                    act: $r.type,
+                    outcome: (if $fail then "FAILURE" else "SUCCESS" end)
+                  }
+                  + (if $r.organization_id then { cs1Label: "organizationId", cs1: $r.organization_id } else {} end)
+                  + (if $r.claude_chat_id then { cs2Label: "chatId", cs2: $r.claude_chat_id } else {} end)
+                  + (if $r.claude_project_id then { cs3Label: "projectId", cs3: $r.claude_project_id } else {} end)
+                  + (if $a.type then { cs4Label: "actorType", cs4: $a.type } else {} end)
+                  + (if $r.organization_uuid then { cs5Label: "organizationUuid", cs5: $r.organization_uuid } else {} end)
+                  + (if $a.directory_id then { cs6Label: "scimDirectoryId", cs6: $a.directory_id } else {} end)
+                  | with_entries(select(.value != null and .value != ""))
+                )
+              }
+            }

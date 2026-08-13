@@ -1,0 +1,54 @@
+name: "Anthropic Compliance Users to CEF"
+description: "Maps Anthropic Compliance API organization-user directory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-users"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Compliance API — organization users -> CEF intermediate (T1)
+          # Source: GET /v1/compliance/organizations/{org_uuid}/users
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values: severity 0-10, times epoch-ms,
+          # every cs* slot paired with its *Label. One jq pass, shallow null-drop.
+          #
+          # Documented fields: id, full_name, email, organization_role,
+          # created_at (+ organization_uuid from the same Compliance API).
+          # A user directory record is informational -> severity 2.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Claude Compliance API",
+              version: "",
+              signature_id: "compliance.organization.users",
+              name: "Organization user directory record",
+              severity: 2,
+              extension: ( {
+                rt:      to_epoch_ms($r.created_at),
+                suser:   $r.email,
+                suid:    $r.id,
+                act:     "user-listed",
+                outcome: "SUCCESS",
+                cs1Label: "organizationRole", cs1: $r.organization_role,
+                cs2Label: "fullName",         cs2: $r.full_name,
+                cs3Label: "organizationUuid", cs3: $r.organization_uuid
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
