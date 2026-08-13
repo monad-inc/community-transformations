@@ -1,0 +1,117 @@
+name: "Snyk Scan Targets to OCSF v1.9.0"
+description: "Transforms Snyk Scan Target (source/repo inventory) records into the OCSF v1.9.0 API Activity (6003) class, modeling each target as a Read of Snyk's REST targets API."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-targets"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "snyk"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003) — v1.9.0
+          # Input: one Snyk /orgs/{org_id}/targets record per invocation.
+          # A "target" is a scanned source (repo / container registry / etc.)
+          # enumerated from Snyk's REST API — modeled as activity_id=2 (Read).
+          # cloud + osint are base-required in 1.9.0; both are populated.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($r.relationships // {}) as $rel
+          | ($rel.integration.data.attributes.integration_type) as $itype
+          | ($rel.organization.data.id) as $org_id
+          | ($a.url // "") as $url
+          | ( ($url | ltrimstr("https://") | ltrimstr("http://") | split("/") | .[0]) // "" ) as $host
+          | ( ($itype // ($host | ascii_downcase
+                | if contains("github") then "github"
+                  elif contains("gitlab") then "gitlab"
+                  elif contains("bitbucket") then "bitbucket"
+                  elif (contains("azure") or contains("visualstudio")) then "azure-repos"
+                  else . end)) ) as $provider0
+          | ( if ($provider0 // "") == "" then "unknown" else $provider0 end ) as $provider
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  2,
+              "type_uid":     600302,
+              "severity_id":  1,
+              "status_id":    1,
+
+              # --- Time (REQUIRED) ---
+              "time": (to_epoch($a.created_at) // 0),
+
+              # --- Metadata (REQUIRED: product + version) ---
+              "metadata": {
+                "version": "1.9.0",
+                "uid": $r.id,
+                "profiles": ["cloud", "osint"],
+                "product": {
+                  "name": "Snyk",
+                  "vendor_name": "Snyk",
+                  "feature": { "name": "Targets" }
+                }
+              },
+
+              # --- cloud (base-required in 1.9.0; provider = SCM/registry) ---
+              "cloud": {
+                "provider": ($provider // "unknown")
+              },
+
+              # --- osint (base-required array; the target URL as an indicator) ---
+              "osint": [
+                ( { "type_id": 5, "value": $url }
+                  | if .value == "" then {"type_id": 0, "value": ($a.display_name // $r.id)} else . end )
+              ],
+
+              # --- actor (REQUIRED: at_least_one — the collecting application) ---
+              "actor": {
+                "application": { "name": "Monad" }
+              },
+
+              # --- api (REQUIRED: operation) ---
+              "api": {
+                "operation": "GET /orgs/{org_id}/targets",
+                "service": { "name": "Snyk" },
+                "response": { "code": 200 }
+              },
+
+              # --- src_endpoint (REQUIRED: at_least_one — the target source) ---
+              "src_endpoint": {
+                "hostname": ($host | if . == "" then null else . end),
+                "name": $a.display_name,
+                "uid": $r.id
+              },
+
+              # --- Recommended / descriptive ---
+              "message": ("Snyk scan target: " + ($a.display_name // $r.id)),
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "target_id": $r.id,
+                "display_name": $a.display_name,
+                "url": $a.url,
+                "is_private": $a.is_private,
+                "source_type": $provider,
+                "integration_id": $rel.integration.data.id,
+                "organization_id": $org_id,
+                "created_at": $a.created_at
+              },
+
+              "raw_data": ($r | tostring)
+            }
+            | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != "")) else . end )

@@ -1,0 +1,85 @@
+name: "Snyk Project Metadata to OCSF v1.9.0"
+description: "Transforms Snyk Project Metadata into the OCSF v1.9.0 Software Inventory Info class (Discovery)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-projects"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "snyk"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Software Inventory Info (class_uid=5020, Discovery) — v1.9.0
+          # Input: one Snyk REST API /orgs/{id}/projects record per call.
+          # A Snyk "project" is a scanned software asset (a manifest in a
+          # repo), so it models as a software inventory snapshot collected
+          # from Snyk. cloud + osint are base-required for this class.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($r.relationships.target.data.id // null) as $target_id
+          | {
+              "class_uid":    5020,
+              "category_uid": 5,
+              "activity_id":  2,
+              "type_uid":     502002,
+              "severity_id":  1,
+              "time": (to_epoch($a.created) // 0),
+              "message": ($a.name // ""),
+              "status": $a.status,
+              "is_alert": false,
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "name": "Snyk",
+                  "vendor_name": "Snyk"
+                },
+                "uid": $r.id,
+                "profiles": [ "cloud", "osint" ],
+                "labels": (
+                  [ $a.tags[]? | select(.key != null) | "\(.key):\(.value)" ]
+                )
+              },
+              "cloud": {
+                "provider": "Snyk"
+              },
+              "device": {
+                "type_id": 0,
+                "name": $a.name,
+                "uid": $target_id
+              },
+              "osint": [
+                {
+                  "value": ($r.id // $a.name),
+                  "type_id": 0,
+                  "name": ($a.name // null)
+                }
+              ],
+              "unmapped": {
+                "project_type": $a.type,
+                "origin": $a.origin,
+                "target_file": $a.target_file,
+                "target_reference": $a.target_reference,
+                "business_criticality": $a.business_criticality,
+                "environment": $a.environment,
+                "lifecycle": $a.lifecycle,
+                "read_only": $a.read_only
+              },
+              "raw_data": ($r | tostring)
+            }
+            | walk( if type == "object" then with_entries(select(.value != null and .value != [] and .value != {})) else . end )

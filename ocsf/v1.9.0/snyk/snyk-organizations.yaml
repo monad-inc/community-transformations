@@ -1,0 +1,100 @@
+name: "Snyk Organizations to OCSF v1.9.0"
+description: "Transforms Snyk Organization inventory records (Snyk REST GET /orgs) into the OCSF v1.9.0 API Activity class (class_uid 6003)."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-organizations"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "snyk"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003) — v1.9.0
+          # Input: one Snyk organization record (REST GET /orgs data[]).
+          # An org-inventory pull is a Read (activity_id=2) API event.
+          # cloud + osint are base-required in 1.9.0; both profiles are
+          # declared in metadata.profiles and osint is emitted as an array.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  2,
+              "type_uid":     600302,
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": (to_epoch($a.created_at) // 0),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Snyk",
+                  "name": "Snyk"
+                },
+                "profiles": ["cloud", "osint"]
+              },
+
+              # --- cloud (base-required in 1.9.0) ---
+              "cloud": {
+                "provider": "Snyk"
+              },
+
+              # --- osint (base-required in 1.9.0; no indicators in an org record) ---
+              "osint": [],
+
+              # --- api (base-required; this is a REST GET) ---
+              "api": {
+                "operation": "GET /orgs"
+              },
+
+              # --- actor (base-required; the Snyk integration performing the read) ---
+              "actor": {
+                "app_name": "Snyk"
+              },
+
+              # --- src_endpoint (base-required; the Snyk REST API host) ---
+              "src_endpoint": {
+                "svc_name": "Snyk REST API",
+                "hostname": "api.snyk.io"
+              },
+
+              # --- Recommended ---
+              "status_id": 1,
+              "message": ("Snyk organization: " + ($a.name // $r.id)),
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "org_slug": $a.slug,
+                "group_id": $a.group_id,
+                "is_personal": $a.is_personal,
+                "access_requests_enabled": $a.access_requests_enabled
+              },
+
+              # --- Original record ---
+              "raw_data": ($r | tostring)
+            }
+          # Prune null/"" only — keep osint:[] (base-required) intact.
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != ""))
+              else . end
+            )

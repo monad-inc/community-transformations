@@ -1,0 +1,100 @@
+name: "Semgrep Projects to OCSF v1.9.0"
+description: "Transforms Semgrep project (scanned-repository) inventory records from the Semgrep ListProjects API into the OCSF v1.9.0 Software Inventory Info (5020) class, with the cloud and osint profiles."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-projects"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "semgrep"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Software Inventory Info (class_uid=5020) — v1.9.0
+          # Input: one Semgrep project record (GET /deployments/{slug}/projects).
+          # A Semgrep "project" is a scanned code repository — modeled here as
+          # a software/asset inventory snapshot. Declares the cloud + osint
+          # profiles (both base-required on 5020 in 1.9.0).
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | sub(" "; "T") | sub("\\.[0-9]+"; "")
+                  | sub("([+-][0-9][0-9]:[0-9][0-9]|Z)$"; "") + "Z"
+                  | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.url // null) as $url
+          | ($r.tags // []) as $tags
+          | (if $url == null then "Other"
+             elif ($url | ascii_downcase | contains("github")) then "GitHub"
+             elif ($url | ascii_downcase | contains("gitlab")) then "GitLab"
+             elif ($url | ascii_downcase | contains("bitbucket")) then "Bitbucket"
+             else "Other" end) as $scm
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 5,
+              "class_uid":    5020,
+              "activity_id":  2,
+              "type_uid":     502002,
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": (to_epoch($r.created_at) // to_epoch($r.latest_scan_at) // (now | floor)),
+
+              # --- Metadata (REQUIRED: product, version) ---
+              "metadata": {
+                "version": "1.9.0",
+                "profiles": ["cloud", "osint"],
+                "product": {
+                  "vendor_name": "Semgrep",
+                  "name": "Semgrep Cloud Platform"
+                },
+                "labels": (if ($tags | length) > 0 then $tags else null end)
+              },
+
+              # --- Device (REQUIRED on 5020): the scanned repository as asset ---
+              "device": {
+                "type_id": 0,
+                "name": $r.name,
+                "hostname": $r.name
+              },
+
+              # --- cloud profile (base-required): SCM hosting provider ---
+              "cloud": {
+                "provider": $scm
+              },
+
+              # --- osint profile (base-required, array): the repo URL observable ---
+              "osint": (
+                if $url != null and $url != ""
+                then [ { "type_id": 5, "value": $url } ]
+                else [ { "type_id": 99, "value": $r.name } ]
+                end
+              ),
+
+              # --- Recommended / descriptive ---
+              "message": ("Semgrep project inventory: " + ($r.name // "unknown")),
+
+              # --- Source fields without a clean OCSF home ---
+              "unmapped": {
+                "project_id": $r.id,
+                "primary_branch": $r.primary_branch,
+                "default_branch": $r.default_branch,
+                "latest_scan_at": $r.latest_scan_at,
+                "url": $url,
+                "tags": (if ($tags | length) > 0 then $tags else null end)
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [] and .value != "")) else . end)

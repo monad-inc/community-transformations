@@ -1,0 +1,154 @@
+name: "Rapid7 InsightVM Assets to OCSF v1.9.0"
+description: "Transforms Rapid7 InsightVM asset inventory records (GET /api/3/assets) into the OCSF v1.9.0 Device Inventory Info (5001) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "rapid7-assets"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "rapid7"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Device Inventory Info (class_uid=5001) — v1.9.0
+          # Category 5 (Discovery), activity_id 2 (Collect).
+          # Input: one Rapid7 InsightVM Asset record per invocation.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r |
+          # Latest scan timestamp from history; fall back to now.
+          ( ($r.history // []) | map(.date) | map(select(. != null)) | sort ) as $dates |
+          ( if ($dates | length) > 0 then $dates[-1] else null end ) as $last_scan |
+          # OS strings for type classification.
+          ( ( ($r.osFingerprint.family // "") + " "
+              + ($r.osFingerprint.systemName // "") + " "
+              + ($r.os // "") ) | ascii_downcase ) as $osl |
+          # Primary hostname (top-level hostName, else first hostNames entry).
+          ( $r.hostName // ( ($r.hostNames // [])[0] | .name? ) ) as $primary_host |
+          # Primary IP (top-level ip, else first address).
+          ( $r.ip // ( ($r.addresses // [])[0] | .ip? ) ) as $primary_ip |
+          # Primary MAC (top-level mac, else first address).
+          ( $r.mac // ( ($r.addresses // [])[0] | .mac? ) ) as $primary_mac |
+          {
+            "category_uid": 5,
+            "class_uid": 5001,
+            "activity_id": 2,
+            "type_uid": 500102,
+            "severity_id": 1,
+
+            "time": ( to_epoch($last_scan) // now ),
+            "start_time": ( ($r.history // []) | map(.date) | map(select(. != null)) | sort
+                            | (if length > 0 then to_epoch(.[0]) else null end) ),
+            "end_time": to_epoch($last_scan),
+
+            "metadata": {
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "Rapid7",
+                "name": "InsightVM"
+              },
+              "logged_time": ( to_epoch($last_scan) // now )
+            },
+
+            "device": {
+              "type_id": (
+                ( ($r.osFingerprint.type // "") | ascii_downcase ) as $ft |
+                if   ($ft | test("laptop"))                          then 3
+                elif ($ft | test("desktop|workstation"))            then 2
+                elif ($ft | test("server"))                          then 1
+                elif ($ft | test("mobile|phone|tablet"))            then 5
+                elif ($ft | test("virtual|hypervisor|guest"))      then 6
+                else
+                  ( ($r.type // "") | ascii_downcase ) as $tt |
+                  if   ($tt | test("mobile|phone"))          then 5
+                  elif ($tt | test("virtual|hypervisor|guest")) then 6
+                  else 0 end
+                end
+              ),
+              "uid": ($r.id | tostring),
+              "hostname": $primary_host,
+              "name": $primary_host,
+              "ip": $primary_ip,
+              "mac": $primary_mac,
+              "os": (
+                if ($r.os != null or $r.osFingerprint != null) then {
+                  "name": ( $r.os // $r.osFingerprint.product // $r.osFingerprint.family // "Unknown" ),
+                  "type_id": (
+                    if   ($osl | test("windows"))       then 100
+                    elif ($osl | test("android"))        then 201
+                    elif ($osl | test("linux"))          then 200
+                    elif ($osl | test("ios"))            then 301
+                    elif ($osl | test("mac|os x|darwin")) then 300
+                    elif ($osl | test("solaris|sunos"))  then 400
+                    elif ($osl | test("aix"))            then 401
+                    elif ($osl | test("hp-ux|hpux"))     then 402
+                    else 0 end
+                  ),
+                  "version": ($r.osFingerprint.version // null),
+                  "cpu_bits": (
+                    ( ($r.osFingerprint.architecture // "") | ascii_downcase ) as $arch |
+                    if   ($arch | test("x64|amd64|x86_64|64")) then 64
+                    elif ($arch | test("x86|i386|i686|32"))    then 32
+                    else null end
+                  )
+                } else null end
+              ),
+              "network_interfaces": (
+                ( $r.addresses // [] )
+                | map( { "ip": .ip, "mac": .mac } | with_entries(select(.value != null and .value != "")) )
+                | map(select(. != {}))
+              )
+            },
+
+            # OSINT is base-required in 1.9.0. Anchor it to the device's
+            # primary network indicator (IP preferred, else hostname).
+            "osint": [
+              (
+                if $primary_ip != null then
+                  { "value": $primary_ip, "type_id": 1, "uid": ($r.id | tostring) }
+                elif $primary_host != null then
+                  { "value": $primary_host, "type_id": 3, "uid": ($r.id | tostring) }
+                else
+                  { "value": ($r.id | tostring), "type_id": 0, "uid": ($r.id | tostring) }
+                end
+              )
+            ],
+
+            # Cloud is base-required in 1.9.0. InsightVM asset records carry no
+            # cloud-provider context, so declare it Unknown.
+            "cloud": {
+              "provider": "Unknown"
+            },
+
+            "unmapped": {
+              "type": $r.type,
+              "riskScore": $r.riskScore,
+              "rawRiskScore": $r.rawRiskScore,
+              "assessedForVulnerabilities": $r.assessedForVulnerabilities,
+              "assessedForPolicies": $r.assessedForPolicies,
+              "vulnerabilities": $r.vulnerabilities,
+              "ids": $r.ids
+            }
+          }
+          # Single end-of-pipeline prune of null / "" / {} / [] leaves, while
+          # keeping required objects (device, osint[0], cloud) populated.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != {} and . != ""))
+              else . end
+            )

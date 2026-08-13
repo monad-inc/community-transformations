@@ -1,0 +1,95 @@
+name: "Semgrep Deployments to OCSF v1.9.0"
+description: "Transforms Semgrep Deployment (org/tenant) inventory records from the Semgrep API into the OCSF v1.9.0 Cloud Resources Inventory Info (class_uid 5023) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-deployments"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "semgrep"
+  - "deployment"
+  - "inventory"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: ONE Semgrep Deployment record per invocation, as returned
+          #   by the Semgrep API `GET /deployments`. A Semgrep "deployment" is
+          #   an org/tenant, i.e. SaaS cloud-resource inventory metadata — not
+          #   a finding — so it maps to Discovery / Cloud Resources Inventory
+          #   Info, whose description explicitly covers inventory collected
+          #   "from ... Software-as-a-Service (SaaS) APIs".
+          #
+          # Documented deployment fields (semgrep public_v1 OpenAPI):
+          #   .id           int64  -> resources[].uid / cloud.account.uid
+          #   .name         string -> resources[].name / cloud.account.name
+          #   .slug         string -> resources[].labels[] (machine id)
+          #   .findings.url string -> unmapped.findings_url
+          #
+          # The deployment record carries no timestamp, so `time` is stamped
+          # at collection time (activity_id=2 Collect).
+          # ---------------------------------------------------------------
+          . as $r
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 5,        # Discovery
+              "class_uid":    5023,     # Cloud Resources Inventory Info
+              "activity_id":  2,        # Collect (via SaaS API)
+              "type_uid":     502302,   # 5023 * 100 + 2
+              "severity_id":  1,        # Informational
+
+              # --- Time (REQUIRED) — no source timestamp; stamp at collection ---
+              "time": (now | floor),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Semgrep",
+                  "name": "Semgrep AppSec Platform"
+                },
+                "uid": ($r.id | tostring)
+              },
+
+              # --- OSINT (base-required in 1.9.0; no indicators for inventory) ---
+              "osint": [],
+
+              # --- Cloud (the SaaS tenant this resource belongs to) ---
+              "cloud": {
+                "provider": "Semgrep",
+                "account": {
+                  "uid": ($r.id | tostring),
+                  "name": $r.name
+                }
+              },
+
+              # --- The inventoried cloud resource: the deployment itself ---
+              "resources": [
+                {
+                  "uid": ($r.id | tostring),
+                  "name": $r.name,
+                  "type": "Semgrep Deployment",
+                  "labels": [ $r.slug ]
+                }
+              ],
+
+              # --- Recommended ---
+              "status_id": 1,           # Success
+              "message": ("Semgrep deployment inventory: " + ($r.name // $r.slug)),
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "slug": $r.slug,
+                "findings_url": ($r.findings.url // null)
+              },
+
+              # --- Original record for audit / debugging ---
+              "raw_data": ($r | tostring)
+            }

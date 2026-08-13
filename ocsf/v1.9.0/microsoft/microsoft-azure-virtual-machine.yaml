@@ -1,0 +1,142 @@
+name: "Microsoft Azure Virtual Machine to OCSF v1.9.0"
+description: "Transforms Microsoft Azure Compute Virtual Machine (Get/List) inventory records into the OCSF v1.9.0 Device Inventory Info (5001) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-virtual-machine"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "microsoft"
+  - "azure"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Device Inventory Info (class_uid=5001) — v1.9.0
+          # Category: Discovery (5). Activity: Collect (2).
+          # Input: one Azure Compute Virtual Machine record per invocation
+          #        (Microsoft.Compute/virtualMachines Get or List item).
+          # A VM record is a proactively-collected device inventory snapshot.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else
+              ( ( $ts
+                  | gsub("\\.[0-9]+"; "")
+                  | sub("([+-][0-9]{2}:[0-9]{2}|Z)$"; "") )
+                + "Z" | fromdateiso8601 )
+            end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.properties // {}) as $p
+          | (($r.id // "") | split("/")) as $idp
+          | ($p.storageProfile // {}) as $sp
+          | ($sp.imageReference // {}) as $img
+          | ($sp.osDisk // {}) as $osd
+          | ($p.osProfile // {}) as $osp
+          | ($osd.osType // "") as $ostype
+          | ( $osp.computerName // $r.name ) as $host
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid":  5,
+              "category_name": "Discovery",
+              "class_uid":     5001,
+              "class_name":    "Device Inventory Info",
+              "activity_id":   2,
+              "activity_name": "Collect",
+              "type_uid":      500102,
+              "type_name":     "Device Inventory Info: Collect",
+              "severity_id":   1,
+              "severity":      "Informational",
+
+              # --- Time (REQUIRED) — VM creation timestamp ---
+              "time": ( to_epoch($p.timeCreated) // now | floor ),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Microsoft",
+                  "name": "Azure Virtual Machines",
+                  "feature": { "name": "Compute" }
+                },
+                "profiles": [ "cloud", "host" ]
+              },
+
+              # --- Device (REQUIRED object; type_id required) ---
+              "device": {
+                "type_id": 6,
+                "type":    "Virtual",
+                "uid":     $p.vmId,
+                "name":    $r.name,
+                "hostname": $host,
+                "region":  $r.location,
+                "vendor_name": "Microsoft",
+                "os": {
+                  "type_id": ( if $ostype == "Windows" then 100
+                               elif $ostype == "Linux" then 200
+                               else 0 end ),
+                  "type":    ( if $ostype == "" then null else $ostype end ),
+                  "name": (
+                    [ $img.publisher, $img.offer, $img.sku ]
+                    | map(select(. != null and . != "")) | join(" ")
+                    | if . == "" then null else . end
+                  ),
+                  "version": $img.exactVersion
+                },
+                "hw_info": {
+                  "vendor_name": "Microsoft",
+                  "cpu_count": ($p.hardwareProfile.vmSizeProperties.vCPUsAvailable),
+                  "serial_number": $osd.name
+                }
+              },
+
+              # --- Cloud (REQUIRED object; provider required) ---
+              "cloud": {
+                "provider": "Microsoft Azure",
+                "region":   $r.location,
+                "zone":     ( $r.zones[0]? ),
+                "account": {
+                  "uid":  ( $idp[2]? ),
+                  "name": "Azure Subscription"
+                }
+              },
+
+              # --- OSINT (REQUIRED array; each needs value + type_id) ---
+              # The device's collected hostname is the observable indicator.
+              "osint": [
+                { "type_id": 3, "value": ($host // $r.name // "unknown") }
+              ],
+
+              # --- Passthrough / audit ---
+              "unmapped": {
+                "provisioning_state": $p.provisioningState,
+                "vm_size":            $p.hardwareProfile.vmSize,
+                "resource_group":     ( $idp[4]? ),
+                "image_publisher":    $img.publisher,
+                "image_offer":        $img.offer,
+                "image_sku":          $img.sku,
+                "admin_username":     $osp.adminUsername,
+                "security_type":      $p.securityProfile.securityType,
+                "tags":               $r.tags
+              },
+              "raw_data": ( . | tostring )
+            }
+          | prune

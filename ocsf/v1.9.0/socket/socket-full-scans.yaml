@@ -1,0 +1,185 @@
+name: "Socket Full Scan Findings to OCSF v1.9.0"
+description: "Transforms Socket.dev full-scan SBOM artifact records into the OCSF v1.9.0 Vulnerability Finding (class_uid 2002) class, one finding per scanned package with each supply-chain/CVE alert mapped to a vulnerability entry."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "socket-full-scans"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "socket"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one Socket.dev full-scan SBOM artifact per invocation.
+          #   Each artifact is one scanned package carrying an alerts[] array
+          #   of supply-chain / CVE / quality findings. We emit ONE OCSF
+          #   Vulnerability Finding per artifact, with one vulnerabilities[]
+          #   entry per alert.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Socket severity label -> OCSF severity_id. Socket uses the label
+          # "middle" for the medium bucket.
+          def sev_to_id:
+            (. // "" | ascii_downcase) as $s |
+            if   $s == "info" or $s == "informational" then 1
+            elif $s == "low"      then 2
+            elif $s == "middle" or $s == "medium" then 3
+            elif $s == "high"     then 4
+            elif $s == "critical" then 5
+            else 0 end;
+          def sev_caption($id):
+            {"0":"Unknown","1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Other";
+
+          . as $r |
+          (.alerts // []) as $alerts |
+
+          # Reconstruct the package URL when the artifact doesn't carry one.
+          ( ($r.inputPurl)
+            // ( "pkg:" + ($r.type // "generic")
+                 + (if ($r.namespace // "") != "" then "/" + $r.namespace else "" end)
+                 + "/" + ($r.name // "unknown")
+                 + (if ($r.version // "") != "" then "@" + $r.version else "" end) )
+          ) as $purl |
+
+          # The affected package object, shared by every vulnerability entry.
+          # The OCSF affected_package object requires both name and version, so
+          # default them when the SBOM artifact omits a version.
+          ( {
+              "name": ($r.name // "unknown"),
+              "version": ($r.version // "0.0.0"),
+              "purl": $purl,
+              "type": $r.type,
+              "license": $r.license
+            } ) as $affected_pkg |
+
+          # Overall finding severity = the worst alert severity on the package.
+          ( [ $alerts[] | (.severity | sev_to_id) ] | (max // 0) ) as $sev_id |
+
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200201,
+            "activity_id": 1,
+
+            # --- Severity (REQUIRED); sibling string = OCSF caption ---
+            "severity_id": $sev_id,
+            "severity": sev_caption($sev_id),
+
+            # --- Time (REQUIRED): package publication time from the SBOM;
+            # fall back to ingest time when the artifact omits publishedAt ---
+            "time": (to_epoch($r.publishedAt) // (now | floor)),
+
+            # --- Metadata (REQUIRED); declare the base-required profiles ---
+            "metadata": {
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "Socket",
+                "name": "Socket Full Scans"
+              },
+              "uid": ($r.id | tostring),
+              "profiles": ["cloud", "osint"]
+            },
+
+            # --- Cloud (base-required in 1.9.0) ---
+            "cloud": {
+              "provider": "Socket"
+            },
+
+            # --- Finding Info (REQUIRED) ---
+            "finding_info": {
+              "uid": ($r.id | tostring),
+              "title": (($r.name // "package") + "@" + ($r.version // "?") + " — Socket supply-chain finding"),
+              "desc": ("Socket full-scan alerts for " + $purl),
+              "types": ["Vulnerability"],
+              "src_url": ("https://socket.dev/npm/package/" + ($r.name // ""))
+            },
+
+            # --- Vulnerabilities (REQUIRED) ---
+            # One entry per Socket alert. The OCSF vulnerability object carries
+            # a `just_one: [advisory, cve, cwe]` constraint, so CVE alerts emit
+            # `cve` and every other Socket alert type emits an `advisory`.
+            "vulnerabilities": (
+              if ($alerts | length) > 0 then
+                [ $alerts[] as $al |
+                  ($al.severity | sev_to_id) as $aid |
+                  {
+                    "title": $al.type,
+                    "desc": ($al.props.description // $al.props.note // $al.type),
+                    "severity": sev_caption($aid),
+                    "affected_packages": [ $affected_pkg ],
+                    "vendor_name": "Socket"
+                  }
+                  + ( if ($al.props.cveId != null) then
+                        { "cve": (
+                            { "uid": $al.props.cveId }
+                            + (if ($al.props.cvssScore != null) then
+                                 { "cvss": [ { "version": "3.0", "base_score": $al.props.cvssScore }
+                                             + (if $al.props.cvssVector != null then { "vector_string": $al.props.cvssVector } else {} end) ] }
+                               else {} end)
+                            + (if ($al.props.url != null) then { "references": [ $al.props.url ] } else {} end)
+                          ) }
+                      else
+                        { "advisory": {
+                            "uid": $al.type,
+                            "desc": ($al.props.description // $al.props.note // $al.type)
+                          } }
+                      end )
+                ]
+              else
+                [ { "title": "supply-chain-scan",
+                    "advisory": { "uid": "no-alerts", "desc": "Socket scanned the package with no active alerts." },
+                    "affected_packages": [ $affected_pkg ] } ]
+              end
+            ),
+
+            # --- OSINT (base-required in 1.9.0). Each alert becomes an
+            # indicator: CVE alerts as a Vulnerability indicator (type_id 10),
+            # every other alert as the package purl (type_id 99). ---
+            "osint": (
+              ( [ $alerts[] as $al |
+                  if ($al.props.cveId != null) then
+                    { "type_id": 10, "value": $al.props.cveId, "name": $al.type }
+                  else
+                    { "type_id": 99, "value": $purl, "name": $al.type }
+                  end ]
+              ) as $o |
+              if ($o | length) > 0 then ($o | unique) else [ { "type_id": 99, "value": $purl } ] end
+            ),
+
+            # --- Recommended: resources describing the scanned package ---
+            "resources": [ {
+              "type": "package",
+              "name": ($r.name),
+              "uid": $purl
+            } ],
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": (
+              [ { "name": "resource.uid", "type": "Resource UID", "type_id": 10, "value": $purl } ]
+              + [ $alerts[] | select(.props.cveId != null)
+                  | { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": .props.cveId } ]
+            ),
+
+            # --- Original record for audit / debugging ---
+            "raw_data": ($r | tostring)
+          }
+          # Drop keys that resolved to null (OCSF rejects null-typed values),
+          # but keep the required objects populated above.
+          | del(.. | nulls)
