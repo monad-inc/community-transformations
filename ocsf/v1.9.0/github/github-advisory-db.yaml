@@ -1,0 +1,193 @@
+name: "GitHub Advisory Database to OCSF v1.9.0"
+description: "Transforms GitHub Advisory Database (Global Security Advisory) records into the OCSF v1.9.0 Vulnerability Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-advisory-db"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "github"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one GitHub Global Security Advisory record per invocation
+          #   (the github-advisory-db input connector). This is a VULNERABILITY
+          #   CATALOG entry — a published advisory, not a host-scoped scan
+          #   result — so there is no device/asset context.
+          #
+          # v1.9.0 makes `cloud` and `osint` base-REQUIRED on this class (they
+          # were not required at 1.5.0), so both are always emitted: `cloud`
+          # carries the source platform (GitHub) and `osint` carries the
+          # advisory identifier as a Vulnerability-type indicator.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # GHSA severity label -> OCSF severity_id (+ caption sibling).
+          def sev_to_id:
+            (. // "" | ascii_downcase) as $s |
+            if   $s == "low"       then 2
+            elif $s == "medium" or $s == "moderate" then 3
+            elif $s == "high"      then 4
+            elif $s == "critical"  then 5
+            else 0 end;                       # "unknown"/absent -> Unknown
+          def sev_caption($id):
+            {"2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Unknown";
+
+          # Derive the CVSS version string ("3.1", "4.0", ...) from the vector
+          # prefix "CVSS:<ver>/..."; default to "3.1" when only a bare score
+          # is present.
+          def cvss_ver($vec):
+            if ($vec | type) == "string" and ($vec | startswith("CVSS:"))
+            then ($vec | ltrimstr("CVSS:") | split("/")[0])
+            else "3.1" end;
+
+          . as $r |
+          ($r.references // []) as $refs |
+          ($r.vulnerabilities // []) as $vulns |
+          ($r.cwes // []) as $cwes |
+          # Prefer the structured cvss_severities.cvss_v3, then the legacy
+          # top-level cvss object.
+          (($r.cvss_severities.cvss_v3 // $r.cvss // {})) as $cv |
+
+          # Primary indicator id: the GHSA id (always present), CVE as fallback.
+          ($r.ghsa_id // $r.cve_id) as $primary_id |
+
+          # One OCSF CVSS object when a base score is present.
+          (if ($cv.score != null)
+             then [ { "version": cvss_ver($cv.vector_string),
+                      "base_score": $cv.score }
+                    + (if $cv.vector_string != null
+                         then {"vector_string": $cv.vector_string} else {} end) ]
+             else [] end) as $cvss |
+
+          # The CVE object (recommended on the vulnerability), only when a CVE
+          # id exists.
+          (if $r.cve_id != null
+             then { "uid": $r.cve_id,
+                    "title": $r.summary,
+                    "desc": $r.description,
+                    "references": $refs,
+                    "created_time": to_epoch($r.nvd_published_at // $r.published_at) }
+                  + (if ($cvss | length) > 0 then {"cvss": $cvss} else {} end)
+             else null end) as $cve |
+
+          # First CWE (recommended on the vulnerability), when present.
+          ($cwes | first) as $cwe0 |
+
+          # Affected packages, one per vulnerabilities[] entry. name+version
+          # are REQUIRED on affected_package; the range is the "version".
+          ([ $vulns[] | {
+              "name": (.package.name // "unknown"),
+              "version": (.vulnerable_version_range // "*"),
+              "fixed_in_version": .first_patched_version,
+              "package_manager": .package.ecosystem
+            } ]) as $pkgs |
+
+          # Is a fix published for any affected package?
+          ([ $vulns[] | .first_patched_version ] | map(select(. != null)) | length > 0) as $has_fix |
+
+          (($r.severity // "") | sev_to_id) as $sev_id |
+
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200201,
+            "activity_id": 1,
+
+            # --- Severity (REQUIRED) ---
+            "severity_id": $sev_id,
+            "severity": sev_caption($sev_id),
+
+            # --- Time (REQUIRED) ---
+            "time": to_epoch($r.published_at),
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+              "version": "1.9.0",
+              # `cloud` and `osint` are anchors of their respective OCSF
+              # profiles; declare the profiles so the fields are recognized.
+              "profiles": ["cloud", "osint"],
+              "product": {
+                "vendor_name": "GitHub",
+                "name": "GitHub Advisory Database"
+              },
+              "uid": $r.ghsa_id,
+              "logged_time": to_epoch($r.github_reviewed_at)
+            },
+
+            # --- Cloud (cloud profile); provider is the source platform ---
+            "cloud": { "provider": "GitHub" },
+
+            # --- OSINT (osint profile, array); the advisory id as a
+            #     Vulnerability-type (type_id=10) indicator ---
+            "osint": [{
+              "value": $primary_id,
+              "type_id": 10,
+              "type": "Vulnerability"
+            }],
+
+            # --- Finding Info (REQUIRED) ---
+            "finding_info": {
+              "uid": $r.ghsa_id,
+              "title": $r.summary,
+              "desc": $r.description,
+              "created_time": to_epoch($r.published_at),
+              "modified_time": to_epoch($r.updated_at),
+              "src_url": $r.html_url,
+              "types": ["Vulnerability"]
+            },
+
+            # --- Vulnerabilities (REQUIRED) — one advisory = one entry. The
+            #     OCSF `vulnerability` object carries a `just_one:
+            #     [advisory, cve, cwe]` constraint, so attach EXACTLY one:
+            #     prefer the CVE, else the first CWE, else a synthesized
+            #     advisory keyed by the GHSA id. ---
+            "vulnerabilities": [
+              ({
+                "title": $r.summary,
+                "desc": $r.description,
+                "severity": $r.severity,
+                "references": $refs,
+                "is_fix_available": $has_fix,
+                "first_seen_time": to_epoch($r.published_at),
+                "affected_packages": (if ($pkgs | length) > 0 then $pkgs else null end)
+              }
+              + (if $cve != null then {"cve": $cve}
+                 elif $cwe0 != null then {"cwe": {"uid": $cwe0.cwe_id, "caption": $cwe0.name}}
+                 else {"advisory": {"uid": $r.ghsa_id, "desc": $r.summary, "references": $refs}} end)
+              + (if $has_fix
+                   then {"remediation": {"desc": ("Upgrade to a patched release. Fixed versions: "
+                          + ([ $vulns[] | select(.first_patched_version != null)
+                               | (.package.name // "package") + " " + .first_patched_version ] | join(", "))),
+                          "references": $refs}}
+                   else {} end))
+            ],
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": [
+              (if $r.cve_id != null
+                 then { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": $r.cve_id } else empty end),
+              (if $cwe0 != null
+                 then { "name": "vulnerabilities.cwe.uid", "type": "CWE Object: uid", "type_id": 17, "value": $cwe0.cwe_id } else empty end)
+            ],
+
+            # --- Original record for audit / debugging ---
+            "raw_data": (. | tostring)
+          }
+          # Drop keys that resolved to null (the OCSF validator rejects nulls).
+          | del(.. | nulls)

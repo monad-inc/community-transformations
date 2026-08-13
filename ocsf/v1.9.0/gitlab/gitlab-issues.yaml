@@ -1,0 +1,128 @@
+name: "GitLab Issues to OCSF v1.9.0"
+description: "Transforms GitLab Issues API records into the OCSF v1.9.0 API Activity (6003) class, modeling issue create/update lifecycle as a CRUD API event."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "gitlab-issues"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "gitlab"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # GitLab Issues API record -> OCSF v1.9.0 API Activity (class_uid 6003)
+          # One issue record per invocation -> one OCSF API Activity event.
+          #
+          # A GitLab issue is a tracked work item; its lifecycle (create/update)
+          # is modeled here as a CRUD API activity:
+          #   created_at == updated_at  -> Create (activity_id 1)
+          #   otherwise                 -> Update (activity_id 3)
+          #
+          # 6003 base-required objects populated: metadata, actor, api, cloud,
+          # osint, src_endpoint (osint/cloud are required by this class in 1.9.0).
+          # -----------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+
+          # GitLab issue severity -> OCSF severity_id (default Informational)
+          def sev_id($s):
+            ({ "critical": 5, "high": 4, "medium": 3, "low": 2, "unknown": 1 }
+              [($s // "" | ascii_downcase)] // 1);
+
+          . as $r
+          | (if ($r.created_at == $r.updated_at) then 1 else 3 end) as $act
+          | (if $act == 1 then "issues.create" else "issues.update" end) as $op
+          | ($r.author // {}) as $au
+          | (($r.assignees // []) | map(.username) | map(select(. != null))) as $assignees
+          | ($r.web_url // $r.references.full // "unknown") as $url
+
+          # Actor (required): the issue author performed the activity.
+          | ({ user: { type_id: 1,
+                       name: $au.username,
+                       uid: (if $au.id != null then ($au.id | tostring) else null end),
+                       full_name: $au.name,
+                       email_addr: null },
+               application: { name: "GitLab" } }) as $actor
+
+          # Observables — reference only attributes 6003 actually defines.
+          | ([ (if $au.username != null then {name:"actor.user.name", type_id:4, value:$au.username} else empty end),
+               (if $au.id != null then {name:"actor.user.uid", type_id:31, value:($au.id|tostring)} else empty end),
+               {name:"osint.value", type_id:6, value:$url} ]) as $observables
+
+          | {
+              # --- Classification (REQUIRED) ---
+              category_uid: 6,
+              class_uid:    6003,
+              activity_id:  $act,
+              type_uid:     (6003 * 100 + $act),
+              severity_id:  sev_id($r.severity),
+
+              # --- Time (REQUIRED) ---
+              time: to_epoch($r.updated_at // $r.created_at),
+
+              # --- Metadata (REQUIRED) ---
+              metadata: {
+                version: "1.9.0",
+                product: { vendor_name: "GitLab", name: "GitLab Issues" },
+                profiles: ["cloud", "osint"],
+                uid: (if $r.id != null then ($r.id | tostring) else null end),
+                log_name: ($r.issue_type // $r.type // "issue")
+              },
+
+              # --- API details (REQUIRED for 6003) ---
+              api: { operation: $op, service: { name: "GitLab Issues" } },
+
+              # --- Actor (REQUIRED for 6003) ---
+              actor: $actor,
+
+              # --- Cloud (REQUIRED for 6003) ---
+              cloud: { provider: "GitLab" },
+
+              # --- OSINT (REQUIRED for 6003) — the issue's canonical URL indicator ---
+              osint: [ { value: $url, type_id: 5 } ],
+
+              # --- Source endpoint (REQUIRED for 6003) ---
+              src_endpoint: { svc_name: "gitlab-issues",
+                              uid: (if $r.project_id != null then ($r.project_id | tostring) else null end) },
+
+              # --- Recommended ---
+              status_id: (if ($r.state == "opened" or $r.state == "closed") then 1 else 0 end),
+              message: $r.title,
+              observables: $observables,
+
+              # --- Fields with no clean OCSF home ---
+              unmapped: {
+                iid: $r.iid,
+                issue_type: $r.issue_type,
+                state: $r.state,
+                confidential: $r.confidential,
+                labels: $r.labels,
+                assignees: $assignees,
+                milestone: ($r.milestone.title // null),
+                upvotes: $r.upvotes,
+                downvotes: $r.downvotes,
+                merge_requests_count: $r.merge_requests_count,
+                user_notes_count: $r.user_notes_count,
+                due_date: $r.due_date,
+                closed_at: $r.closed_at,
+                references: ($r.references.full // null),
+                description: $r.description
+              },
+
+              raw_data: ($r | tostring)
+            }
+            # Prune nulls / empties last; required objects stay populated.
+            | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                    elif type == "array" then map(select(. != null))
+                    else . end )
