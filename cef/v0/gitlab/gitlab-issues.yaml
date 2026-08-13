@@ -1,0 +1,65 @@
+name: "GitLab Issues to CEF"
+description: "Maps GitLab Issues API records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "gitlab-issues"
+tags:
+  - "v0"
+  - "cef"
+  - "gitlab"
+  - "issues"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # GitLab Issues API record -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values: severity 0-10, times epoch-ms,
+          # every cs*/cn* slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object only (no recursive walk).
+          # -----------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000) end;
+
+          # GitLab issue severity -> CEF severity bucket (0-10).
+          def sev_cef($s):
+            ({ "critical": 9, "high": 7, "medium": 5, "low": 3, "unknown": 2 }
+              [($s // "" | ascii_downcase)] // 2);
+
+          . as $r
+          | ($r.author // {}) as $au
+          | (($r.assignees // [])[0] // $r.assignee // {}) as $asg
+          | (if ($r.created_at == $r.updated_at) then "create" else "update" end) as $verb
+          | { _cef: {
+                vendor: "GitLab",
+                product: "GitLab Issues",
+                version: "",
+                signature_id: (($r.issue_type // $r.type // "issue") + "." + $verb),
+                name: $r.title,
+                severity: sev_cef($r.severity),
+                extension: ( {
+                  rt:         to_epoch_ms($r.updated_at // $r.created_at),
+                  start:      to_epoch_ms($r.created_at),
+                  end:        to_epoch_ms($r.closed_at),
+                  suser:      $au.username,
+                  duser:      $asg.username,
+                  act:        $verb,
+                  outcome:    $r.state,
+                  externalId: (if $r.id != null then ($r.id | tostring) else null end),
+                  request:    $r.web_url,
+                  msg:        $r.description,
+                  cs1Label: "labels",       cs1: (($r.labels // []) | join(",")),
+                  cs2Label: "issueType",    cs2: ($r.issue_type // $r.type),
+                  cs3Label: "state",        cs3: $r.state,
+                  cs4Label: "confidential", cs4: (if $r.confidential != null then ($r.confidential | tostring) else null end),
+                  cn1Label: "iid",          cn1: $r.iid,
+                  cn2Label: "projectId",    cn2: $r.project_id
+                } | with_entries(select(.value != null and .value != "")) )
+            } }

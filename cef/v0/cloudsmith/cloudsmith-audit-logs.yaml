@@ -1,5 +1,5 @@
 name: "Cloudsmith Audit Logs to CEF"
-description: "Maps Cloudsmith Audit Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+description: "Maps Cloudsmith audit log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -17,10 +17,10 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # Cloudsmith Audit Logs -> CEF intermediate (T1). No escaping here;
-          # the shared CEF Serializer (T2) owns all escaping/header assembly.
-          # severity: integer 0-10 bucketed from the verb; rt in epoch-ms;
-          # custom cs* slots always paired with their *Label. One jq pass.
+          # Cloudsmith audit log -> CEF intermediate (T1). NO escaping here;
+          # the shared serializer (T2) owns all CEF escaping/header assembly.
+          # Emit final-form values: severity 0-10, times epoch-ms, every
+          # custom slot paired with its label.
           # ---------------------------------------------------------------
           def to_epoch_ms($ts):
             if $ts == null then null
@@ -29,34 +29,33 @@ config:
             end;
 
           . as $r
-          | ($r.event // "") as $ev
-          | (
-              if ($ev|contains(".delete")) or ($ev|contains(".revoked")) or ($ev|contains(".removed")) then 6
-              elif ($ev|contains(".update")) or ($ev|contains(".changed")) or ($ev|contains(".refreshed")) or ($ev|contains(".rotated")) then 4
-              elif ($ev|endswith(".created")) or ($ev|contains(".create")) then 3
-              else 2 end
-            ) as $sev
+          | ($r.event // "")       as $ev
+          | ($ev | ascii_downcase) as $evl
           | { _cef: {
               vendor: "Cloudsmith",
               product: "Cloudsmith Audit Logs",
               version: "",
-              signature_id: $ev,
-              name: ([$r.actor, $ev, "on", $r.object] | map(select(. != null)) | join(" ")),
-              severity: $sev,
+              signature_id: (if $ev != "" then $ev else "unknown" end),
+              name: ($ev
+                     + (if ($r.actor // "") != "" then " by " + $r.actor else "" end)
+                     + (if ($r.object // "") != "" then " on " + $r.object else "" end)),
+              severity: (if   ($evl | test("delet|remov|revok|destroy|purge")) then 6
+                         elif ($evl | test("creat|updat|chang|add|modif|set")) then 4
+                         else 3 end),
               extension: ( {
-                rt:         to_epoch_ms($r.event_at),
-                suser:      $r.actor,
-                suid:       $r.actor_slug_perm,
-                src:        $r.actor_ip_address,
-                act:        $ev,
-                outcome:    "SUCCESS",
-                externalId: $r.uuid,
-                sourceServiceName: $r.context,
-                cs1Label: "object",       cs1: $r.object,
-                cs2Label: "objectKind",   cs2: $r.object_kind,
-                cs3Label: "target",       cs3: $r.target,
-                cs4Label: "targetKind",   cs4: $r.target_kind,
-                cs5Label: "actorKind",    cs5: $r.actor_kind,
-                cs6Label: "sourceCountry", cs6: ($r.actor_location.country_code // $r.actor_location.country)
-              } | with_entries(select(.value != null and .value != "")) )
+                  rt: to_epoch_ms($r.event_at),
+                  suser: $r.actor,
+                  src: $r.actor_ip_address,
+                  act: $r.event,
+                  outcome: "Success",
+                  requestClientApplication: $r.actor_kind,
+                  externalId: $r.uuid
+                }
+                + (if ($r.context // "") != ""      then { cs1Label: "context",    cs1: $r.context }      else {} end)
+                + (if ($r.object_kind // "") != ""  then { cs2Label: "objectKind", cs2: $r.object_kind }  else {} end)
+                + (if ($r.object // "") != ""        then { cs3Label: "object",     cs3: $r.object }        else {} end)
+                + (if ($r.target // "") != ""        then { cs4Label: "target",     cs4: $r.target }        else {} end)
+                + (if ($r.target_kind // "") != ""   then { cs5Label: "targetKind", cs5: $r.target_kind }   else {} end)
+                + (if ($r.actor_location.country_code // "") != "" then { cs6Label: "actorCountry", cs6: $r.actor_location.country_code } else {} end)
+                | with_entries(select(.value != null and .value != "")) )
           } }

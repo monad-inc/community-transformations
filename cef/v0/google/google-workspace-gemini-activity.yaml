@@ -1,0 +1,62 @@
+name: "Google Workspace Gemini Activity to CEF"
+description: "Maps Google Workspace Admin SDK Reports 'gemini_in_workspace_apps' activity records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-workspace-gemini-activity"
+tags:
+  - "v0"
+  - "cef"
+  - "google"
+  - "gemini-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Google Workspace "gemini_in_workspace_apps" activity -> CEF (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity 0-10, times epoch-MS, custom slots
+          # paired with their *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.id // {}) as $id
+          | ($r.actor // {}) as $ac
+          | ($r.events[0] // {}) as $ev
+          | ((($ev.parameters // []) | map({ (.name): (.value // .boolValue // .intValue // .multiValue) }) | add) // {}) as $p
+
+          | { _cef: {
+                vendor: "Google",
+                product: "Gemini in Workspace Apps",
+                version: "",
+                signature_id: ($ev.name // "feature_utilization"),
+                name: ("Gemini " + ($p.action // "feature") + " in " + ($p.app_name // "workspace")),
+                severity: 2,
+                extension: ( {
+                  rt:       to_epoch_ms($id.time),
+                  suser:    ($ac.email // null),
+                  suid:     ($ac.profileId // null),
+                  src:      ($r.ipAddress // null),
+                  act:      ($p.action // null),
+                  outcome:  "SUCCESS",
+                  cs1Label: "app_name",
+                  cs1: ($p.app_name // null),
+                  cs2Label: "feature_source",
+                  cs2: ($p.feature_source // null),
+                  cs3Label: "event_category",
+                  cs3: ($p.event_category // null),
+                  cs4Label: "ownerDomain",
+                  cs4: ($r.ownerDomain // null),
+                  cs5Label: "customerId",
+                  cs5: ($id.customerId // null)
+                } | with_entries(select(.value != null and .value != "")) )
+            } }

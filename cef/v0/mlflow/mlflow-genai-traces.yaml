@@ -1,0 +1,81 @@
+name: "MLflow GenAI Traces to CEF"
+description: "Maps one MLflow GenAI trace into the normalized {_cef:{...}} CEF intermediate (Vendor=MLflow). Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "mlflow-genai-traces"
+tags:
+  - "v0"
+  - "cef"
+  - "mlflow"
+  - "genai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # MLflow GenAI Trace -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Emit FINAL-FORM:
+          #   severity integer 0-10; time fields epoch-MILLISECONDS (MLflow
+          #   request_time is already epoch-ms); custom slots cs*/cn* paired
+          #   with their *Label. One jq pass; shallow null-drop; no walk.
+          #
+          # MLflow serializes attribute VALUES as JSON strings, so reads go
+          # through pj() (parse-json-string-or-passthrough).
+          # ---------------------------------------------------------------
+          def pj($v):
+            if $v == null then null
+            elif ($v | type) == "string" then ($v | fromjson? // $v)
+            else $v end;
+          def sattr($sp; $k): (($sp.attributes // {})[$k]) | pj(.);
+          def mattr($i; $k):  (($i.trace_metadata // {})[$k]) | pj(.);
+
+          . as $t
+          | ($t.info // {}) as $i
+          | ($t.data.spans // []) as $spans
+          | ( $spans | map(select(((.span_type // "") | ascii_upcase) as $st
+                          | $st == "LLM" or $st == "CHAT_MODEL")) | (.[0] // null) ) as $llm
+          | ( $spans | map(select(.parent_span_id == null)) | (.[0] // null) ) as $root
+
+          | ( mattr($i; "mlflow.trace.tokenUsage") ) as $ttok
+          | ( if $llm != null then sattr($llm; "mlflow.chat.tokenUsage") else null end ) as $stok
+          | ( (if ($ttok | type) == "object" then $ttok.input_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.input_tokens else null end) ) as $in_tok
+          | ( (if ($ttok | type) == "object" then $ttok.output_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.output_tokens else null end) ) as $out_tok
+
+          | ( if $llm != null then (sattr($llm; "gen_ai.request.model") // sattr($llm; "gen_ai.response.model") // sattr($llm; "mlflow.chat.model")) else null end ) as $model
+          | ( $i.state // "STATE_UNSPECIFIED" ) as $state
+          | ( mattr($i; "mlflow.trace.user") ) as $user_id
+          | ( mattr($i; "mlflow.trace.session") ) as $sess
+          | ( $i.trace_location // {} ) as $loc
+          | ( ($root.span_type // "GENAI") | ascii_downcase ) as $stype
+          | ( $root.name // ($i.tags."mlflow.traceName") // "genai.trace" ) as $op
+
+          | { _cef: {
+                vendor: "MLflow",
+                product: "MLflow GenAI Traces",
+                version: "",
+                signature_id: ("genai." + $stype),
+                name: ("MLflow trace " + $op + " (" + $state + ")"),
+                severity: ( { "OK": 2, "IN_PROGRESS": 4, "ERROR": 7, "STATE_UNSPECIFIED": 0 }[$state] // 0 ),
+                extension: ( {
+                  rt:      $i.request_time,
+                  end:     (if ($i.request_time != null and $i.execution_duration != null)
+                            then ($i.request_time + $i.execution_duration) else null end),
+                  outcome: $state,
+                  act:     $op,
+                  suser:   $user_id,
+                  msg:     $i.request_preview,
+                  cs1Label: "traceId",       cs1: $i.trace_id,
+                  cs2Label: "model",         cs2: $model,
+                  cs3Label: "sessionId",     cs3: $sess,
+                  cs4Label: "experimentId",  cs4: ($loc.mlflow_experiment.experiment_id),
+                  cn1Label: "executionMs",   cn1: $i.execution_duration,
+                  cn2Label: "inputTokens",   cn2: $in_tok,
+                  cn3Label: "outputTokens",  cn3: $out_tok
+                } | with_entries(select(.value != null and .value != "")) )
+            } }

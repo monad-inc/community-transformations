@@ -1,0 +1,115 @@
+name: "OpenAI Codex (OTLP) to CEF"
+description: "Maps OTLP telemetry from OpenAI Codex into the normalized {_cef} intermediate (T1) consumed by the shared CEF serializer, fanning out one CEF event per OTLP logRecord. Emits vendor/product/signature/name/severity plus dictionary keys (rt, suser, act, outcome, reason) and labeled custom slots for conversation id, model, tool name and token counts. No escaping is performed here (the serializer owns it)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-codex"
+tags:
+  - "v0"
+  - "cef"
+  - "openai"
+  - "codex"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Codex RAW OTLP logs -> CEF T1 intermediate ({_cef})
+          # One OTLP envelope in -> one {_cef} per logRecord out.
+          # Metrics envelopes produce no output. NO escaping here (T2 owns it).
+          # Severity buckets (0-10): api/tool error or denied decision -> 6;
+          # sandbox non-success -> 5; success -> 2; default -> 3.
+          # -----------------------------------------------------------------
+
+          def num($x):
+            if $x == null or $x == "" then null
+            elif ($x | type) == "string" then ($x | tonumber? // null)
+            else $x end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+
+          (.resourceLogs // [])[] as $rl
+          | kv($rl.resource.attributes) as $res
+          | ($rl.scopeLogs // [])[] as $sl
+          | ($sl.logRecords // [])[] as $lr
+          | ($res + kv($lr.attributes)) as $r
+          | ( ($lr.body.stringValue) as $b
+              | if (($r["event.name"]) // "") != "" then $r["event.name"]
+                elif ($b != null and ($b | startswith("codex."))) then $b
+                else "codex.unknown" end ) as $en
+          | ($en | ltrimstr("codex.")) as $eshort
+          | ($r["model"] // "unknown") as $model
+          | (($r["error.message"] // $r["error"])) as $err
+          | (num($r["http.response.status_code"])) as $status
+
+          # epoch-ms from RFC3339 event.timestamp (ms precision), else timeUnixNano
+          | (if (($r["event.timestamp"]) // "") != ""
+             then (($r["event.timestamp"] | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+             elif (($lr.timeUnixNano) // "") != ""
+             then (($lr.timeUnixNano | tonumber) / 1000000 | floor)
+             else null end) as $rt
+
+          # per-event success + severity
+          | (if $en == "codex.tool_result" then truthy($r["success"])
+             elif $en == "codex.tool_decision" then (($r["decision"] // "approved") | ascii_downcase | startswith("approv"))
+             elif $en == "codex.sandbox_outcome" then ((($r["outcome"] // "") | ascii_downcase) | . == "success" or . == "ok")
+             elif $err != null then false
+             elif ($status != null and $status >= 400) then false
+             else true end) as $ok
+          | (if $ok then 2
+             elif $en == "codex.sandbox_outcome" then 5
+             elif ($err != null or ($status != null and $status >= 400)
+                   or $en == "codex.tool_decision" or $en == "codex.tool_result") then 6
+             else 3 end) as $sev
+
+          | (if $ok then "SUCCESS" else "FAILURE" end) as $outcome
+
+          | ({
+              rt: $rt,
+              suser: $r["user.email"],
+              suid: $r["user.account_id"],
+              act: $eshort,
+              outcome: $outcome,
+              reason: $err,
+              request: $r["endpoint"],
+              app: $r["auth_mode"],
+              cs1Label: "conversationId", cs1: $r["conversation.id"],
+              cs2Label: "model",          cs2: $model,
+              cs3Label: "toolName",       cs3: $r["tool_name"],
+              cs4Label: "decision",       cs4: ($r["decision"] // $r["outcome"]),
+              cs5Label: "sseKind",        cs5: $r["event.kind"],
+              cs6Label: "terminalType",   cs6: $r["terminal.type"],
+              cn1Label: "inputTokens",    cn1: num($r["input_token_count"]),
+              cn2Label: "outputTokens",   cn2: num($r["output_token_count"]),
+              cn3Label: "httpStatus",     cn3: $status
+            }
+            # drop null/empty slots; drop orphan labels whose value is absent
+            | with_entries(select((.value != null) and (.value != "")))
+            | . as $e
+            | reduce (["cs1","cs2","cs3","cs4","cs5","cs6","cn1","cn2","cn3"][]) as $slot
+                ($e; if (.[$slot] == null) then del(.[$slot + "Label"]) else . end)
+            ) as $ext
+
+          | { _cef: {
+                vendor: "OpenAI",
+                product: "Codex",
+                version: ($r["app.version"] // ""),
+                signature_id: $en,
+                name: ($model + " " + $eshort + (if $ok then "" else " (failure)" end)),
+                severity: $sev,
+                extension: $ext
+              } }

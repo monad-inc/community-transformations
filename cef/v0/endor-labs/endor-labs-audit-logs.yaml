@@ -1,0 +1,66 @@
+name: "Endor Labs Audit Logs to CEF"
+description: "Maps Endor Labs Audit Log (AuditLog) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "endor-labs-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "endor-labs"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Endor Labs AuditLog -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Final-form values:
+          #   severity integer 0-10; rt epoch-MILLISECONDS; cs* paired w/ label.
+          # One jq pass; shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def email_of($cb):
+            if $cb == null then null
+            else ($cb | split("@")) as $p
+              | (if ($p | length) >= 2 then ($p[0] + "@" + $p[1]) else $cb end)
+            end;
+
+          # Higher severity for destructive ops.
+          def sev($op):
+            { "OPERATION_DELETE": 7, "OPERATION_CREATE": 5,
+              "OPERATION_UPDATE": 5, "OPERATION_UPSERT": 5,
+              "OPERATION_READ": 3 }[$op] // 4;
+
+          . as $r
+          | ($r.meta // {}) as $m
+          | ($r.spec // {}) as $s
+          | (email_of($m.created_by)) as $email
+          | { _cef: {
+                vendor: "Endor Labs",
+                product: "Endor Labs Audit Log",
+                version: "",
+                signature_id: ($s.operation // "OPERATION_UNSPECIFIED"),
+                name: (($s.operation // "operation") + " " + ($s.message_kind // "resource")),
+                severity: sev($s.operation),
+                extension: ( {
+                    rt:       to_epoch_ms($m.create_time // $m.upsert_time // $m.update_time),
+                    suser:    ($email // $m.created_by),
+                    src:      ($s.remote_address),
+                    act:      ($s.operation),
+                    outcome:  "SUCCESS",
+                    cs1Label: "resourceKind", cs1: ($s.message_kind),
+                    cs2Label: "resourceUuid", cs2: ($s.message_uuid),
+                    cs3Label: "namespace",    cs3: ($r.tenant_meta.namespace),
+                    cs4Label: "createdBy",    cs4: ($m.created_by),
+                    cs5Label: "auditUuid",    cs5: ($r.uuid)
+                  } | with_entries(select(.value != null and .value != "")) )
+            } }
