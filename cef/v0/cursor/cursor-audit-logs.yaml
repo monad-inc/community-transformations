@@ -1,0 +1,48 @@
+name: "Cursor Audit Logs to CEF"
+description: "Maps Cursor team audit-log events into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cursor-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "cursor"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Cursor audit event -> CEF intermediate (T1). No escaping here — the
+          # shared serializer owns that. signature_id = the audited action.
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000) end;
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+          def real($s): if ($s | type) == "string" and $s != "unknown" and $s != "" then $s else null end;
+          . as $r
+          | ( (.event_type // "") ) as $et
+          | { _cef: {
+              vendor: "Cursor",
+              product: "Cursor Audit Logs",
+              version: "",
+              signature_id: $r.event_type,
+              name: $r.event_type,
+              severity: (if ($et | test("(protected_git_scope|service_account|cloud_agent_secret|privacy_mode|api_key)")) then 6 else 3 end),
+              extension: ( {
+                rt: to_epoch_ms($r.timestamp),
+                suser: real($r.user_email),
+                suid: real($r.user_id),
+                src: (if is_ip($r.ip_address) then $r.ip_address else null end),
+                act: $r.event_type,
+                cs1Label: "teamId", cs1: $r.team_id,
+                cs2Label: "requestId", cs2: $r.request_id,
+                cs3Label: "sourceRaw", cs3: ($r.ip_address // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
