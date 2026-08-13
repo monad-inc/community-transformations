@@ -1,0 +1,88 @@
+name: "Anthropic Claude Enterprise Groups to OCSF v1.9.0"
+description: "Transforms Anthropic Claude Enterprise RBAC/SCIM group directory records (Admin/Compliance API groups endpoint) into the OCSF v1.9.0 Group Management (3006) class. A polled directory snapshot maps to activity Other (99); source_type, roles, and timestamps are preserved."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-groups"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Group Management (class_uid=3006) — v1.9.0
+          # Input: one Anthropic Claude Enterprise group record per
+          # invocation (Admin/Compliance API groups endpoint):
+          #   { id, name, description, source_type("direct"|"scim"),
+          #     roles[], created_at, updated_at }
+          # The connector polls and LISTS groups (a directory/state
+          # snapshot), not a discrete lifecycle change, so activity is
+          # Other (99) with activity_name "list". The group's assigned
+          # role IDs populate group.privileges.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | (to_epoch($r.updated_at) // to_epoch($r.created_at)) as $time
+          | ({
+              category_uid: 3,
+              class_uid:    3006,
+              activity_id:  99,
+              type_uid:     300699,
+              activity_name: "list",
+              severity_id:  1,
+
+              time: $time,
+
+              metadata: {
+                version: "1.9.0",
+                product: { vendor_name: "Anthropic", name: "Claude Enterprise" },
+                labels: ([ $r.source_type ] | map(select(. != null and . != ""))),
+                original_time: $r.created_at
+              },
+
+              # cloud is base-required in 1.9.0; provider is its only required field
+              cloud: { provider: "Anthropic" },
+
+              # osint is base-required (array); re-asserted after the prune below
+              osint: [],
+
+              group: {
+                uid:  $r.id,
+                name: $r.name,
+                type: $r.source_type,
+                desc: $r.description,
+                privileges: ($r.roles // [] | map(select(. != null and . != "")))
+              },
+
+              status_id: 1,
+              status: "Success",
+              message: (($r.name // "group") + " (" + ($r.source_type // "direct") + ")"),
+
+              unmapped: {
+                created_at: $r.created_at,
+                updated_at: $r.updated_at,
+                source_type: $r.source_type,
+                roles: $r.roles
+              },
+              raw_data: ($r | tostring)
+            })
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)
+          # re-assert base-required osint array (pruned when empty)
+          | .osint = (.osint // [])

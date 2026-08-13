@@ -1,0 +1,115 @@
+name: "Abnormal Security Cases to OCSF v1.9.0"
+description: "Transforms Abnormal Security case records (account-takeover / email-security cases from the /v1/cases API) into the OCSF v1.9.0 Incident Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-cases"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "abnormal"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Incident Finding (class_uid=2005) — v1.9.0
+          # Input: one Abnormal Security case record per invocation.
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.affectedEmployee // null) as $emp
+
+          # firstObserved is ISO-8601; OCSF time is epoch seconds.
+          | (if ($r.firstObserved|type) == "number" then $r.firstObserved
+             elif ($r.firstObserved|type) == "string"
+               then ($r.firstObserved | gsub("\\.[0-9]+";"") | (try fromdateiso8601 catch null))
+             else null end) as $time
+
+          # Severity text -> OCSF severity_id. Account-takeover / compromise
+          # cases are high-impact; other case types default to Medium.
+          | ((($r.severity // "") | ascii_downcase)) as $sev
+          | (if   ($sev | test("takeover|compromis|exfiltrat")) then 4   # High
+             elif  ($sev | test("phish|fraud|impersonat"))      then 3   # Medium
+             elif  ($sev == "")                                 then 0   # Unknown
+             else                                                    3   # Medium
+             end) as $severity_id
+
+          # case_status -> Incident status_id.
+          | ((($r.case_status // "") | ascii_downcase)) as $cs
+          | (if   ($cs | test("action required|open|new"))   then 1   # New
+             elif  ($cs | test("in progress|acknowledg"))    then 2   # In Progress
+             elif  ($cs | test("hold"))                      then 3   # On Hold
+             elif  ($cs | test("remediat|resolv"))           then 4   # Resolved
+             elif  ($cs | test("closed|dismiss"))            then 5   # Closed
+             elif  ($cs == "")                               then 0   # Unknown
+             else                                                 99  # Other
+             end) as $status_id
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid":    2005,
+              "activity_id":  1,                       # Create (new case)
+              "type_uid":     (2005 * 100 + 1),        # 200501
+              "severity_id":  $severity_id,
+
+              # --- Time (REQUIRED) ---
+              "time": $time,
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Abnormal Security",
+                  "name": "Abnormal Behavior Platform"
+                },
+                "profiles": ["incident"]
+              },
+
+              # --- Finding Information List (REQUIRED for Incident Finding) ---
+              "finding_info_list": [
+                ({
+                   "uid":   ($r.caseId | tostring),
+                   "title": ($r.severity // "Abnormal Security Case"),
+                   "desc":  $r.description
+                 } | with_entries(select(.value != null and .value != "")))
+              ],
+
+              # --- OSINT (REQUIRED): the affected mailbox as an indicator ---
+              "osint": [
+                ({
+                   "value":   $emp,
+                   "type_id": 9                        # Email Address
+                 } | select(.value != null))
+              ],
+
+              # --- Cloud (REQUIRED): the email-security control environment ---
+              "cloud": {
+                "provider": "Abnormal Security"
+              },
+
+              # --- Incident status (REQUIRED) ---
+              "status_id": $status_id,
+
+              # --- Recommended ---
+              "status":        $r.case_status,
+              "status_detail": $r.remediation_status,
+              "is_alert":      true,
+              "desc":          $r.description,
+              "message":       ($r.genai_summary // $r.description),
+
+              # --- Non-OCSF passthrough ---
+              "unmapped": {
+                "analysis":   $r.analysis,
+                "threat_ids": $r.threatIds
+              }
+            }
+          # Drop nulls/empties while keeping the required objects intact.
+          | walk(if type == "object"
+                 then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                 else . end)

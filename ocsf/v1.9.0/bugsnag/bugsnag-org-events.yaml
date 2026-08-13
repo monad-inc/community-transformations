@@ -1,0 +1,145 @@
+name: "BugSnag Org Events to OCSF v1.9.0"
+description: "Transforms BugSnag organization error/crash events into the OCSF v1.9.0 Application Error (6008) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bugsnag-org-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "bugsnag"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Application Error (class_uid=6008) — v1.9.0
+          # Input: one BugSnag org error event (Data Access API shape).
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.exceptions[0] // {}) as $ex
+          | ($r.app // {}) as $app
+          | ($r.device // {}) as $dev
+          | ($r.user // {}) as $usr
+          | ($r.request // {}) as $req
+
+          | def to_epoch($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then $ts
+              else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              end;
+
+          # BugSnag severity -> OCSF severity_id
+          ( { "error": 4, "warning": 3, "info": 1 }[$r.severity] // 0 ) as $sev
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6008,
+              "activity_id":  1,
+              "type_uid":     600801,
+              "severity_id":  $sev,
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.received_at),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "uid": $r.id,
+                "product": {
+                  "vendor_name": "BugSnag",
+                  "name": "BugSnag",
+                  "feature": { "name": "Error Monitoring" },
+                  "version": $app.version
+                },
+                "log_name": "org-events",
+                "profiles": ["cloud", "osint", "host", "security_control"]
+              },
+
+              # --- Cloud (REQUIRED on Application Error) ---
+              "cloud": {
+                "provider": "Unknown"
+              },
+
+              # --- OSINT (REQUIRED on Application Error) ---
+              # No native OSINT indicators in BugSnag; carry the event URL as
+              # an Other-typed indicator so the required object is populated.
+              "osint": [
+                {
+                  "value": ($r.url // $r.project_url // $r.id),
+                  "type_id": 99
+                }
+              ],
+
+              # --- Recommended ---
+              "message": ($ex.message // $r.context // ($r.severity // "error")),
+              "status": (if $r.unhandled == true then "Unhandled" else "Handled" end),
+              "status_detail": ($r.severity_reason.type // null),
+              "is_alert": ($r.unhandled == true),
+
+              "device": {
+                "type_id": 0,
+                "hostname": $dev.hostname,
+                "uid": $dev.id,
+                "os": {
+                  "name": $dev.os_name,
+                  "version": $dev.os_version,
+                  "type_id": (
+                    ($dev.os_name // "" | ascii_downcase) as $on
+                    | if   ($on | test("mac"))     then 300
+                      elif ($on | test("win"))     then 100
+                      elif ($on | test("android")) then 401
+                      elif ($on | test("ios"))     then 400
+                      elif ($on | test("linux"))   then 200
+                      else 0 end
+                  )
+                }
+              },
+
+              "observables": (
+                [
+                  ( if $dev.hostname != null
+                    then { "name": "device.hostname", "type_id": 1, "value": $dev.hostname }
+                    else empty end ),
+                  ( if $r.id != null
+                    then { "name": "metadata.uid", "type_id": 0, "value": $r.id }
+                    else empty end )
+                ]
+              ),
+
+              # --- Non-OCSF passthrough ---
+              "unmapped": {
+                "error_id": $r.error_id,
+                "context": $r.context,
+                "unhandled": $r.unhandled,
+                "error_class": $ex.error_class,
+                "app_id": $app.id,
+                "app_version": $app.version,
+                "release_stage": $app.release_stage,
+                "app_type": $app.type,
+                "url": $r.url,
+                "project_url": $r.project_url,
+                "user_id": $usr.id,
+                "user_name": $usr.name,
+                "user_email": $usr.email,
+                "browser_name": $dev.browser_name,
+                "browser_version": $dev.browser_version,
+                "request_url": $req.url,
+                "http_method": $req.http_method,
+                "client_ip": $req.client_ip,
+                "duration": $app.duration
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Prune nulls / empty containers (single recursive pass).
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

@@ -1,0 +1,131 @@
+name: "Cloudflare Zones to OCSF v1.9.0"
+description: "Transforms Cloudflare Zones inventory records into the OCSF v1.9.0 Cloud Resources Inventory Info (class_uid 5023) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zones"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one Cloudflare Zone record (GET /zones) per invocation.
+          # A Cloudflare zone is a cloud-managed web asset, collected via the
+          # Cloudflare API -> activity_id 2 (Collect).
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.account // {}) as $acct
+          | ($r.owner // {}) as $owner
+          | ($r.plan // {}) as $plan
+          | {
+              "category_uid": 5,
+              "class_uid":    5023,
+              "type_uid":     502302,
+              "activity_id":  2,
+              "severity_id":  1,
+
+              "time":       to_epoch($r.modified_on // $r.created_on),
+              "start_time": to_epoch($r.created_on),
+              "end_time":   to_epoch($r.activated_on),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare Zones"
+                },
+                "profiles": ["cloud", "osint"]
+              },
+
+              # osint is base-required for 5023 (osint profile); array of indicators.
+              # The zone name is a domain indicator (type_id 2 = Domain).
+              "osint": [
+                { "value":   $r.name,
+                  "type_id": 2,
+                  "type":    "Domain",
+                  "subdomains": ($r.name_servers // []),
+                  "whois": (
+                    { "registrar": $r.original_registrar }
+                    | with_entries(select(.value != null))
+                  )
+                } | with_entries(select(.value != null))
+              ],
+
+              # cloud satisfies the class at_least_one constraint. Nested account/org
+              # each carry their own at_least_one, so omit them when empty.
+              "cloud": (
+                { "provider": "Cloudflare",
+                  "account": (
+                    { "uid": $acct.id, "name": $acct.name, "type": "Cloud Account" }
+                    | with_entries(select(.value != null))
+                    | if length > 0 then . else null end
+                  ),
+                  "org": (
+                    { "uid": $owner.id, "name": $owner.name }
+                    | with_entries(select(.value != null))
+                    | if length > 0 then . else null end
+                  )
+                } | with_entries(select(.value != null))
+              ),
+
+              # resources also satisfies the constraint and carries the asset.
+              "resources": [
+                { "uid":  $r.id,
+                  "name": $r.name,
+                  "type": "Cloudflare Zone",
+                  "hostname": $r.name,
+                  "labels": (
+                    [ (if $r.type      then ("type:" + $r.type) else empty end),
+                      (if $r.status    then ("status:" + $r.status) else empty end),
+                      (if $r.paused    then "paused" else empty end),
+                      (if $plan.name   then ("plan:" + $plan.name) else empty end) ]
+                  ),
+                  "created_time": to_epoch($r.created_on),
+                  "modified_time": to_epoch($r.modified_on)
+                } | with_entries(select(.value != null))
+              ],
+
+              # status_id describes the collection operation (succeeded), not the
+              # asset lifecycle state; the zone's own status lives in status_detail.
+              "status_id":     1,
+              "status_detail": ($r.status // "unknown"),
+              "message":       ("Cloudflare zone " + ($r.name // "unknown") + " (" + ($r.status // "unknown") + ")"),
+
+              "observables": (
+                [ (if $r.name then { "name": "osint.value", "type": "Hostname", "type_id": 1, "value": $r.name } else empty end),
+                  (if $r.id   then { "name": "resources.uid", "type": "Resource UID", "type_id": 10, "value": $r.id } else empty end) ]
+              ),
+
+              "unmapped": (
+                { "development_mode": $r.development_mode,
+                  "original_dnshost": $r.original_dnshost,
+                  "original_name_servers": $r.original_name_servers,
+                  "permissions": $r.permissions,
+                  "plan_id": $plan.id,
+                  "plan_legacy_id": $plan.legacy_id,
+                  "plan_price": $plan.price,
+                  "plan_currency": $plan.currency,
+                  "plan_frequency": $plan.frequency,
+                  "plan_is_subscribed": $plan.is_subscribed,
+                  "meta": $r.meta }
+                | with_entries(select(.value != null))
+              ),
+
+              "raw_data": ($r | tostring)
+            }

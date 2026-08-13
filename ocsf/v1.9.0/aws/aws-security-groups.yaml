@@ -1,0 +1,136 @@
+name: "AWS Security Groups to OCSF v1.9.0"
+description: "Transforms AWS EC2 Security Group inventory records (as emitted by the aws-security-groups input connector) into the OCSF v1.9.0 Cloud Resources Inventory Info class (class_uid 5023)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-groups"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+  - "cloud-security"
+  - "security-groups"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Category: Discovery (5).  Activity: Collect (2) — records are
+          # proactively pulled from the EC2 DescribeSecurityGroups API on a
+          # cron by the aws-security-groups connector, not logged at an event.
+          #
+          # Input: one AWS EC2 SecurityGroup record per invocation (SDK/JSON
+          # PascalCase form), e.g. { GroupId, GroupName, Description, VpcId,
+          # OwnerId, SecurityGroupArn, IpPermissions[], IpPermissionsEgress[],
+          # Tags[] }.
+          #
+          # A security group carries no event timestamp of its own (it is a
+          # configuration snapshot), so `time` is stamped at collection with
+          # `now`, consistent with activity_id=Collect.
+          # ---------------------------------------------------------------
+
+          . as $r
+
+          # Region is not a top-level field on the record; derive it from the
+          # ARN (arn:aws:ec2:<region>:<account>:security-group/<id>).
+          | ( ($r.SecurityGroupArn // "") | split(":") ) as $arn
+          | ( if ($arn | length) > 3 and ($arn[3] != "") then $arn[3] else null end ) as $region
+
+          # Count rules that expose the group to the whole internet
+          # (0.0.0.0/0 or ::/0 on any ingress rule) — surfaced in `message`
+          # so a reader sees the exposure without parsing every rule.
+          | ( ($r.IpPermissions // [])
+              | map( ( (.IpRanges   // []) | map(.CidrIp   == "0.0.0.0/0") | any )
+                     or ( (.Ipv6Ranges // []) | map(.CidrIpv6 == "::/0")     | any ) )
+              | map(select(.)) | length ) as $world_open_ingress
+
+          | {
+              # --- Classification (REQUIRED) ---
+              category_uid: 5,
+              class_uid:    5023,
+              type_uid:     502302,
+              activity_id:  2,
+              activity_name: "Collect",
+              severity_id:  1,
+              severity:     "Informational",
+
+              # --- Time (REQUIRED) ---
+              time: (now | floor),
+
+              # --- Metadata (REQUIRED) ---
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "Amazon EC2"
+                }
+              },
+
+              # --- OSINT (REQUIRED array; no threat-intel indicators on an
+              #     inventory snapshot, so an empty array) ---
+              osint: [],
+
+              # --- Recommended ---
+              message: ( "Security group \($r.GroupName // $r.GroupId) "
+                         + "(\($r.GroupId)) — "
+                         + "\(($r.IpPermissions // []) | length) ingress / "
+                         + "\(($r.IpPermissionsEgress // []) | length) egress rule(s)"
+                         + ( if $world_open_ingress > 0
+                             then "; \($world_open_ingress) rule(s) open to 0.0.0.0/0 or ::/0"
+                             else "" end ) ),
+              status_id: 1,
+              status: "Success",
+              region: $region,
+
+              cloud: {
+                provider: "AWS",
+                region: $region,
+                account: {
+                  uid: $r.OwnerId,
+                  type: "AWS Account",
+                  type_id: 10
+                }
+              },
+
+              resources: [
+                {
+                  uid: ($r.SecurityGroupArn // $r.GroupId),
+                  name: $r.GroupName,
+                  type: "AWS::EC2::SecurityGroup",
+                  region: $region,
+                  owner: { uid: $r.OwnerId },
+                  labels: ( ($r.Tags // []) | map("\(.Key)=\(.Value)") ),
+                  namespace: $r.VpcId
+                }
+              ],
+
+              # --- Fields with no clean OCSF home kept for investigation ---
+              unmapped: {
+                group_id: $r.GroupId,
+                description: $r.Description,
+                vpc_id: $r.VpcId,
+                ingress_rules: (($r.IpPermissions // []) | tostring),
+                egress_rules: (($r.IpPermissionsEgress // []) | tostring),
+                world_open_ingress_rules: $world_open_ingress
+              },
+
+              raw_data: ($r | tostring)
+            }
+
+          # Drop nulls / empty containers so the event stays compact while the
+          # required objects (metadata, osint, etc.) always survive.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )
+          # osint is a REQUIRED array but legitimately empty here; the prune
+          # above strips empty arrays, so restore it as the final step.
+          | .osint = (.osint // [])

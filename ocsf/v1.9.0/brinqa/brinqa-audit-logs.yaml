@@ -1,0 +1,99 @@
+name: "Brinqa Audit Logs to OCSF v1.9.0"
+description: "Transforms Brinqa audit and security event log records into the OCSF v1.9.0 API Activity (6003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "brinqa-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "brinqa"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one Brinqa audit-log record per invocation.
+          # Brinqa platform audit trail: a user action on the platform with
+          # an outcome + severity. Modeled as generic CRUD API activity.
+          # Documented fields: category, user, createdBy, dateCreated,
+          # lastUpdated, timestamp, msg, detail, outcome, severity, stacktrace.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then ($ts / 1000 | floor) else ($ts | floor) end)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+          def lc($s): ($s // "" | ascii_downcase);
+
+          . as $r
+          | lc($r.severity) as $sev
+          | lc(($r.detail // "") + " " + ($r.msg // "")) as $act
+          | lc($r.outcome) as $oc
+          | (if   ($act | test("delete|remove"))              then 4
+             elif ($act | test("create|add"))                 then 1
+             elif ($act | test("update|modif|change|edit"))   then 3
+             elif ($act | test("read|view|login|logout|access|export")) then 2
+             else 99 end) as $activity
+          | (if   $sev == "info" or $sev == "informational" then 1
+             elif $sev == "low"                             then 2
+             elif $sev == "warn" or $sev == "warning" or $sev == "medium" then 3
+             elif $sev == "error" or $sev == "high"         then 4
+             elif $sev == "critical"                        then 5
+             elif $sev == "fatal"                           then 6
+             else 0 end) as $sevid
+          | (if   $oc == "success" then 1
+             elif ($oc | test("fail|error|denied")) then 2
+             else 0 end) as $statusid
+          | {
+              category_uid: 6,
+              class_uid:    6003,
+              activity_id:  $activity,
+              type_uid:     (6003 * 100 + $activity),
+              severity_id:  $sevid,
+              time:         to_epoch($r.timestamp // $r.dateCreated),
+              metadata: {
+                version: "1.9.0",
+                product: { vendor_name: "Brinqa", name: "Brinqa" }
+              },
+              cloud: { provider: "Brinqa" },
+              actor: {
+                user: (
+                  {
+                    name: ($r.user // $r.createdBy),
+                    email_addr: (if ($r.createdBy // "" | test("@")) then $r.createdBy else null end)
+                  } | with_entries(select(.value != null))
+                )
+              },
+              api: {
+                operation: ($r.category // "Audit"),
+                service: { name: "Brinqa Platform" }
+              },
+              status:        (($r.outcome // "") | if . == "" then null else (.[0:1] | ascii_upcase) + .[1:] end),
+              status_id:     $statusid,
+              status_detail: $r.detail,
+              message:       $r.msg,
+              unmapped: (
+                {
+                  id:          $r.id,
+                  typeId:      $r.typeId,
+                  category:    $r.category,
+                  createdBy:   $r.createdBy,
+                  dateCreated: $r.dateCreated,
+                  lastUpdated: $r.lastUpdated,
+                  stacktrace:  $r.stacktrace
+                } | with_entries(select(.value != null))
+              ),
+              raw_data: ($r | tostring)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != ""))
+              else . end
+            )
+          | . + { osint: [], src_endpoint: {} }

@@ -1,0 +1,130 @@
+name: "AlienVault OTX Subscribed Pulses to OCSF v1.9.0"
+description: "Transforms AlienVault OTX subscribed-pulse threat-intelligence records into the OCSF v1.9.0 Detection Finding (2004) class, carrying each pulse indicator as an OSINT object."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-subscribed-pulses"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "alienvault"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: one AlienVault OTX subscribed pulse per invocation
+          #        (pulse metadata + its indicators[] array).
+          # Each pulse indicator becomes one OSINT object (osint is a
+          # required, array-valued attribute on this class via the OSINT
+          # profile). Pulse-level threat context (adversary, malware
+          # families, ATT&CK ids, target countries/industries) that has no
+          # clean OCSF home is preserved under `unmapped`.
+          # NOTE: the Detection Finding class marks `cloud` as required even
+          # though OSINT feeds carry no cloud context; a minimal placeholder
+          # provider is emitted to satisfy the schema.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | (try fromdateiso8601 catch null))
+            end;
+
+          # OTX indicator type -> OCSF osint.type_id enum
+          def osint_type_id($t):
+            ($t // "" | ascii_downcase) as $l
+            | if   $l == "ipv4" or $l == "ipv6" or $l == "cidr" then 1
+              elif $l == "domain" then 2
+              elif $l == "hostname" then 3
+              elif ($l | startswith("filehash")) then 4
+              elif $l == "url" or $l == "uri" then 5
+              elif $l == "user agent" or $l == "useragent" then 6
+              elif $l == "sslcertfingerprint" or $l == "x509" then 7
+              elif $l == "email" then 9
+              elif $l == "cve" then 10
+              elif $l == "filepath" then 11
+              else 99
+              end;
+
+          . as $p
+          | (($p.TLP // "") | ascii_upcase) as $tlp
+          | ($p.references // []) as $refs
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  1,
+              "type_uid":     (2004 * 100 + 1),
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": (to_epoch($p.modified) // to_epoch($p.created)),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "profiles": ["osint", "cloud"],
+                "product": {
+                  "vendor_name": "AlienVault",
+                  "name": "Open Threat Exchange (OTX)"
+                }
+              },
+
+              # --- Finding info (REQUIRED) ---
+              "finding_info": {
+                "uid":   ($p.id // "unknown" | tostring),
+                "title": ($p.name // "OTX Pulse"),
+                "desc":  $p.description,
+                "src_url": ($refs[0]),
+                "created_time":  to_epoch($p.created),
+                "modified_time": to_epoch($p.modified)
+              },
+
+              # --- Cloud (REQUIRED by class; N/A for OSINT feed) ---
+              "cloud": { "provider": "Other" },
+
+              # --- OSINT (REQUIRED, array — one entry per indicator) ---
+              "osint": [
+                ($p.indicators // [])[]
+                | {
+                    "value":   .indicator,
+                    "type_id": osint_type_id(.type),
+                    "tlp":     (if $tlp == "" then null else $tlp end),
+                    "name":    (if (.title // "") == "" then null else .title end),
+                    "desc":    (if (.description // "") == "" then null else .description end),
+                    "external_uid": (.id | tostring),
+                    "created_time": to_epoch(.created),
+                    "expiration_time": to_epoch(.expiration),
+                    # raw OTX indicator type + role preserved as labels (the
+                    # OCSF `type` string sibling must mirror the type_id enum
+                    # caption, so the vendor string is kept here instead).
+                    "labels": ([ .type, .role ] | map(select(. != null and . != ""))),
+                    "references": $refs
+                  }
+                | with_entries(select(.value != null and .value != "" and .value != []))
+              ],
+
+              # --- Recommended ---
+              "is_alert": false,
+              "message": ($p.name // ""),
+              "status_id": 1,
+
+              # --- Pulse-level threat context with no clean OCSF home ---
+              "unmapped": {
+                "adversary":          $p.adversary,
+                "malware_families":   $p.malware_families,
+                "attack_ids":         $p.attack_ids,
+                "tags":               $p.tags,
+                "targeted_countries": $p.targeted_countries,
+                "industries":         $p.industries,
+                "revision":           $p.revision,
+                "author_name":        $p.author_name,
+                "public":             $p.public
+              } | with_entries(select(.value != null and .value != "" and .value != []))
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)

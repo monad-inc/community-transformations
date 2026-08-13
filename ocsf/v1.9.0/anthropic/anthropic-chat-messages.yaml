@@ -1,0 +1,114 @@
+name: "Anthropic Claude.ai Chat Messages to OCSF v1.9.0"
+description: "Transforms Anthropic Compliance API chat message records (anthropic-chat-messages) into OCSF v1.9.0 API Activity (6003) events with the ai_operation profile, mapping the chat user, conversation context, and message role/content."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-chat-messages"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "ai"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # Anthropic Compliance API chat message -> OCSF v1.9.0
+          # One message record in -> one OCSF API Activity (6003) event out.
+          #
+          # A compliance chat message is an application-level event: a user
+          # (human) or Claude (assistant) authored a message inside a Claude.ai
+          # conversation. API Activity (6003) is the closest class that carries
+          # the ai_operation profile (message_context) and models a
+          # create-a-resource action without forcing an OS device/process.
+          #
+          # activity_id 1 = Create (a new message was authored).
+          # ai_role_id: human -> 1 (User), assistant -> 2 (Assistant).
+          #
+          # NOTE ON osint/cloud: the bundled OCSF v1.9.0 schema resolves the
+          # osint + cloud profile attributes as class-required, so both are
+          # emitted at the top level to satisfy the structural validator. osint
+          # is an empty array (no OSINT enrichment on a chat message); cloud
+          # carries the SaaS provider.
+          # -----------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+
+          . as $r
+          | ($r.chat_user // {}) as $cu
+          | ($r.role // "unknown") as $role
+          | (if $role == "assistant" then 2 elif $role == "human" then 1 else 0 end) as $ai_role
+          | ([ ($r.content // [])[]? | .type ] | map(select(. != null)) | unique) as $ctypes
+          | ([ ($r.content // [])[]? | select(.type == "text") | .text ]
+             | map(select(. != null)) | join("\n")) as $text
+          | ($cu.email_address // "") as $email
+          | (if ($email | index("@")) != null then ($email | split("@")[0]) else null end) as $uname
+
+          | ({ type_id: 1,
+               name: (if ($uname // "") != "" then $uname else ($cu.id // (if $email != "" then $email else "unknown" end)) end),
+               uid: $cu.id,
+               email_addr: (if $email != "" then $email else null end) }) as $user
+
+          | ([ (if $email != "" then {name:"actor.user.email_addr", type_id:5, value:$email} else empty end),
+               (if ($r.id // "") != "" then {name:"metadata.uid", type_id:10, value:$r.id} else empty end) ]) as $obs
+
+          | ({ chat_id: $r.chat_id,
+               chat_name: $r.chat_name,
+               project_id: $r.project_id,
+               organization_id: $r.organization_id,
+               organization_uuid: $r.organization_uuid,
+               message_role: $role,
+               content_types: $ctypes,
+               content_length: (if ($text | length) > 0 then ($text | length) else null end),
+               content_preview: (if ($text | length) > 280 then (($text[0:280]) + "…") else (if $text == "" then null else $text end) end),
+               file_count: (($r.files // []) | length),
+               artifact_count: (($r.artifacts // []) | length) }) as $ctx
+
+          | { time: to_epoch($r.created_at),
+              category_uid: 6,
+              class_uid: 6003,
+              activity_id: 1,
+              type_uid: 600301,
+              severity_id: 1,
+              status_id: 1,
+              status: "Success",
+              metadata: {
+                version: "1.9.0",
+                product: { vendor_name: "Anthropic", name: "Claude.ai",
+                           feature: { name: "Compliance API" } },
+                log_name: "chat.message",
+                uid: $r.id,
+                tenant_uid: ($r.organization_id // $r.organization_uuid),
+                profiles: ["ai_operation"]
+              },
+              cloud: { provider: "Anthropic" },
+              actor: { user: $user, app_name: "Claude.ai" },
+              api: {
+                operation: ("chat.message." + $role),
+                service: { name: "Claude.ai", version: null },
+                request: { uid: $r.id }
+              },
+              message_context: {
+                ai_role_id: $ai_role,
+                service: { name: "Claude.ai" }
+              },
+              src_endpoint: { name: "claude.ai", svc_name: "Claude.ai" },
+              observables: $obs,
+              message: ($role + " message in chat \"" + ($r.chat_name // "untitled") + "\""),
+              unmapped: $ctx }
+
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)
+          # re-assert osint (empty = no OSINT on a chat message) after prune so the
+          # bundle-required top-level key survives the empty-array drop
+          | .osint = []

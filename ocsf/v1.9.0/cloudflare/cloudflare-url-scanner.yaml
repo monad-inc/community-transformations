@@ -1,0 +1,123 @@
+name: "Cloudflare URL Scanner to OCSF v1.9.0"
+description: "Transforms Cloudflare URL Scanner scan-result records into the OCSF v1.9.0 Detection Finding (class_uid 2004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-url-scanner"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: one Cloudflare URL Scanner scan-result record per invocation.
+          # A scan verdict (malicious / benign for a submitted URL) is a
+          # detection produced by Cloudflare's URL Scanner engine.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.task // {}) as $t
+          | ($r.page // {}) as $p
+          | (($r.verdicts // {}).overall // {}) as $v
+          | (($v.malicious) == true) as $bad
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  1,
+              "type_uid":     200401,
+              "severity_id":  (if $bad then 4 else 1 end),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($t.time),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare URL Scanner"
+                },
+                "uid": $t.uuid
+              },
+
+              # --- Cloud (REQUIRED by schema — scan run by Cloudflare) ---
+              "cloud": { "provider": "Cloudflare" },
+
+              # --- OSINT (REQUIRED — the scanned URL as an indicator) ---
+              "osint": [
+                ( { "value": $t.url, "type_id": 5 }
+                  | if (($v.categories // []) | length) > 0
+                    then . + { "category": ($v.categories | join(", ")) } else . end )
+              ],
+
+              # --- Finding info (REQUIRED: uid) ---
+              "finding_info": {
+                "uid": $t.uuid,
+                "title": (if $bad
+                          then ("Malicious URL detected: " + ($t.url // ""))
+                          else ("URL scanned clean: " + ($t.url // "")) end),
+                "types": ($v.categories // []),
+                "src_url": $t.reportURL
+              },
+
+              # --- Recommended fields ---
+              "status_id": (if $t.success == true then 1 else 0 end),
+              "is_alert":  $bad,
+              "verdict_id": (if $bad then 2 else 5 end),
+              "message": (if $bad
+                          then ("Cloudflare URL Scanner flagged " + ($t.url // "") + " as malicious")
+                          else ("Cloudflare URL Scanner found no threat for " + ($t.url // "")) end),
+              "src_url": $t.reportURL,
+
+              # --- Observables (URL, host, IP seen in the scan) ---
+              "observables": (
+                [ ( if $p.url  != null then { "name": "url.url_string", "type_id": 6,  "value": $p.url }  else empty end ),
+                  ( if $p.domain != null then { "name": "device.hostname", "type_id": 1, "value": $p.domain } else empty end ),
+                  ( if $p.ip   != null then { "name": "device.ip",       "type_id": 2,  "value": $p.ip }   else empty end )
+                ]
+              ),
+
+              # --- Evidence: the resolved page ---
+              "evidences": [
+                { "url": {
+                    "url_string": $p.url,
+                    "hostname":   $p.domain,
+                    "scheme":     (if ($p.url // "") | startswith("https") then "https" else "http" end)
+                  },
+                  "device": (
+                    { "hostname": $p.domain, "ip": $p.ip, "region": $p.country }
+                    | with_entries(select(.value != null))
+                  ),
+                  "data": {
+                    "http_status": $p.status,
+                    "server": $p.server,
+                    "asn": $p.asn,
+                    "categories": ($v.categories // []),
+                    "tags": ($v.tags // [])
+                  }
+                }
+              ],
+
+              # --- Original record for audit / debugging ---
+              "raw_data": ($r | tostring)
+            }
+          # Prune null/empty leaves while preserving required objects.
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

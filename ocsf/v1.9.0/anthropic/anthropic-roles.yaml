@@ -1,0 +1,98 @@
+name: "Anthropic Organization Roles to OCSF v1.9.0"
+description: "Transforms Anthropic Admin API organization user/role records into the OCSF v1.9.0 User Inventory Info (5003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-roles"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
+          # Input: one Anthropic Admin API organization user record per
+          # invocation (GET /v1/organizations/users):
+          #   { id, added_at, email, name, role, type }
+          # activity_id=2 (Collect): user inventory proactively collected
+          # from the Anthropic Admin API.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ( $r.role // "" ) as $role
+          # Admin-tier org roles map to the OCSF Admin user type.
+          | ( if ($role | IN("admin","owner","primary_owner","membership_admin"))
+              then 2 else 1 end ) as $utype_id
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 5,
+              "class_uid":    5003,
+              "activity_id":  2,
+              "type_uid":     500302,
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) — when the user joined the org ---
+              "time": to_epoch($r.added_at),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "profiles": [ "cloud", "osint" ],
+                "product": {
+                  "vendor_name": "Anthropic",
+                  "name": "Anthropic Admin API"
+                }
+              },
+
+              # --- User (REQUIRED) ---
+              "user": {
+                "name":       ($r.email // $r.name),
+                "uid":        $r.id,
+                "full_name":  $r.name,
+                "email_addr": $r.email,
+                "type_id":    $utype_id,
+                "type":       (if $utype_id == 2 then "Admin" else "User" end),
+                # Organization role captured as a group membership.
+                "groups": [ { "name": $role, "type": "Organization Role" } ]
+              },
+
+              # --- OSINT (REQUIRED by class) — the user email as an indicator ---
+              "osint": [ {
+                "value":   $r.email,
+                "type_id": 9
+              } ],
+
+              # --- Cloud (REQUIRED by class) — Anthropic SaaS environment ---
+              "cloud": {
+                "provider": "Anthropic"
+              },
+
+              # --- Recommended ---
+              "status_id": 1,
+              "message":   (($r.name // $r.email // "user") + " has organization role " + $role),
+
+              "observables": [
+                { "name": "user.email_addr", "type_id": 5, "value": $r.email },
+                { "name": "user.uid",        "type_id": 31, "value": $r.id }
+              ],
+
+              # --- Original record for audit ---
+              "unmapped": { "role": $role, "type": $r.type },
+              "raw_data": ($r | tostring)
+            }
+          # Drop null/empty leaves while keeping required objects populated.
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

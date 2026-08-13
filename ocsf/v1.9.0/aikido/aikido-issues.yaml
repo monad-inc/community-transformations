@@ -1,0 +1,124 @@
+name: "Aikido Issues to OCSF v1.9.0"
+description: "Transforms Aikido Security issue export records into the OCSF v1.9.0 Vulnerability Finding (2002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-issues"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aikido"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | ($r.status // "" | ascii_downcase) as $st
+          | {
+              "class_uid": 2002,
+              "category_uid": 2,
+              "activity_id": 1,
+              "type_uid": 200201,
+              "time": ($r.first_detected_at // 0),
+              "severity_id": (
+                { "critical": 5, "high": 4, "medium": 3, "low": 2 }[$sev] // 0
+              ),
+              "status_id": (
+                { "open": 1, "snoozed": 2, "ignored": 3, "closed": 4 }[$st] // 0
+              ),
+              "status": ($r.status // null),
+              "message": ($r.rule // null),
+              "finding_info": {
+                "uid": ($r.id | tostring),
+                "title": ($r.rule // "Aikido issue"),
+                "desc": ($r.rule // null),
+                "types": [ $r.type ] | map(select(. != null)),
+                "created_time": ($r.first_detected_at // null),
+                "first_seen_time": ($r.first_detected_at // null),
+                "src_url": (
+                  if $r.group_id != null
+                  then "https://app.aikido.dev/feature/issues/" + ($r.group_id | tostring)
+                  else null end
+                ),
+                "product": {
+                  "name": "Aikido Security",
+                  "vendor_name": "Aikido"
+                }
+              },
+              "vulnerabilities": [
+                {
+                  "title": ($r.rule // null),
+                  "desc": ($r.rule // null),
+                  "severity": ($r.severity // null),
+                  "is_exploit_available": ($r.exploitability != null and $r.exploitability != "no_known_exploit"),
+                  "is_fix_available": (($r.patched_versions // []) | length > 0),
+                  "first_seen_time": ($r.first_detected_at // null),
+                  "remediation": (
+                    if ($r.patched_versions // []) | length > 0
+                    then { "desc": ("Upgrade to a patched version: " + (($r.patched_versions // []) | join(", "))) }
+                    else null end
+                  ),
+                  "cve": (
+                    if $r.cve_id != null
+                    then {
+                      "uid": $r.cve_id,
+                      "cvss": (
+                        if $r.original_cvss_severity_score != null
+                        then [ { "base_score": (($r.original_cvss_severity_score / 10)) } ]
+                        else null end
+                      )
+                    }
+                    else null end
+                  ),
+                  "cwe": (
+                    if ($r.cwe_classes // []) | length > 0
+                    then { "uid": ($r.cwe_classes[0]) }
+                    else null end
+                  ),
+                  "affected_code": (
+                    if $r.affected_file != null
+                    then [ {
+                      "file": { "path": $r.affected_file, "name": ($r.affected_file | split("/") | last) },
+                      "start_line": ($r.start_line // null),
+                      "end_line": ($r.end_line // null)
+                    } ]
+                    else null end
+                  ),
+                  "affected_packages": (
+                    if $r.affected_package != null
+                    then [ {
+                      "name": $r.affected_package,
+                      "version": ($r.installed_version // "unknown"),
+                      "fixed_in_version": (($r.patched_versions // []) | first),
+                      "package_manager": ($r.programming_language // null)
+                    } | with_entries(select(.value != null)) ]
+                    else null end
+                  )
+                } | with_entries(select(.value != null))
+              ],
+              "osint": [],
+              "cloud": {
+                "provider": ($r.cloud_name // "N/A")
+              },
+              "resource": (
+                if $r.code_repo_name != null then { "name": $r.code_repo_name, "type": "code_repository" }
+                elif $r.container_repo_name != null then { "name": $r.container_repo_name, "type": "container_image" }
+                elif $r.cloud_name != null then { "name": $r.cloud_name, "type": "cloud_account" }
+                elif $r.domain_name != null then { "name": $r.domain_name, "type": "domain" }
+                else null end
+              ),
+              "metadata": {
+                "product": {
+                  "name": "Aikido Security",
+                  "vendor_name": "Aikido"
+                },
+                "version": "1.9.0"
+              },
+              "raw_data": ($r | tostring)
+            }
+          | with_entries(select(.value != null))

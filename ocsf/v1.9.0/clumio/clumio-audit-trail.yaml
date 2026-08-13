@@ -1,0 +1,149 @@
+name: "Clumio Audit Trail to OCSF v1.9.0"
+description: "Transforms Clumio Audit Trail records into the OCSF v1.9.0 API Activity (class_uid 6003) class, mapping the acting user, the performed action, the affected Clumio/cloud entity, and success/failure status."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-audit-trail"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "clumio"
+  - "application"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: ONE Clumio Audit Trail record per invocation, as returned
+          # by GET /audit-trails (the clumio-audit-trail input connector).
+          #
+          # Clumio audit records are administrative CRUD actions issued
+          # through the Clumio UI or REST API (create/update/delete of
+          # policies, users, SSO/MFA settings, org units; login/logout;
+          # apply/remove protection). That maps cleanly to OCSF API Activity.
+          #
+          # Field mappings:
+          #   .action                 -> activity_id + api.operation
+          #   .status                 -> status_id / severity_id / outcome
+          #   .timestamp (RFC-3339)   -> time
+          #   .user_email             -> actor.user (name / email_addr)
+          #   .ip_address             -> src_endpoint.ip
+          #   .category               -> api.service.name
+          #   .primary_entity         -> resources[0] + cloud.provider
+          #   .id                     -> metadata.uid / api.request.uid
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.action // "" | ascii_downcase) as $act
+          | ($r.status // "" | ascii_downcase) as $st
+          | ($r.primary_entity // {}) as $pe
+          | ($r.parent_entity // {}) as $par
+          | (($pe.type // "") | ascii_downcase) as $petype
+
+          # ---- activity_id (CRUD) from the Clumio action ------------------
+          | ( if ($act | test("^(create|register)$")) then 1        # Create
+              elif ($act | test("^(browse|search)$")) then 2        # Read
+              elif ($act | test("^(update|enable|disable|apply|remove)$")) then 3  # Update
+              elif ($act | test("^(delete|unregister)$")) then 4    # Delete
+              else 99 end ) as $activity_id                          # Other (login/logout/etc.)
+
+          # ---- status -> status_id / severity -----------------------------
+          | ( if $st == "success" then 1
+              elif $st == "failure" then 2
+              elif $st == "partial_success" then 99
+              else 0 end ) as $status_id
+          | ( if $st == "failure" then 3          # Medium
+              elif $st == "partial_success" then 2 # Low
+              else 1 end ) as $severity_id         # Informational
+
+          # ---- cloud provider inferred from the affected asset type -------
+          | ( if ($petype | startswith("aws")) then "AWS"
+              elif ($petype | startswith("azure")) then "Azure"
+              elif ($petype | startswith("gcp")) then "GCP"
+              elif ($petype | test("^(microsoft365|m365|mssql|dynamo)")) then "Microsoft"
+              else "Clumio" end ) as $provider
+
+          | {
+              "category_uid": 6,
+              "category_name": "Application Activity",
+              "class_uid": 6003,
+              "class_name": "API Activity",
+              "type_uid": (6003 * 100 + $activity_id),
+              "activity_id": $activity_id,
+              "activity_name": ( { "1":"Create","2":"Read","3":"Update","4":"Delete","99":"Other" }[$activity_id|tostring] // "Other" ),
+              "severity_id": $severity_id,
+
+              "time": to_epoch($r.timestamp),
+
+              "status_id": $status_id,
+              "status": ( { "1":"Success","2":"Failure","99":"Other" }[$status_id|tostring] // "Unknown" ),
+              "status_detail": ($r.status // null),
+
+              "metadata": {
+                "version": "1.9.0",
+                "uid": ($r.id // null),
+                "product": {
+                  "vendor_name": "Clumio",
+                  "name": "Clumio Audit Trail"
+                }
+              },
+
+              # OCSF requires osint on API Activity; Clumio audit records
+              # carry no threat-intel indicators, so emit an empty array.
+              "osint": [],
+
+              "cloud": { "provider": $provider },
+
+              "actor": {
+                "user": {
+                  "name": ($r.user_email // null),
+                  "email_addr": ($r.user_email // null),
+                  "type_id": 1
+                }
+              },
+
+              "api": {
+                "operation": ($r.action // "unknown"),
+                "service": { "name": ($r.category // null) },
+                "request": { "uid": ($r.id // null) }
+              },
+
+              "src_endpoint": { "ip": ($r.ip_address // null) },
+
+              "resources": [
+                {
+                  "uid": ($pe.id // null),
+                  "type": ($pe.type // null),
+                  "name": ($pe.value // null),
+                  "owner": ( if ($par.value // null) != null
+                             then { "name": $par.value } else null end )
+                }
+              ],
+
+              "message": ( "\($r.user_email // "unknown") \($r.action // "acted") \($r.category // "") \($pe.value // "" | tostring)" ),
+
+              "unmapped": {
+                "interface": ($r.interface // null),
+                "parent_entity": ($par | if . == {} then null else . end),
+                "details_json": ($r.details_json // null)
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Drop null/empty leaves while preserving required objects.
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != ""))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

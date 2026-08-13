@@ -1,0 +1,145 @@
+name: "CISA Known Exploited Vulnerabilities to OCSF v1.9.0"
+description: "Transforms CISA Known Exploited Vulnerabilities (KEV) catalog entries into the OCSF v1.9.0 Vulnerability Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cisa-kev"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cisa"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one CISA KEV catalog "vulnerabilities[]" entry per record.
+          #
+          # CISA KEV carries no host/asset/cloud context and no CVSS score —
+          # it is a public catalog of actively-exploited CVEs. v1.9.0 marks
+          # `osint` and `cloud` as base-required on this class, so both are
+          # emitted with minimal, honest values (osint = the CVE indicator;
+          # cloud.provider = "Not Applicable", since KEV has no cloud origin).
+          # Every KEV entry is, by definition, actively exploited, so
+          # is_exploit_available is always true.
+          # ---------------------------------------------------------------
+
+          # KEV dates are date-only ("YYYY-MM-DD"); normalize to an ISO
+          # instant before parsing to epoch seconds.
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else
+              ( $ts
+                | if test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$") then . + "T00:00:00Z" else . end
+                | gsub("\\.[0-9]+Z?$"; "Z")
+                | fromdateiso8601 )
+            end;
+
+          def trim: if . == null then null else (. | gsub("^\\s+|\\s+$"; "")) end;
+
+          . as $r |
+          # `notes` is a free-text field that usually holds one or more
+          # reference URLs separated by " ; ". Split into a clean list.
+          ( (($r.notes // "") | split(";") | map(trim) | map(select(. != "" and (startswith("http")))) )) as $refs |
+          ($r.cveID) as $cve |
+
+          # KEV has no CVSS; ransomware-linked KEV entries are treated as the
+          # most urgent (Critical), the rest as High — all KEV are exploited.
+          (if (($r.knownRansomwareCampaignUse // "") | ascii_downcase) == "known"
+             then 5 else 4 end) as $sev_id |
+          ({"5":"Critical","4":"High"}[$sev_id|tostring]) as $sev_label |
+
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200201,
+            "activity_id": 1,
+
+            # --- Severity (REQUIRED) ---
+            "severity_id": $sev_id,
+            "severity": $sev_label,
+
+            # --- Time (REQUIRED): the date CISA added the CVE to the catalog ---
+            "time": to_epoch($r.dateAdded),
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "CISA",
+                "name": "CISA Known Exploited Vulnerabilities Catalog"
+              }
+            },
+
+            # --- Vulnerabilities (REQUIRED). One CVE per KEV entry; the
+            #     `vulnerability` object carries a just_one:[advisory,cve,cwe]
+            #     constraint, so only `cve` is populated here. CWEs are
+            #     preserved in raw_data. ---
+            "vulnerabilities": [
+              {
+                "title": $r.vulnerabilityName,
+                "desc": $r.shortDescription,
+                "severity": $sev_label,
+                "references": $refs,
+                "is_exploit_available": true,
+                "vendor_name": $r.vendorProject,
+                "first_seen_time": to_epoch($r.dateAdded),
+                "remediation": {
+                  "desc": ($r.requiredAction // "Apply updates per vendor instructions.")
+                },
+                "cve": {
+                  "uid": $cve,
+                  "references": $refs,
+                  "created_time": to_epoch($r.dateAdded)
+                }
+              }
+            ],
+
+            # --- OSINT (REQUIRED in v1.9.0): the CVE as an indicator. ---
+            "osint": [
+              {
+                "value": $cve,
+                "type_id": 99,
+                "type": "CVE"
+              }
+            ],
+
+            # --- Cloud (REQUIRED in v1.9.0): KEV has no cloud origin. ---
+            "cloud": {
+              "provider": "Not Applicable"
+            },
+
+            # --- Finding Info (REQUIRED) ---
+            "finding_info": {
+              "uid": $cve,
+              "title": $r.vulnerabilityName,
+              "desc": $r.shortDescription,
+              "created_time": to_epoch($r.dateAdded),
+              "src_url": ($refs | first),
+              "types": ["Vulnerability"]
+            },
+
+            # --- Recommended: message + status (KEV entries are open/known) ---
+            "message": $r.vulnerabilityName,
+            "status": "New",
+            "status_id": 1,
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": [
+              { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": $cve }
+            ],
+
+            # --- Original record for audit / debugging (retains cwes, dueDate,
+            #     product, knownRansomwareCampaignUse) ---
+            "raw_data": ($r | tostring)
+          }
+          # Drop keys that resolved to null (OCSF rejects null-typed values).
+          | del(.. | nulls)

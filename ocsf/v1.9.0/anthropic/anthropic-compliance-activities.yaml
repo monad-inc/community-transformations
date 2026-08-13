@@ -1,0 +1,134 @@
+name: "Anthropic Compliance Activities to OCSF v1.9.0"
+description: "Transforms Anthropic Claude Compliance API activity-feed records into OCSF v1.9.0, routing authentication activities to the Authentication (3002) class and all other audit activities to the API Activity (6003) class as generic CRUD."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-activities"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "ai"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Compliance API activity feed -> OCSF v1.9.0
+          # One activity record in -> one OCSF event out.
+          #
+          # Routing (by activity `type`):
+          #   login/logout/sso/mfa/session/authentication -> Authentication 3002 (IAM)
+          #   everything else (chat/file/project/admin/api-key/role/group CRUD)
+          #                                               -> API Activity 6003 (Application)
+          #
+          # The `actor` discriminated union (user_actor, api_actor,
+          # admin_api_key_actor, unauthenticated_user_actor, anthropic_actor,
+          # scim_directory_sync_actor) is normalized to one OCSF user + endpoint.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != ""))
+              else . end);
+
+          . as $r
+          | ($r.actor // {}) as $a
+          | ($a.email_address // $a.unauthenticated_email_address) as $email
+          | ($a.user_id // $a.api_key_id // $a.admin_api_key_id // $a.directory_id) as $auid
+          | ($a.ip_address) as $ip
+          | ($r.type // "") as $t
+          | ($t | ascii_downcase) as $tl
+          # string-builtin predicate (avoids regex per autoscaling rule 4)
+          | (def has($s): ($tl | contains($s));
+             (has("login") or has("logout") or has("logon") or has("logoff")
+              or has("sso") or has("sign_in") or has("sign_out") or has("mfa")
+              or has("session_") or has("authenticat")) ) as $isauth
+          | (def has($s): ($tl | contains($s));
+             if (has("failed") or has("denied") or has("rejected")
+                 or has("blocked") or has("error") or has("revoked_access")) then 2
+             else 1 end) as $status_id
+          | (def has($s): ($tl | contains($s));
+             if (has("created") or has("added") or has("uploaded") or has("invited")
+                 or has("generated") or has("enrolled") or has("installed")) then 1
+             elif (has("deleted") or has("removed") or has("revoked")
+                   or has("archived") or has("uninstalled")) then 4
+             elif (has("updated") or has("changed") or has("renamed") or has("modified")
+                   or has("enabled") or has("disabled") or has("accepted") or has("assigned")) then 3
+             elif (has("viewed") or has("read") or has("listed") or has("exported")
+                   or has("downloaded") or has("accessed") or has("retrieved")) then 2
+             else 99 end) as $apiact
+          | (def has($s): ($tl | contains($s));
+             if (has("login") or has("logon") or has("sign_in")) then 1
+             elif (has("logout") or has("logoff") or has("sign_out")) then 2
+             else 99 end) as $authact
+          | (if $status_id == 2 then 3 elif $apiact == 4 then 2 else 1 end) as $severity_id
+          | ({
+              "user_actor": 1, "admin_api_key_actor": 2,
+              "anthropic_actor": 3
+            }[$a.type] // 0) as $user_type_id
+          | {
+              type_id: $user_type_id,
+              name: ($email // $a.type // "unknown"),
+              email_addr: $email,
+              uid: $auid
+            } as $user
+          | (if $isauth then {
+              category_uid: 3,
+              class_uid: 3002,
+              activity_id: $authact,
+              type_uid: (3002 * 100 + $authact),
+              user: $user,
+              service: { name: "Claude Enterprise" },
+              auth_protocol_id: (if ($tl | contains("sso")) then 5 else null end),
+              src_endpoint: { ip: $ip, uid: $auid }
+            } else {
+              category_uid: 6,
+              class_uid: 6003,
+              activity_id: $apiact,
+              type_uid: (6003 * 100 + $apiact),
+              actor: { user: $user },
+              api: { operation: $t, service: { name: "Compliance Activity Feed" } },
+              src_endpoint: { ip: $ip, uid: $auid }
+            } end)
+          + {
+              time: to_epoch($r.created_at),
+              severity_id: $severity_id,
+              status_id: $status_id,
+              status: (if $status_id == 1 then "Success" else "Failure" end),
+              cloud: { provider: "Anthropic" },
+              metadata: {
+                product: { vendor_name: "Anthropic", name: "Claude Compliance API" },
+                version: "1.9.0",
+                uid: $r.id,
+                log_name: "compliance_activities"
+              },
+              message: ("Anthropic compliance activity: " + $t),
+              unmapped: ({
+                activity_type: $r.type,
+                organization_id: $r.organization_id,
+                organization_uuid: $r.organization_uuid,
+                actor_type: $a.type,
+                user_agent: $a.user_agent,
+                claude_chat_id: $r.claude_chat_id,
+                claude_project_id: $r.claude_project_id,
+                filename: $r.filename,
+                directory_id: $a.directory_id,
+                idp_connection_type: $a.idp_connection_type,
+                workos_event_id: $a.workos_event_id
+              } | with_entries(select(.value != null)))
+            }
+          | prune
+          | .osint = []

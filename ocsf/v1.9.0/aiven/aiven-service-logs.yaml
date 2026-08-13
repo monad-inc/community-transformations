@@ -1,0 +1,118 @@
+name: "Aiven Service Logs to OCSF v1.9.0"
+description: "Transforms Aiven managed-service journald log records (HOSTNAME, SYSTEMD_UNIT, MESSAGE, PRIORITY, timestamp) into the OCSF v1.9.0 Base Event class (class_uid 0), the schema's sanctioned home for otherwise-unclassified log events."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aiven-service-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aiven"
+  - "system"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Aiven Service Logs -> OCSF v1.9.0 Base Event (class_uid=0)
+          #
+          # Input: ONE Aiven service-log record per invocation, as delivered
+          # by Aiven's logging integrations (external OpenSearch / rsyslog /
+          # journalpump). These are systemd-journal entries emitted by any
+          # Aiven managed service (PostgreSQL, Kafka, OpenSearch, Redis, ...).
+          # Documented fields: HOSTNAME (service + node), SYSTEMD_UNIT,
+          # MESSAGE, timestamp; PRIORITY (syslog level 0-7) and SESSION_ID
+          # when journalpump forwards them.
+          #
+          # These are heterogeneous free-text log lines with no single event
+          # semantics, so they map to the OCSF Base Event, which is defined
+          # to "log events that are not otherwise defined by the schema".
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # A syslog priority may arrive as a string ("3") or an int (3).
+          def prio: ((.PRIORITY // "") | if type == "number" then tostring else . end);
+
+          # journald/syslog PRIORITY (0 emerg .. 7 debug) -> OCSF severity_id.
+          def severity_id:
+            { "0": 6, "1": 5, "2": 5, "3": 4, "4": 3, "5": 2, "6": 1, "7": 1 }[prio] // 0;
+          def severity_txt:
+            { "0": "Emergency", "1": "Alert", "2": "Critical", "3": "Error",
+              "4": "Warning", "5": "Notice", "6": "Informational", "7": "Debug" }[prio];
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          . as $r
+          # Aiven PostgreSQL log lines carry a "user=..,db=..,app=..,client=.."
+          # prefix; pull the acting user and client address when present.
+          | ( (.MESSAGE // "")
+              | capture("user=(?<user>[^,]*),db=(?<db>[^,]*),app=(?<app>[^,]*),client=(?<client>[^ ]*)")
+              ? // {} ) as $pg
+          | ( if ($pg.user // "") != "" then $pg.user else null end ) as $puser
+          | ( if is_ip($pg.client // "") then $pg.client else null end ) as $pclient
+
+          | {
+              "category_uid": 0,
+              "class_uid":    0,
+              "type_uid":     0,
+              "activity_id":  0,
+              "severity_id":  severity_id,
+              "severity":     severity_txt,
+
+              "time": to_epoch(.timestamp),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Aiven",
+                  "name": "Aiven Service Logs"
+                },
+                "log_name": .SYSTEMD_UNIT,
+                "logged_time": to_epoch(.timestamp),
+                "uid": .SESSION_ID
+              },
+
+              # Required on Base Event in this schema build (profile==null).
+              "cloud": { "provider": "Aiven" },
+              "osint": [],
+
+              "device": ( { "type_id": 0, "hostname": .HOSTNAME }
+                          | with_entries(select(.value != null)) ),
+
+              "actor": ( if $puser != null then { "user": { "name": $puser } } else null end ),
+
+              "message": .MESSAGE,
+
+              "observables": (
+                [ ( if .HOSTNAME != null
+                      then { "name": "device.hostname", "type_id": 1, "value": .HOSTNAME }
+                      else empty end ),
+                  ( if $puser != null
+                      then { "name": "actor.user.name", "type_id": 4, "value": $puser }
+                      else empty end ),
+                  ( if $pclient != null
+                      then { "name": "src_endpoint.ip", "type_id": 2, "value": $pclient }
+                      else empty end ) ]
+              ),
+
+              "unmapped": ( {
+                "systemd_unit": .SYSTEMD_UNIT,
+                "priority": .PRIORITY,
+                "session_id": .SESSION_ID,
+                "pg_database": ( if ($pg.db // "") != "" then $pg.db else null end ),
+                "pg_client": $pclient
+              } | with_entries(select(.value != null)) ),
+
+              "raw_data": (. | tostring)
+            }
+          | with_entries(select(.value != null))

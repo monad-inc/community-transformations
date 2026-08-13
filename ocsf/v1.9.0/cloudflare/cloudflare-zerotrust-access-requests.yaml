@@ -1,0 +1,100 @@
+name: "Cloudflare Zero Trust Access Requests to OCSF v1.9.0"
+description: "Transforms Cloudflare Zero Trust Access authentication (access_requests) logs into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zerotrust-access-requests"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002, category_uid=3) — v1.9.0
+          # Input: one Cloudflare Zero Trust Access access_requests record.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]+(\\.[0-9]+){3}$")) or ($s | test(":")));
+
+          . as $r
+          | (($r.action // "") | ascii_downcase) as $act
+          | (if ($act | startswith("logout") or startswith("logoff")) then 2
+             elif ($act | startswith("login") or startswith("logon")) then 1
+             else 99 end) as $activity_id
+          | (if $r.allowed == true then 1
+             elif $r.allowed == false then 2
+             else 0 end) as $status_id
+          | {
+              "category_uid": 3,
+              "class_uid":    3002,
+              "type_uid":     (3002 * 100 + $activity_id),
+              "activity_id":  $activity_id,
+              "severity_id":  1,
+              "status_id":    $status_id,
+
+              "time": to_epoch($r.created_at),
+
+              "metadata": {
+                "version": "1.9.0",
+                "uid": $r.ray_id,
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare Zero Trust Access"
+                }
+              },
+
+              "user": {
+                "type_id": 1,
+                "name": $r.user_email,
+                "email_addr": $r.user_email
+              },
+
+              "cloud": {
+                "provider": "Cloudflare"
+              },
+
+              "osint": [],
+
+              "auth_protocol": $r.connection,
+
+              "src_endpoint": (
+                if is_ip($r.ip_address)
+                then { "ip": $r.ip_address }
+                else null end
+              ),
+
+              "dst_endpoint": (
+                if ($r.app_domain // "") != ""
+                then { "domain": $r.app_domain }
+                else null end
+              ),
+
+              "message": (
+                ($r.user_email // "unknown") + " "
+                + (if $status_id == 1 then "allowed" elif $status_id == 2 then "denied" else "attempted" end)
+                + " access to " + ($r.app_domain // "application")
+              ),
+
+              "unmapped": (
+                { "app_uid": $r.app_uid, "connection": $r.connection }
+                | with_entries(select(.value != null and .value != ""))
+              ),
+
+              "raw_data": ($r | tostring)
+            }
+          # Drop only optional keys that came out null; required keys
+          # (including osint: []) are always emitted above.
+          | with_entries(select(.value != null))

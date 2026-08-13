@@ -1,0 +1,138 @@
+name: "AWS RDS Audit Logs to OCSF v1.9.0"
+description: "Transforms AWS RDS (MySQL / MariaDB) audit log records — the MariaDB Audit Plugin CSV line carried in the connector's message field — into the OCSF v1.9.0 Datastore Activity (6005) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-rds-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "application_activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Datastore Activity (class_uid=6005) — v1.9.0
+          # Input: one aws-rds-audit-logs record per invocation.
+          #
+          # The connector emits a small envelope
+          #   { engine, instance_id, log_file_name, message, region, source }
+          # where `message` is ONE raw MariaDB Audit Plugin CSV line:
+          #   ts,serverhost,username,host,connectionid,queryid,
+          #     operation,database,object,retcode
+          # The `object` field (query text / table) may itself contain commas
+          # and is single-quoted, so it is captured greedily up to the final
+          # comma (retcode is always last and never contains a comma).
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ( $r.message
+              | capture("^(?<ts>[^,]*),(?<serverhost>[^,]*),(?<username>[^,]*),(?<host>[^,]*),(?<connectionid>[^,]*),(?<queryid>[^,]*),(?<operation>[^,]*),(?<database>[^,]*),(?<object>.*),(?<retcode>[^,]*)$")
+            ) as $m
+
+          # Strip the single quotes MariaDB wraps around the object/query and
+          # un-double any escaped internal quotes.
+          | ( ($m.object // "")
+              | sub("^'"; "") | sub("'$"; "") | gsub("''"; "'") ) as $obj
+
+          | ( ($m.operation // "") | ascii_upcase ) as $op
+          | ( $m.retcode // "" ) as $ret
+          | ( $m.database // "" ) as $db
+
+          # MariaDB audit `operation` -> OCSF Datastore Activity activity_id.
+          | ( { "READ":1, "UPDATE":2, "CONNECT":3, "QUERY":4, "WRITE":5,
+                "CREATE":6, "ALTER":2, "RENAME":2, "DROP":7 }[$op] // 99 ) as $activity_id
+
+          | ( if $ret == "0" or $ret == "" then 1 else 2 end ) as $status_id
+
+          # A non-zero return code (e.g. FAILED_CONNECT) is Medium; routine
+          # audited activity is Informational.
+          | ( if $status_id == 2 then 3 else 1 end ) as $severity_id
+
+          | ( try ($m.ts | strptime("%Y%m%d %H:%M:%S") | mktime) catch null ) as $time
+
+          | {
+              category_uid: 6,
+              class_uid: 6005,
+              activity_id: $activity_id,
+              type_uid: (6005 * 100 + $activity_id),
+              severity_id: $severity_id,
+              status_id: $status_id,
+
+              time: $time,
+
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "Amazon RDS",
+                  feature: { name: "MariaDB Audit Plugin" }
+                },
+                log_name: $r.log_file_name
+              },
+
+              cloud: {
+                provider: "AWS",
+                region: $r.region
+              },
+
+              # The authenticated database user is the acting principal.
+              actor: {
+                user: { name: $m.username, type_id: 1 }
+              },
+
+              # The client that opened the DB connection.
+              src_endpoint: (
+                if ($m.host | test("^(\\d{1,3}\\.){3}\\d{1,3}$"))
+                then { ip: $m.host, hostname: $m.host }
+                else { hostname: $m.host } end
+              ),
+
+              # The datastore the activity targeted. uid (the RDS instance id)
+              # always satisfies the class/object at_least_one constraint even
+              # when the active database name is empty (e.g. on CONNECT).
+              database: {
+                type_id: 1,
+                type: "Relational",
+                uid: $r.instance_id,
+                name: (if $db == "" then null else $db end)
+              },
+
+              query_info: (
+                if $obj == "" then null
+                else { query_string: $obj, uid: (if $m.queryid == "" then null else $m.queryid end) }
+                end
+              ),
+
+              # activity_name carries the OCSF caption for a mapped activity,
+              # and the raw MariaDB operation for the unmapped (99) case.
+              activity_name: ( { "1":"Read","2":"Update","3":"Connect","4":"Query",
+                                 "5":"Write","6":"Create","7":"Delete" }[$activity_id|tostring] // $op ),
+              status: (if $status_id == 1 then "Success" else "Failure" end),
+              message: (if $obj == "" then $op else $obj end),
+
+              unmapped: {
+                engine: $r.engine,
+                operation: $op,
+                serverhost: $m.serverhost,
+                connectionid: $m.connectionid,
+                queryid: $m.queryid,
+                retcode: $ret
+              },
+
+              raw_data: ($r.message | tostring)
+            }
+
+          # Drop nulls / empty objects so optional slots vanish cleanly, then
+          # re-assert osint (a required-but-empty array the prune would strip).
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )
+          | .osint = []

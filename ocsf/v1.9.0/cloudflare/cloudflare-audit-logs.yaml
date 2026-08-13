@@ -1,0 +1,144 @@
+name: "Cloudflare Audit Logs to OCSF v1.9.0"
+description: "Transforms Cloudflare account Audit Log records into the OCSF v1.9.0 API Activity class (class_uid 6003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: ONE Cloudflare (classic) audit-log record per invocation
+          #   as emitted by the Monad `cloudflare-audit-logs` connector:
+          #   { id, action{type,result}, actor{id,email,ip,type}, interface,
+          #     metadata{...}, newValue, oldValue, owner{id},
+          #     resource{id,type}, when }
+          #
+          # A Cloudflare audit log is an administrative CRUD action taken on
+          # a Cloudflare resource through an interface (API / dashboard),
+          # which maps cleanly onto OCSF API Activity.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Recursively drop null / "" / {} / [] so the event stays compact.
+          # osint is re-attached AFTER the prune (it is a required attribute
+          # that legitimately carries an empty array here).
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.action // {}) as $act
+          | ($r.actor // {}) as $ac
+          | ($r.resource // {}) as $res
+          | ($act.type // "") as $atype
+
+          # ---- activity_id from the action verb --------------------------
+          | ( if   ($atype | test("(?i)(^|_)(create|add|new|provision|register|invoke)"))  then 1
+              elif ($atype | test("(?i)(^|_)(delete|remove|revoke|deregister|purge|disable)")) then 4
+              elif ($atype | test("(?i)(^|_)(view|read|get|list|download|export)"))         then 2
+              elif ($atype | test("(?i)(change|update|set|edit|modify|rotate|enable|patch)")) then 3
+              else 99 end ) as $activity_id
+
+          # action.result is a bool in the classic schema (true = success).
+          | ( ($act.result == true) or (($act.result | type) == "string" and ($act.result | ascii_downcase) == "true") ) as $ok
+
+          | ({
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $activity_id,
+              "type_uid":     (6003 * 100 + $activity_id),
+              "severity_id":  (if $ok then 1 else 3 end),
+              "status_id":    (if $ok then 1 else 2 end),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.when),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare Audit Logs"
+                },
+                "uid": $r.id,
+                "log_provider": "Cloudflare"
+              },
+
+              # --- Cloud (REQUIRED by API Activity; provider required) ---
+              "cloud": {
+                "provider": "Cloudflare"
+              },
+
+              # --- Actor (REQUIRED) ---
+              "actor": {
+                "user": {
+                  "uid": $ac.id,
+                  "name": ($ac.email // $ac.id),
+                  "email_addr": $ac.email,
+                  "type": ($ac.type // "Unknown")
+                }
+              },
+
+              # --- API (REQUIRED; operation required) ---
+              "api": {
+                "operation": (if $atype == "" then "unknown" else $atype end),
+                "service": { "name": ($r.metadata.type // $res.type) }
+              },
+
+              # --- Source endpoint (REQUIRED) ---
+              "src_endpoint": {
+                "ip": $ac.ip
+              },
+
+              # --- Recommended ---
+              "activity_name": (if $activity_id == 99 then $atype else null end),
+              "status": (if $ok then "Success" else "Failure" end),
+              "message": ("Cloudflare " + $atype + (if ($res.type // "") != "" then (" on " + $res.type) else "" end)),
+
+              "resources": [ {
+                "uid": $res.id,
+                "type": $res.type,
+                "name": ($r.metadata.name // $r.metadata.zone_name)
+              } ],
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "interface": $r.interface,
+                "owner_id": ($r.owner // {}).id,
+                "old_value": (if $r.oldValue != null then ($r.oldValue | tostring) else null end),
+                "new_value": (if $r.newValue != null then ($r.newValue | tostring) else null end),
+                "metadata": $r.metadata
+              },
+
+              "observables": ( [
+                (if ($ac.email // null) != null then {"name":"actor.user.email_addr","type":"Email Address","value":$ac.email} else null end),
+                (if ($ac.ip // null) != null then {"name":"src_endpoint.ip","type":"IP Address","value":$ac.ip} else null end)
+              ] | map(select(. != null)) ),
+
+              "raw_data": ($r | tostring)
+            } | prune)
+
+          # osint is a REQUIRED attribute of API Activity but has no source
+          # here; attach an empty array after the prune so it survives.
+          | . + { "osint": [] }

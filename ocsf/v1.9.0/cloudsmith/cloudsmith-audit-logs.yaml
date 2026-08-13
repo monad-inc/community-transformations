@@ -1,0 +1,139 @@
+name: "Cloudsmith Audit Logs to OCSF v1.9.0"
+description: "Transforms Cloudsmith Audit Log records into the OCSF v1.9.0 API Activity (6003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudsmith-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudsmith"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one Cloudsmith Audit Log record per invocation.
+          # Cloudsmith audit logs are a generic actor->verb->object->target
+          # CRUD activity stream (CloudTrail-shaped), so API Activity is the
+          # faithful class. activity_id is derived from the event verb suffix.
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.event // "") as $ev
+          | ($r.actor_kind // "") as $ak
+
+          # verb -> activity_id (Create/Read/Update/Delete/Other)
+          | (
+              if ($ev|endswith(".created")) or ($ev|contains(".create")) then 1
+              elif ($ev|endswith(".deleted")) or ($ev|contains(".delete")) or ($ev|contains(".revoked")) or ($ev|contains(".removed")) then 4
+              elif ($ev|endswith(".updated")) or ($ev|contains(".update")) or ($ev|contains(".changed")) or ($ev|contains(".refreshed")) or ($ev|contains(".rotated")) then 3
+              elif ($ev|contains(".read")) or ($ev|contains(".viewed")) or ($ev|contains(".downloaded")) or ($ev|contains(".login")) or ($ev|contains(".accessed")) then 2
+              else 99 end
+            ) as $activity
+
+          # actor_kind -> user.type_id (1 User, 3 System)
+          | (
+              if $ak == "user" then 1
+              elif $ak == "system" then 3
+              else 0 end
+            ) as $utype
+
+          | (
+              if ($r.event_at | type) == "number" then $r.event_at
+              elif $r.event_at == null then null
+              else ($r.event_at | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              end
+            ) as $time
+
+          | {
+              category_uid: 6,
+              class_uid: 6003,
+              type_uid: (6003 * 100 + $activity),
+              activity_id: $activity,
+              severity_id: 1,
+              status_id: 1,
+              status: "Success",
+
+              time: $time,
+
+              metadata: {
+                version: "1.9.0",
+                uid: $r.uuid,
+                original_time: ($r.event_at | tostring),
+                product: {
+                  vendor_name: "Cloudsmith",
+                  name: "Cloudsmith Audit Logs"
+                }
+              },
+
+              # base-required in 1.9.0 (no OSINT enrichment on an audit event)
+              osint: [],
+              cloud: { provider: "Cloudsmith" },
+
+              # who performed the action
+              actor: {
+                user: {
+                  name: $r.actor,
+                  uid: $r.actor_slug_perm,
+                  type_id: $utype
+                }
+              },
+
+              # the API/verb invoked
+              api: {
+                operation: $ev,
+                service: { name: ($r.context // null) }
+              },
+
+              # source of the request
+              src_endpoint: {
+                ip: $r.actor_ip_address,
+                location: (
+                  ($r.actor_location // {}) as $loc
+                  | {
+                      city: $loc.city,
+                      country: ($loc.country_code // $loc.country),
+                      continent: $loc.continent,
+                      postal_code: $loc.postal_code,
+                      coordinates: (
+                        if ($loc.latitude != null and $loc.longitude != null)
+                        then [$loc.longitude, $loc.latitude] else null end
+                      )
+                    }
+                )
+              },
+
+              message: ([$r.actor, $ev, "on", $r.object, "in", $r.target] | map(select(. != null)) | join(" ")),
+
+              observables: (
+                [
+                  (if $r.actor != null then {name:"actor.user.name", type_id:4, value:$r.actor} else empty end),
+                  (if $r.actor_ip_address != null then {name:"src_endpoint.ip", type_id:2, value:$r.actor_ip_address} else empty end)
+                ]
+              ),
+
+              unmapped: {
+                object_kind: $r.object_kind,
+                object_slug_perm: $r.object_slug_perm,
+                target: $r.target,
+                target_kind: $r.target_kind,
+                target_slug_perm: $r.target_slug_perm,
+                actor_url: $r.actor_url,
+                context: $r.context
+              },
+
+              raw_data: ($r | tostring)
+            }
+
+          # prune nulls/empty-strings only; keep osint:[] (base-required) intact
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != ""))
+              else . end
+            )

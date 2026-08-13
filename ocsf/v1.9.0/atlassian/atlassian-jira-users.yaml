@@ -1,0 +1,106 @@
+name: "Atlassian Jira Users to OCSF v1.9.0"
+description: "Transforms Atlassian Jira user directory records (from the atlassian-jira-users input) into the OCSF v1.9.0 User Inventory Info class (class_uid 5003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-users"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "atlassian"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
+          # Input: ONE Atlassian Jira Cloud user record per invocation, as
+          # returned by the Jira platform REST v3 users API (Get user /
+          # Get all users / User search). A Jira user record carries no
+          # timestamp of its own, so `time` is the collection time (now).
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.accountType // "") as $atype
+
+          # accountType -> OCSF user.type_id
+          #   atlassian/customer -> 1 (User); app -> 4 (Service); else 0
+          | ( if   $atype == "app"                      then 4
+              elif $atype == "atlassian" or $atype == "customer" then 1
+              else 0 end ) as $utype_id
+
+          | {
+              "category_uid": 5,
+              "class_uid":    5003,
+              "activity_id":  2,
+              "type_uid":     500302,
+              "severity_id":  1,
+
+              "time": (now | floor),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Atlassian",
+                  "name": "Jira"
+                }
+              },
+
+              "user": ( {
+                "name":        ($r.displayName // $r.emailAddress // $r.accountId),
+                "uid":         $r.accountId,
+                "type_id":     $utype_id,
+                "type":        $atype,
+                "full_name":   $r.displayName,
+                "display_name": $r.displayName,
+                "email_addr":  $r.emailAddress,
+                "domain":      ( if ($r.emailAddress // "") | contains("@")
+                                 then ($r.emailAddress | split("@") | last) else null end ),
+                "groups": ( ($r.groups.items // [])
+                            | map( { "name": .name, "uid": .groupId }
+                                   | with_entries(select(.value != null)) )
+                            | if length > 0 then . else null end ),
+                "account": ( {
+                  "name":    $r.displayName,
+                  "uid":     $r.accountId,
+                  "type_id": 99,
+                  "type":    "Atlassian account",
+                  "is_disabled": ( if ($r.active|type) == "boolean" then ($r.active | not) else null end )
+                } | with_entries(select(.value != null)) )
+              } | with_entries(select(.value != null)) ),
+
+              # OSINT is required on 5003; anchor it on the strongest
+              # identifier available for the user (email, else account id).
+              "osint": [ (
+                if ($r.emailAddress // "") != ""
+                then { "value": $r.emailAddress, "type_id": 9 }
+                else { "value": $r.accountId,    "type_id": 99 }
+                end
+              ) ],
+
+              "cloud": { "provider": "Atlassian" },
+
+              "status_id": ( if $r.active == true then 1 elif $r.active == false then 2 else 0 end ),
+              "status":    ( if $r.active == true then "Active" elif $r.active == false then "Inactive" else null end ),
+
+              "observables": ( [
+                { "name": "user.uid", "type_id": 30, "value": $r.accountId },
+                ( if ($r.emailAddress // "") != ""
+                  then { "name": "user.email_addr", "type_id": 5, "value": $r.emailAddress }
+                  else empty end )
+              ] ),
+
+              "unmapped": ( {
+                "self":       $r.self,
+                "timeZone":   $r.timeZone,
+                "locale":     $r.locale,
+                "applicationRoles": ( ($r.applicationRoles.items // []) | map(.key) | if length>0 then . else null end )
+              } | with_entries(select(.value != null)) ),
+
+              "raw_data": ($r | tostring)
+            }
+          | with_entries(select(.value != null))

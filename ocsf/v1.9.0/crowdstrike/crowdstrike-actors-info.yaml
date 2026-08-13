@@ -1,0 +1,104 @@
+name: "CrowdStrike Actors Info to OCSF v1.9.0"
+description: "Transforms CrowdStrike Falcon Intelligence Actors (adversary/threat-actor profiles) into the OCSF v1.9.0 OSINT Inventory Info class (class_uid 5021), carrying the actor profile in the osint object with a nested threat_actor."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-actors-info"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "crowdstrike"
+  - "discovery"
+  - "osint"
+  - "threat-intel"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF OSINT Inventory Info (class_uid=5021) — v1.9.0
+          # Input: one CrowdStrike Falcon Intelligence Actor document per
+          # invocation (GET /intel/entities/actors/v1). This is proactively
+          # collected threat intelligence, so activity_id=2 (Collect).
+          # The adversary profile is carried in the required `osint` object
+          # (type_id 99 / Other — a threat-actor is not one of the listed
+          # indicator types) with a nested `threat_actor`.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # CrowdStrike actor_type -> OCSF threat_actor.type_id
+          def actor_type_id($t):
+            ($t // "" | ascii_downcase) as $l
+            | if   ($l | contains("targeted")) or ($l | contains("state")) or ($l | contains("nation")) then 1
+              elif ($l | contains("ecrime")) or ($l | contains("criminal")) then 2
+              elif ($l | contains("hacktivis")) then 3
+              elif ($l | contains("insider")) then 4
+              elif $l == "" then 0
+              else 99 end;
+
+          . as $r
+          | (to_epoch(.last_modified_date) // to_epoch(.created_date) // to_epoch(.last_activity_date)) as $t
+          | {
+              category_uid: 5,
+              class_uid:    5021,
+              type_uid:     502102,
+              activity_id:  2,
+              severity_id:  1,
+              time:         $t,
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "CrowdStrike",
+                  name: "Falcon Intelligence"
+                }
+              },
+              # The class requires a cloud object; the OSINT was collected
+              # from CrowdStrike's cloud-delivered intelligence platform.
+              cloud: {
+                provider: "CrowdStrike Falcon Intelligence"
+              },
+              osint: ({
+                type_id: 99,
+                type: "Threat Actor",
+                value: (.name // .slug // (.id | tostring)),
+                name: .name,
+                uid: (if .id != null then (.id | tostring) else null end),
+                desc: (.short_description // .description),
+                src_url: .url,
+                vendor_name: "CrowdStrike",
+                created_time: to_epoch(.created_date),
+                modified_time: to_epoch(.last_modified_date),
+                labels: (
+                  [ (.motivations // [])[].value,
+                    (.origins // [])[].value ]
+                  | map(select(. != null and . != ""))
+                ),
+                threat_actor: ({
+                  name: (.name // .slug // "Unknown"),
+                  type: .actor_type,
+                  type_id: actor_type_id(.actor_type)
+                } | with_entries(select(.value != null and .value != "")))
+              }
+              | if (.labels | length) == 0 then del(.labels) else . end
+              | with_entries(select(.value != null and .value != ""))),
+              status_id: 1,
+              message: (.short_description // .description),
+              observables: (
+                [ (if ($r.name // "") != ""
+                   then {name: "osint.value", type_id: 10, value: $r.name}
+                   else empty end),
+                  (if ($r.url // "") != ""
+                   then {name: "osint.src_url", type_id: 6, value: $r.url}
+                   else empty end) ]
+              ),
+              raw_data: (. | tostring)
+            }
+          | if (.observables | length) == 0 then del(.observables) else . end

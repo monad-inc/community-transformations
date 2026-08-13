@@ -1,0 +1,116 @@
+name: "Atlassian Jira Project Roles to OCSF v1.9.0"
+description: "Transforms Atlassian Jira project-role membership records (atlassian-jira-roles) into the OCSF v1.9.0 Role Management (3008) class."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-roles"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "atlassian"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Role Management (class_uid=3008, category_uid=3) — v1.9.0
+          # Input: one Jira ProjectRole record (atlassian-jira-roles) per
+          # invocation: a project role plus its actor membership list.
+          #
+          # A roles pull is a periodic STATE snapshot, not a lifecycle
+          # mutation, so activity_id=99 (Other) / activity_name="Snapshot",
+          # type_uid = 3008*100 + 99 = 300899.
+          #
+          # Note: the bundled v1.9.0 schema marks `osint` and `cloud`
+          # base-required (profile:null); in published OCSF v1.9.0 they are
+          # gated behind the osint/cloud profiles. Both are emitted so the
+          # version-pinned validator passes — `cloud` is legitimate
+          # (Jira is Atlassian Cloud); `osint` is a minimal required stub.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+          def s($v): if $v == null then null else ($v | tostring) end;
+
+          . as $r
+          | ($r.actors // []) as $actors
+          | ($r.scope.project // {}) as $proj
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 3,
+              "class_uid":    3008,
+              "type_uid":     300899,
+              "activity_id":  99,
+              "activity_name": "Snapshot",
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) — stateless resource: connector
+              # collection time if present, else evaluation time. ---
+              "time": (to_epoch($r.collected_at) // (now | floor)),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Atlassian",
+                  "name": "Jira",
+                  "feature": { "name": "Project Roles" }
+                }
+              },
+
+              # --- IAM Role (REQUIRED) — the Jira project role itself ---
+              "iam_role": {
+                "name": $r.name,
+                "uid":  s($r.id)
+              },
+
+              # --- cloud (schema-required in the bundle; legitimate) ---
+              "cloud": { "provider": "Atlassian" },
+
+              # --- osint (schema-required in the bundle; minimal stub) ---
+              "osint": [ { "type_id": 99, "value": s($r.id) } ],
+
+              # --- Recommended ---
+              "status_id": 1,
+              "status": "Success",
+              "message": ("Project role '\($r.name // "unknown")' membership snapshot for project \($proj.key // $proj.id // "unknown")"),
+
+              # Project the role is scoped to, as a resource.
+              "resources": [
+                {
+                  "name": $proj.name,
+                  "uid":  s($proj.id),
+                  "type": "Jira Project",
+                  "labels": ( [ $proj.key ] | map(select(. != null)) )
+                }
+              ],
+
+              # --- Membership + fields with no clean OCSF home ---
+              "unmapped": {
+                "actors": $actors,
+                "scope": $r.scope,
+                "admin": $r.admin,
+                "default": $r["default"],
+                "roleConfigurable": $r.roleConfigurable,
+                "description": $r.description,
+                "self": $r.self
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Single prune: drop nulls / empty containers; required objects
+          # carry content and survive.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

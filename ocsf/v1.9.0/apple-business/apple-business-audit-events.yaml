@@ -1,0 +1,144 @@
+name: "Apple Business Manager Audit Events to OCSF v1.9.0"
+description: "Transforms Apple Business Manager audit events (device, account, configuration, subscription, domain, and API-key changes) into the OCSF v1.9.0 Entity Management (3004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "apple-business-audit-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "apple-business"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Entity Management (class_uid=3004, category_uid=3) — v1.9.0
+          # Input: one Apple Business Manager auditEvents resource object.
+          # Apple audit events carry NO source IP; there is no src_endpoint.
+          # ---------------------------------------------------------------
+          def has_sub($t; $s): ($t | ascii_upcase | index($s)) != null;
+          def to_epoch($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then $ts
+              else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($a.type // "") as $t
+          | ($a.eventDataPropertyKey // "") as $edk
+
+          # Activity from the ABM verb.
+          | (
+              if   has_sub($t;"CREATED") or has_sub($t;"ADDED") or has_sub($t;"ASSOCIATED") or has_sub($t;"GENERATED") then 1
+              elif has_sub($t;"DELETED") or has_sub($t;"REMOVED") or has_sub($t;"DISASSOCIATED") or has_sub($t;"REVOKED") then 4
+              elif has_sub($t;"UPDATED") or has_sub($t;"CHANGED") then 3
+              else 99 end
+            ) as $activity
+
+          # Managed-entity type from the subject type.
+          | ($a.subjectType // "" | ascii_upcase) as $st
+          | (
+              if   $st == "DEVICE" then 1
+              elif $st == "USER" or $st == "ACCOUNT" or $st == "API_ACCOUNT" then 2
+              elif $st == "GROUP" then 3
+              elif $st == "ORGANIZATION" or $st == "ORG" then 4
+              elif $st == "" then 0
+              else 99 end
+            ) as $ent_type_id
+
+          | ($a.eventDataDeviceAddedToOrg // $a.eventDataDeviceRemovedFromOrg
+             // $a.eventDataDeviceAssignedToServer // $a.eventDataDeviceUnassignedFromServer
+             // $a.eventDataDeviceIsErased // {}) as $devdata
+
+          | {
+              "category_uid": 3,
+              "class_uid":    3004,
+              "activity_id":  $activity,
+              "type_uid":     (3004 * 100 + $activity),
+              "activity_name": (if $t == "" then null else $t end),
+              "severity_id":  1,
+
+              "time": to_epoch($a.eventDateTime),
+
+              "status": $a.outcome,
+              "status_id": (
+                if   ($a.outcome // "" | ascii_upcase) == "SUCCESS" then 1
+                elif ($a.outcome // "" | ascii_upcase) == "FAILURE" then 2
+                else 0 end),
+
+              "metadata": {
+                "version": "1.9.0",
+                "uid": $r.id,
+                "event_code": ($t | if . == "" then null else . end),
+                "original_time": $a.eventDateTime,
+                "product": {
+                  "vendor_name": "Apple",
+                  "name": "Apple Business Manager"
+                }
+              },
+
+              # Required by the class in 1.9.0.
+              "osint": [],
+              "cloud": { "provider": "Apple Business Manager" },
+
+              # The managed entity that the action targeted (REQUIRED).
+              "entity": ({
+                "name": $a.subjectName,
+                "uid":  $a.subjectId,
+                "type": $a.subjectType,
+                "type_id": $ent_type_id,
+                "device": (
+                  if $ent_type_id == 1 then {
+                    "type_id": 0,
+                    "uid": ($devdata.serialNumber // $a.subjectId),
+                    "name": $a.subjectName,
+                    "hostname": $a.subjectName,
+                    "serial_number": $devdata.serialNumber
+                  } else null end),
+                "user": (
+                  if $ent_type_id == 2 then {
+                    "name": $a.subjectName,
+                    "uid":  $a.subjectId
+                  } else null end)
+              }),
+
+              # Who performed the action.
+              "actor": {
+                "user": {
+                  "name": $a.actorName,
+                  "uid":  $a.actorId,
+                  "type_id": (if ($a.actorType // "" | ascii_upcase) == "USER" then 1 else 0 end),
+                  "type": $a.actorType
+                }
+              },
+
+              # Top-level device for device-inventory events (recommended).
+              "device": (
+                if $ent_type_id == 1 then {
+                  "type_id": 0,
+                  "uid": ($devdata.serialNumber // $a.subjectId),
+                  "name": $a.subjectName,
+                  "hostname": $a.subjectName
+                } else null end),
+
+              "message": (($a.actorName // "actor") + " " + $t + " (" + ($a.outcome // "") + ")"),
+
+              "unmapped": {
+                "category": $a.category,
+                "groupId": $a.groupId,
+                "actorType": $a.actorType,
+                "subjectType": $a.subjectType,
+                "eventDataPropertyKey": ($edk | if . == "" then null else . end),
+                "eventData": ($a[$edk] // null)
+              },
+
+              "raw_data": ($r | tostring)
+            }
+
+          # Drop null / "" keys; keep required empty arrays (osint) and objects.
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "")) else . end)
