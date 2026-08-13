@@ -1,0 +1,98 @@
+name: "GitHub Copilot Logs to ECS v9.5.0"
+description: "Maps GitHub Copilot activity records (from GitHub Enterprise audit logs) into Elastic Common Schema (ECS) v9.5.0, populating event categorization, user, source, organization, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-copilot-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "github"
+  - "copilot"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # GitHub audit logs -> ECS v9.5.0 (nested document).
+          # event.kind=event; category/type derived from operation_type;
+          # one jq pass, bind-once, is_ip guard, related.* union, single
+          # end-of-pipeline walk prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | def is_ip($s): ($s | type) == "string"
+              and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$|:"));
+
+          # operation_type -> valid ECS (category, type) pairing.
+          ( if   $r.operation_type == "create"         then { c: ["iam"],           t: ["creation","user"] }
+              elif $r.operation_type == "modify"         then { c: ["iam"],           t: ["change"] }
+              elif $r.operation_type == "remove"         then { c: ["iam"],           t: ["deletion"] }
+              elif $r.operation_type == "access"         then { c: ["configuration"], t: ["access"] }
+              elif $r.operation_type == "authentication" then { c: ["authentication"],t: ["info"] }
+              elif $r.operation_type == "transfer"       then { c: ["iam"],           t: ["change"] }
+              else { c: ["configuration"], t: ["info"] } end ) as $cat
+
+          | ($r.created_at // $r["@timestamp"]) as $ts
+          | (if ($ts | type) == "number"
+             then ($ts | (. / 1000) | strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+             else $ts end) as $iso
+
+          | {
+              "@timestamp": $iso,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": $cat.c,
+                "type": $cat.t,
+                "outcome": "success",
+                "action": $r.action,
+                "id": $r._document_id,
+                "provider": "github-audit-log",
+                "module": "github"
+              },
+
+              "user": {
+                "name": $r.actor,
+                "id": (if $r.actor_id != null then ($r.actor_id | tostring) else null end),
+                "target": {
+                  "name": $r.user,
+                  "id": (if $r.user_id != null then ($r.user_id | tostring) else null end)
+                }
+              },
+
+              "source": {
+                "ip": (if is_ip($r.actor_ip) then $r.actor_ip else null end),
+                "geo": { "country_iso_code": $r.actor_location.country_code }
+              },
+
+              "user_agent": { "original": $r.user_agent },
+
+              "organization": {
+                "name": $r.org,
+                "id": (if $r.org_id != null then ($r.org_id | tostring) else null end)
+              },
+
+              "group": { "name": $r.team },
+
+              "related": {
+                "user": ([$r.actor, $r.user] | map(select(. != null)) | unique),
+                "ip": ([ (if is_ip($r.actor_ip) then $r.actor_ip else null end) ]
+                       | map(select(. != null)) | unique)
+              },
+
+              "github": {
+                "org": $r.org,
+                "repository": ($r.repo // $r.repository),
+                "team": $r.team,
+                "business": $r.business,
+                "operation_type": $r.operation_type
+              }
+            }
+
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null)) else . end )
