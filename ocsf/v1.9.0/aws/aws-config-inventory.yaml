@@ -79,7 +79,7 @@ config:
               message: ( "AWS Config inventory: " + ($r.resourceType // "resource") + " " + ($r.resourceId // "") ),
 
               metadata: {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "host"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "AWS",
@@ -92,11 +92,11 @@ config:
 
               # The class requires an osint object; the resource ARN is the
               # stable indicator for the inventoried asset.
-              osint: {
+              osint: [{
                 value: ( $r.arn // $r.resourceId // "unknown" ),
                 type_id: 99,
                 type: "AWS Resource ARN"
-              },
+              }],
 
               cloud: {
                 provider: "aws",

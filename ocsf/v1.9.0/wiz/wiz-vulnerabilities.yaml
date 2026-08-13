@@ -37,6 +37,15 @@ config:
             elif $s == "INFORMATIONAL" or $s == "Informational" then 1
             else 0 end;
 
+          # impact_id uses the Finding impact scale (Critical=4, no 5-value).
+          def impact($s):
+            if   $s == "CRITICAL"      or $s == "Critical"      then 4
+            elif $s == "HIGH"          or $s == "High"          then 3
+            elif $s == "MEDIUM"        or $s == "Medium"        then 2
+            elif $s == "LOW"           or $s == "Low"           then 1
+            elif $s == "INFORMATIONAL" or $s == "Informational" then 1
+            else 0 end;
+
           . as $r
           | ($r.vulnerableAsset // {}) as $a
           | ($r.name // $r.Name) as $cve_id
@@ -153,11 +162,11 @@ config:
 
               # --- confidence / impact ---
               "confidence_id": 3,
-              "impact_id": (sev($vsev)),
+              "impact_id": (impact($vsev)),
 
               # --- metadata (REQUIRED; requires product + version) ---
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "incident"],
                 "uid": ($r.id // $r.ID),
                 "version": "1.9.0",
                 "product": {
@@ -186,8 +195,8 @@ config:
                     "value": ($a.id // $r.AssetID)
                   } else empty end),
                   (if ($cve_id | type) == "string" and ($cve_id | startswith("CVE-")) then {
-                    "name": "cve.uid",
-                    "type": "CVE ID",
+                    "name": "vulnerabilities.cve.uid",
+                    "type": "Resource UID",
                     "type_id": 10,
                     "value": $cve_id
                   } else empty end)

@@ -38,6 +38,8 @@ config:
              elif ($t | endswith("_ENABLED")) then 4
              elif ($t | endswith("_DISABLED")) then 5
              else 99 end) as $activity_id
+          | ({ "1": "Create", "2": "Update", "3": "Delete", "4": "Enable",
+               "5": "Disable", "99": "Other" }[$activity_id | tostring]) as $activity_name
 
           | {
               # --- Classification (REQUIRED) ---
@@ -45,7 +47,7 @@ config:
               "class_uid":    3007,
               "activity_id":  $activity_id,
               "type_uid":     (3007 * 100 + $activity_id),
-              "activity_name": $t,
+              "activity_name": $activity_name,
               "severity_id":  1,
 
               # --- Time (REQUIRED) ---
@@ -91,9 +93,9 @@ config:
               }),
 
               # --- Source endpoint from the request context (recommended) ---
+              # network_endpoint has no user_agent; keep the UA in unmapped.
               "src_endpoint": ({
-                "ip":         ($r.context.request_ip // null),
-                "user_agent": ($r.context.request_user_agent // null)
+                "ip":         ($r.context.request_ip // null)
               } | with_entries(select(.value != null))),
 
               # --- Outcome: Buildkite records completed actions (recommended) ---
@@ -105,6 +107,7 @@ config:
               "unmapped": ({
                 "graphql_id": $r.graphql_id,
                 "url":        $r.url,
+                "user_agent": ($r.context.request_user_agent // null),
                 "data":       $r.data
               } | with_entries(select(.value != null))),
 

@@ -75,7 +75,7 @@ config:
               },
               user: $user,
               # 5003 base-requires osint + cloud; populate minimally & correctly
-              osint: { value: ($r.email // $r.id // "unknown"), type_id: 8 },
+              osint: [ { value: ($r.email // $r.id // "unknown"), type_id: 8 } ],
               cloud: {
                 provider: "Anthropic",
                 org: (if ($r.organization_uuid // "") != ""

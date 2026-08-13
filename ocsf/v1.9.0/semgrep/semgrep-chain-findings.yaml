@@ -38,6 +38,8 @@ config:
              elif $sev == "low"      then 2
              else 1 end) as $sev_id
           | ($r.rule.cwe_names[0] // null) as $cwe0
+          | (($r.rule.vulnerability_identifier // "") | startswith("CVE-")) as $has_cve
+          | ({ "5": "Critical", "4": "High", "3": "Medium", "2": "Low", "1": "Informational" }[$sev_id | tostring] // "Unknown") as $sev_caption
           | ($r.found_dependency // {}) as $dep
           | (if ($dep.package // null) != null
              then ($dep.package + (if ($dep.version // null) != null then "@" + $dep.version else "" end))
@@ -48,15 +50,15 @@ config:
               "activity_id": 1,
               "type_uid": 200201,
               "severity_id": $sev_id,
-              "severity": ($r.severity // "Unknown"),
+              "severity": $sev_caption,
 
               "time": to_epoch($r.created_at),
               "start_time": to_epoch($r.relevant_since),
 
-              "status": ($r.status // $r.state),
               "status_id": (if ($r.status // $r.state) == "open" or ($r.status // $r.state) == "unresolved" then 1
                             elif ($r.status // $r.state) == "resolved" or ($r.status // $r.state) == "fixed" then 4
                             else 0 end),
+              "status": (if ($r.status // $r.state) == "resolved" or ($r.status // $r.state) == "fixed" then "Resolved" else "New" end),
               "message": $r.rule_message,
 
               "observables": [
@@ -104,10 +106,13 @@ config:
                   "is_fix_available": (($r.fix_recommendations // []) | length > 0),
                   "first_seen_time": to_epoch($r.relevant_since),
                   "last_seen_time": to_epoch($r.created_at),
-                  "cve": (if ($r.rule.vulnerability_identifier // "" | startswith("CVE-"))
+                  # vulnerability carries a just_one [advisory, cve, cwe]
+                  # constraint — emit exactly one. Prefer the CVE (more
+                  # actionable); fall back to the CWE only when no CVE exists.
+                  "cve": (if $has_cve
                           then { "uid": $r.rule.vulnerability_identifier }
                           else null end),
-                  "cwe": (if $cwe0 != null
+                  "cwe": (if ($has_cve | not) and $cwe0 != null
                           then {
                             "uid": ($cwe0 | split(":")[0]),
                             "caption": ($cwe0 | split(": ")[1:] | join(": ")),

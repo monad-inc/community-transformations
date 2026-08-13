@@ -31,7 +31,6 @@ config:
               "status_id": (
                 { "open": 1, "snoozed": 2, "ignored": 3, "closed": 4 }[$st] // 0
               ),
-              "status": ($r.status // null),
               "message": ($r.rule // null),
               "finding_info": {
                 "uid": ($r.id | tostring),
@@ -69,21 +68,21 @@ config:
                       "uid": $r.cve_id,
                       "cvss": (
                         if $r.original_cvss_severity_score != null
-                        then [ { "base_score": (($r.original_cvss_severity_score / 10)) } ]
+                        then [ { "version": "3.1", "base_score": (($r.original_cvss_severity_score / 10)) } ]
                         else null end
                       )
                     }
                     else null end
                   ),
                   "cwe": (
-                    if ($r.cwe_classes // []) | length > 0
+                    if $r.cve_id == null and (($r.cwe_classes // []) | length > 0)
                     then { "uid": ($r.cwe_classes[0]) }
                     else null end
                   ),
                   "affected_code": (
                     if $r.affected_file != null
                     then [ {
-                      "file": { "path": $r.affected_file, "name": ($r.affected_file | split("/") | last) },
+                      "file": { "path": $r.affected_file, "name": ($r.affected_file | split("/") | last), "type_id": 1 },
                       "start_line": ($r.start_line // null),
                       "end_line": ($r.end_line // null)
                     } ]

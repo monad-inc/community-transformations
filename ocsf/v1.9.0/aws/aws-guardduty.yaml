@@ -99,15 +99,6 @@ config:
               "status_id": (if ($svc.archived == true) then 4 else 1 end),
               "is_alert": true,
               "confidence_id": 0,
-              "action_id": (if ((($act.networkConnectionAction // {}).blocked) == true) then 2 else 1 end),
-              "disposition_id": (if ((($act.networkConnectionAction // {}).blocked) == true) then 3 else 1 end),
-              "priority_id": (
-                (if $r.severity == null then 0
-                 elif $r.severity < 4 then 1
-                 elif $r.severity < 7 then 2
-                 elif $r.severity < 9 then 3
-                 else 4 end)
-              ),
               "count": $svc.count,
               "message": $r.description,
               "observables": (
@@ -127,6 +118,15 @@ config:
 
               # --- Fields with no clean OCSF home ---
               "unmapped": {
+                "action": (if ((($act.networkConnectionAction // {}).blocked) == true) then "Denied" else "Allowed" end),
+                "disposition": (if ((($act.networkConnectionAction // {}).blocked) == true) then "Blocked" else "Allowed" end),
+                "priority": (
+                  if $r.severity == null then "Unknown"
+                  elif $r.severity < 4 then "Low"
+                  elif $r.severity < 7 then "Medium"
+                  elif $r.severity < 9 then "High"
+                  else "Critical" end
+                ),
                 "actionType": ($act.actionType),
                 "connectionDirection": (($act.networkConnectionAction // {}).connectionDirection),
                 "protocol": (($act.networkConnectionAction // {}).protocol),

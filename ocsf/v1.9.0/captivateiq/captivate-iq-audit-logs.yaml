@@ -69,25 +69,24 @@ config:
                 "data":    ($r.data // null)
               } | with_entries(select(.value != null)) ),
 
-              # Who performed it. invoked_by carries the logged-in principal
-              # when it differs from the effective user (impersonation).
+              # Who performed it. The logged-in principal (impersonation case)
+              # is retained under unmapped; actor.invoked_by is deprecated in
+              # OCSF 1.9.0.
               "actor": {
                 "user": ( {
                   "uid":        $r.user_id,
                   "name":       $r.user_name,
                   "email_addr": $r.user_email
-                } | with_entries(select(.value != null)) ),
-                "invoked_by": ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id)
-                                then $r.logged_in_user_email else null end )
+                } | with_entries(select(.value != null)) )
               },
 
               "src_endpoint": ( { "ip": $ip } | with_entries(select(.value != null)) ),
 
               # osint + cloud are class-required in OCSF 1.9.0. Represent the
               # source IP as an observable indicator; cloud = the SaaS provider.
-              "osint": ( if $ip != null then { "type_id": 1, "value": $ip }
-                         elif $email != null then { "type_id": 8, "value": $email }
-                         else { "type_id": 99, "value": ($r.object_id // "unknown") } end ),
+              "osint": ( if $ip != null then [{ "type_id": 1, "value": $ip }]
+                         elif $email != null then [{ "type_id": 8, "value": $email }]
+                         else [{ "type_id": 99, "value": ($r.object_id // "unknown") }] end ),
               "cloud": { "provider": "CaptivateIQ" },
 
               "status_id": 1,
@@ -99,6 +98,10 @@ config:
                 "object":              $r.object,
                 "organization_name":   $r.organization_name,
                 "logged_in_user_name": $r.logged_in_user_name,
+                "logged_in_user_id":   ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id)
+                                         then $r.logged_in_user_id else null end ),
+                "logged_in_user_email": ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id)
+                                          then $r.logged_in_user_email else null end ),
                 "parent_objects":      $r.parent_objects
               } | with_entries(select(.value != null)) ),
 

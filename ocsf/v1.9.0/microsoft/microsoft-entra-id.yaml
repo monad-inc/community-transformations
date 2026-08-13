@@ -65,8 +65,10 @@ config:
 
               # --- Auth details ---
               is_mfa: $mfa,
-              auth_protocol_id: ( if $mfa then 1 else 0 end ),
-              auth_protocol: ( if $mfa then "Other / MFA" else "Unknown" end ),
+              # Entra sign-in logs don't report the underlying auth protocol
+              # (NTLM/Kerberos/etc.); the MFA requirement is carried by is_mfa.
+              auth_protocol_id: 0,
+              auth_protocol: "Unknown",
               logon_type: ($r.clientAppUsed),
 
               # --- User (REQUIRED) ---
@@ -92,11 +94,8 @@ config:
                   city: ($loc.city),
                   region: ($loc.state),
                   country: ($loc.countryOrRegion),
-                  coordinates: (
-                    if ($loc.geoCoordinates.longitude != null and $loc.geoCoordinates.latitude != null)
-                    then [ $loc.geoCoordinates.longitude, $loc.geoCoordinates.latitude ]
-                    else null end
-                  )
+                  lat: ($loc.geoCoordinates.latitude),
+                  long: ($loc.geoCoordinates.longitude)
                 }
               },
 
@@ -105,7 +104,23 @@ config:
                 type_id: 0,
                 uid: ($dd.deviceId),
                 name: ($dd.displayName),
-                os: { name: ($dd.operatingSystem) },
+                os: (
+                  if ($dd.operatingSystem // "") != ""
+                  then {
+                    name: $dd.operatingSystem,
+                    type_id: (
+                      ($dd.operatingSystem | ascii_downcase) as $os
+                      | if   ($os | test("windows")) then 100
+                        elif ($os | test("ipados")) then 302
+                        elif ($os | test("ios")) then 301
+                        elif ($os | test("mac")) then 300
+                        elif ($os | test("android")) then 201
+                        elif ($os | test("linux")) then 200
+                        else 0 end
+                    )
+                  }
+                  else null end
+                ),
                 is_compliant: ($dd.isCompliant),
                 is_managed: ($dd.isManaged)
               },
@@ -137,7 +152,7 @@ config:
 
               # --- Metadata (REQUIRED) ---
               metadata: {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "host", "security_control"],
                 version: "1.9.0",
                 uid: ($r.id),
                 correlation_uid: ($r.correlationId),

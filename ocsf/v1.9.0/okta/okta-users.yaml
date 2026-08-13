@@ -74,22 +74,17 @@ config:
               "type_id":     1,
               "type":        "User",
               "phone_number": $p.mobilePhone,
-              "employee_uid": $p.employeeNumber,
+              "uid_alt":      $p.employeeNumber,
               "org": {
                 "name":        $p.organization,
                 "ou_name":     $p.department
               },
               "account": {
-                "uid":        $r.id,
-                "name":       ($p.login // $p.email),
-                "type_id":    99,
-                "type":       "Okta",
-                "is_enabled": ($st == "ACTIVE")
-              },
-              "location": {
-                "city":         $p.city,
-                "region":       $p.state,
-                "country":      $p.countryCode
+                "uid":         $r.id,
+                "name":        ($p.login // $p.email),
+                "type_id":     99,
+                "type":        "Okta",
+                "is_disabled": ($st != "ACTIVE")
               }
             },
 
@@ -115,7 +110,10 @@ config:
               "title":           $p.title,
               "manager":         $p.manager,
               "userType":        $p.userType,
-              "credentialProvider": ($r.credentials.provider.type // null)
+              "credentialProvider": ($r.credentials.provider.type // null),
+              "city":            $p.city,
+              "state":           $p.state,
+              "countryCode":     $p.countryCode
             },
 
             # --- Original record ---

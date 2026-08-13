@@ -40,7 +40,6 @@ config:
               ),
               "status": $a.status,
               "status_id": ({ "open": 1, "resolved": 4, "ignored": 3 }[$a.status] // 99),
-              "is_alert": true,
               "message": ($a.title // ""),
               "time": (to_epoch($a.updated_at) // to_epoch($a.created_at) // 0),
               "cloud": {
@@ -72,10 +71,10 @@ config:
                   "title": $a.title,
                   "desc": $a.description,
                   "severity": $a.effective_severity_level,
-                  "is_fixable": ($a.coordinates[0].is_fixable_snyk // null),
+                  "is_fix_available": ($a.coordinates[0].is_fixable_snyk // null),
                   "references": [ $a.problems[]?.url ],
                   "cve": (
-                    ( $a.problems[]? | select(.source == "NVD") | .id ) as $cve
+                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
                     | if $cve != null then {
                         "uid": $cve,
                         "cvss": [ $a.severities[]? | select(.score != null) | {
@@ -85,9 +84,12 @@ config:
                         } ]
                       } else null end
                   ),
+                  # vulnerability carries a just_one(advisory, cve, cwe) constraint;
+                  # prefer the CVE and only emit the CWE when no CVE is present.
                   "cwe": (
-                    ( $a.classes[]? | select(.source == "CWE") | .id ) as $cwe
-                    | if $cwe != null then { "uid": $cwe } else null end
+                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
+                    | ( [ $a.classes[]?  | select(.source == "CWE") | .id ][0] ) as $cwe
+                    | if ($cve == null and $cwe != null) then { "uid": $cwe } else null end
                   ),
                   "affected_packages": [
                     $a.coordinates[]?.representations[]?.dependency

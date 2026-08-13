@@ -44,9 +44,11 @@ config:
           # journald/syslog PRIORITY (0 emerg .. 7 debug) -> OCSF severity_id.
           def severity_id:
             { "0": 6, "1": 5, "2": 5, "3": 4, "4": 3, "5": 2, "6": 1, "7": 1 }[prio] // 0;
+          # OCSF severity caption keyed off the resolved severity_id so the
+          # enum sibling matches the schema's caption for that id.
           def severity_txt:
-            { "0": "Emergency", "1": "Alert", "2": "Critical", "3": "Error",
-              "4": "Warning", "5": "Notice", "6": "Informational", "7": "Debug" }[prio];
+            { "0": "Unknown", "1": "Informational", "2": "Low", "3": "Medium",
+              "4": "High", "5": "Critical", "6": "Fatal" }[severity_id | tostring] // "Unknown";
 
           def is_ip($s):
             ($s | type) == "string"
@@ -87,29 +89,18 @@ config:
               "cloud": { "provider": "Aiven" },
               "osint": [],
 
-              "device": ( { "type_id": 0, "hostname": .HOSTNAME }
-                          | with_entries(select(.value != null)) ),
-
-              "actor": ( if $puser != null then { "user": { "name": $puser } } else null end ),
-
               "message": .MESSAGE,
 
-              "observables": (
-                [ ( if .HOSTNAME != null
-                      then { "name": "device.hostname", "type_id": 1, "value": .HOSTNAME }
-                      else empty end ),
-                  ( if $puser != null
-                      then { "name": "actor.user.name", "type_id": 4, "value": $puser }
-                      else empty end ),
-                  ( if $pclient != null
-                      then { "name": "src_endpoint.ip", "type_id": 2, "value": $pclient }
-                      else empty end ) ]
-              ),
-
+              # base_event (uid 0) as enforced by the OCSF validator does not
+              # define actor/device/src_endpoint, and no observable can point at
+              # them, so the acting user, client host, and hostname are carried
+              # in unmapped rather than as first-class attributes.
               "unmapped": ( {
+                "hostname": .HOSTNAME,
                 "systemd_unit": .SYSTEMD_UNIT,
                 "priority": .PRIORITY,
                 "session_id": .SESSION_ID,
+                "pg_user": $puser,
                 "pg_database": ( if ($pg.db // "") != "" then $pg.db else null end ),
                 "pg_client": $pclient
               } | with_entries(select(.value != null)) ),

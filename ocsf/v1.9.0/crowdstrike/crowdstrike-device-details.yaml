@@ -85,15 +85,24 @@ config:
               },
 
               # ---- device (required object; type_id required) ----
+              # OCSF device.type_id: 1=Server, 2=Desktop, 3=Laptop, 5=Mobile.
+              # CrowdStrike "Workstation" is a desktop/laptop endpoint (Desktop);
+              # keep the vendor term in unmapped.
               "device": {
                 "type_id": (
-                  if $r.product_type_desc == "Workstation" then 1
-                  elif $r.product_type_desc == "Server" then 2
-                  elif $r.product_type_desc == "Mobile" then 4
+                  if $r.product_type_desc == "Workstation" then 2
+                  elif $r.product_type_desc == "Server" then 1
+                  elif $r.product_type_desc == "Mobile" then 5
                   else 99
                   end
                 ),
-                "type": $r.product_type_desc,
+                "type": (
+                  if $r.product_type_desc == "Workstation" then "Desktop"
+                  elif $r.product_type_desc == "Server" then "Server"
+                  elif $r.product_type_desc == "Mobile" then "Mobile"
+                  else "Other"
+                  end
+                ),
                 "uid": $r.device_id,
                 "hostname": $r.hostname,
                 "name": $r.hostname,
@@ -128,10 +137,8 @@ config:
                   "bios_manufacturer": $r.bios_manufacturer,
                   "bios_ver": $r.bios_version,
                   "chassis": $r.chassis_type_desc,
-                  "cpu_type": ($r.cpu_signature // null),
                   "serial_number": $r.serial_number,
-                  "vendor_name": $r.system_manufacturer,
-                  "name": $r.system_product_name
+                  "vendor_name": $r.system_manufacturer
                 },
 
                 "os": {
@@ -153,6 +160,9 @@ config:
               "raw_data": ($r | tostring),
 
               "unmapped": {
+                "product_type_desc": $r.product_type_desc,
+                "system_product_name": $r.system_product_name,
+                "cpu_signature": $r.cpu_signature,
                 "agent_load_flags": $r.agent_load_flags,
                 "config_id_base": $r.config_id_base,
                 "config_id_build": $r.config_id_build,

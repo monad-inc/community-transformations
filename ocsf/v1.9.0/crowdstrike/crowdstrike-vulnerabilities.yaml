@@ -210,7 +210,6 @@ config:
             "status": (.status // "unknown"),
             "status_id": ((.status // "unknown") | status_to_id),
 
-            "resource": build_resource,
             "resources": [build_resource],
 
             "device": {
@@ -218,6 +217,7 @@ config:
               "type": (.host_info.product_type_desc // ""),
               "hostname": (.host_info.hostname // ""),
               "uid": (.aid // ""),
+              "instance_uid": (.host_info.instance_id // ""),
               "ip": (.host_info.local_ip // ""),
               "domain": (.host_info.machine_domain // ""),
               "vendor_name": (.host_info.system_manufacturer // ""),
@@ -233,7 +233,6 @@ config:
             # --- Cloud (REQUIRED in v1.9.0; provider required) ---
             "cloud": {
               "provider": (.host_info.service_provider // "Unknown"),
-              "account_uid": (.host_info.service_provider_account_id // ""),
-              "instance_uid": (.host_info.instance_id // "")
+              "account": { "uid": (.host_info.service_provider_account_id // "") }
             }
           }

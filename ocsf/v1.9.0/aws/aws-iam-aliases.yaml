@@ -65,12 +65,12 @@ config:
               # base-required field in OCSF 1.9.0. An account alias is not a
               # threat indicator, so this is a schema-mandated placeholder:
               # type_id 99 (Other), value = the account identity.
-              "osint": {
+              "osint": [{
                 "value":   ($alias // $acct // "unknown"),
                 "type_id": 99,
                 "name":    "AWS account alias",
                 "desc":    "Schema-required OSINT placeholder; not a threat indicator."
-              },
+              }],
 
               # --- Recommended: the cloud account this record describes ---
               "cloud": {

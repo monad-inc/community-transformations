@@ -100,13 +100,13 @@ config:
                 "account": { "uid": $r.resourceOwnerAccount, "type_id": 10 }
               },
 
-              # The class requires an osint object; the analyzed resource ARN
+              # The class requires an osint array; the analyzed resource ARN
               # is the indicator this finding is about.
-              "osint": {
+              "osint": [{
                 "value": ($r.resource // $r.id),
                 "type_id": 99,
                 "type": "Resource ARN"
-              },
+              }],
 
               "finding_info": {
                 "uid": $r.id,

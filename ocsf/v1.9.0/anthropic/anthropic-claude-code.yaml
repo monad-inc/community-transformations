@@ -87,7 +87,7 @@ config:
                name: ($r["user.email"] // (if $has_id then null else "unknown" end)),
                uid: $r["user.account_uuid"],
                uid_alt: $r["user.account_id"], email_addr: $r["user.email"] }) as $user
-          | ({ user: $user, app_name: "Claude Code" }) as $actor
+          | ({ user: $user, application: { name: "Claude Code" } }) as $actor
           | ({ type_id: 0, hostname: $r["terminal.type"] }) as $device
 
           # parsed tool parameters (present only when OTEL_LOG_TOOL_DETAILS=1)
@@ -110,7 +110,7 @@ config:
 
           | ({ time: $time,
                metadata: {
-                "profiles": ["cloud", "osint"], version: "1.9.0",
+                "profiles": [], version: "1.9.0",
                  product: { vendor_name: "Anthropic", name: "Claude Code", version: $ver },
                  log_name: $en, uid: $r["prompt.id"], sequence: $r["event.sequence"],
                  tenant_uid: $r["organization.id"] },
@@ -281,7 +281,7 @@ config:
             end
 
           # declare the ai_operation profile when an AI block is present
-          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ["ai_operation"] else . end)
+          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ((.metadata.profiles // []) + ["ai_operation"]) else . end)
           # identity guard: tag + raise severity floor; never drop
           | (if ($has_id | not) then
                .severity_id = ([.severity_id, 3] | max)
@@ -298,4 +298,5 @@ config:
           # osint carries no indicators for these events; cloud names the API provider.
           | (if .category_uid == 1
              then (.osint = (.osint // [])) | (.cloud = (.cloud // { provider: "Anthropic" }))
+                  | (.metadata.profiles = ((.metadata.profiles // []) + ["cloud", "osint"]))
              else . end)

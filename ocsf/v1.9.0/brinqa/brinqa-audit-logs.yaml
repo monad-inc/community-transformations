@@ -97,4 +97,7 @@ config:
               if type == "object" then with_entries(select(.value != null and .value != ""))
               else . end
             )
-          | . + { osint: [], src_endpoint: {} }
+          # src_endpoint is required on 6003 and network_endpoint carries an
+          # at_least_one constraint. Brinqa audit records carry no network data,
+          # so identify the source by the platform service name.
+          | . + { osint: [], src_endpoint: { svc_name: "Brinqa Platform" } }

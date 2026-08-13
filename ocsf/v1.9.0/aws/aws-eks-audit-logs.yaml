@@ -52,6 +52,11 @@ config:
           | ( $r.verb // "" )           as $verb
           | ( { "create":1, "get":2, "list":2, "watch":2,
                 "update":3, "patch":3, "delete":4, "deletecollection":4 }[$verb] // 99 ) as $activity
+          # Map the Kubernetes audit verb to the closest real HTTP method for
+          # http_request.http_method (an enum). Unknown verbs -> null (omitted).
+          | ( { "create":"POST", "get":"GET", "list":"GET", "watch":"GET",
+                "update":"PUT", "patch":"PATCH", "delete":"DELETE",
+                "deletecollection":"DELETE" }[$verb] ) as $httpm
           | ( $rs.code // null )        as $code
           | ( $ann["authorization.k8s.io/decision"] // null ) as $decision
           | ( if ($decision == "forbid") or ($code != null and $code >= 400)
@@ -111,7 +116,7 @@ config:
 
               http_request: {
                 user_agent: $r.userAgent,
-                http_method: $verb,
+                http_method: $httpm,
                 url: { path: $r.requestURI }
               },
 

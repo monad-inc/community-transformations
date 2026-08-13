@@ -98,8 +98,7 @@ config:
                     "type_id": 0,
                     "uid": ($devdata.serialNumber // $a.subjectId),
                     "name": $a.subjectName,
-                    "hostname": $a.subjectName,
-                    "serial_number": $devdata.serialNumber
+                    "hostname": $a.subjectName
                   } else null end),
                 "user": (
                   if $ent_type_id == 2 then {
@@ -118,14 +117,9 @@ config:
                 }
               },
 
-              # Top-level device for device-inventory events (recommended).
-              "device": (
-                if $ent_type_id == 1 then {
-                  "type_id": 0,
-                  "uid": ($devdata.serialNumber // $a.subjectId),
-                  "name": $a.subjectName,
-                  "hostname": $a.subjectName
-                } else null end),
+              # The targeted device is modeled inside entity.device above; the
+              # top-level device attribute requires the host profile (not claimed
+              # here), so it is intentionally omitted.
 
               "message": (($a.actorName // "actor") + " " + $t + " (" + ($a.outcome // "") + ")"),
 

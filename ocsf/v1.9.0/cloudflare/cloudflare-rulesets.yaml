@@ -55,10 +55,10 @@ config:
               # --- OSINT (REQUIRED in the 1.9.0 discovery base). No related
               #     indicator exists for a ruleset asset, so type_id=0/Unknown
               #     and value carries the ruleset id. ---
-              "osint": {
+              "osint": [{
                 "value": ($r.id // "unknown"),
                 "type_id": 0
-              },
+              }],
 
               # --- Cloud (recommended; Cloudflare is the SaaS provider) ---
               "cloud": {

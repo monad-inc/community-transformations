@@ -65,7 +65,7 @@ config:
               "time": to_epoch($r.date),
 
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "host"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "Bitwarden",
@@ -87,7 +87,7 @@ config:
                                 then { "ip": $r.ipAddress } else null end ),
 
               "device": ( if $r.device != null
-                          then { "name": device_name($r.device), "type": "Other", "type_id": 99 }
+                          then { "name": device_name($r.device), "type": device_name($r.device), "type_id": 99 }
                           else null end ),
 
               # Required by the OCSF v1.9.0 base for this class.

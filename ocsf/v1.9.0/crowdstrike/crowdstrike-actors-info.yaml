@@ -66,7 +66,7 @@ config:
               cloud: {
                 provider: "CrowdStrike Falcon Intelligence"
               },
-              osint: ({
+              osint: ([{
                 type_id: 99,
                 type: "Threat Actor",
                 value: (.name // .slug // (.id | tostring)),
@@ -89,7 +89,7 @@ config:
                 } | with_entries(select(.value != null and .value != "")))
               }
               | if (.labels | length) == 0 then del(.labels) else . end
-              | with_entries(select(.value != null and .value != ""))),
+              | with_entries(select(.value != null and .value != ""))]),
               status_id: 1,
               message: (.short_description // .description),
               observables: (

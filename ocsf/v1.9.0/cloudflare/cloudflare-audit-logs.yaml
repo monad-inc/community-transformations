@@ -133,8 +133,8 @@ config:
               },
 
               "observables": ( [
-                (if ($ac.email // null) != null then {"name":"actor.user.email_addr","type":"Email Address","value":$ac.email} else null end),
-                (if ($ac.ip // null) != null then {"name":"src_endpoint.ip","type":"IP Address","value":$ac.ip} else null end)
+                (if ($ac.email // null) != null then {"name":"actor.user.email_addr","type_id":5,"type":"Email Address","value":$ac.email} else null end),
+                (if ($ac.ip // null) != null then {"name":"src_endpoint.ip","type_id":2,"type":"IP Address","value":$ac.ip} else null end)
               ] | map(select(. != null)) ),
 
               "raw_data": ($r | tostring)

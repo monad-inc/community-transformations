@@ -90,11 +90,12 @@ config:
               },
 
               # OSINT object carries the IOC itself (required: value, type_id).
-              "osint": {
+              # osint is an array of OSINT objects on Detection Finding.
+              "osint": [{
                 "value": ($r.indicator // ""),
                 "type_id": $osint_type_id,
                 "type": (if $itype == "" then null else $itype end),
-                "tlp": (if ($p.tlp // "") == "" then null else ("TLP:" + ($p.tlp | ascii_upcase)) end),
+                "tlp": (if ($p.tlp // "") == "" then null else ($p.tlp | ascii_upcase) end),
                 "confidence_id": (if ($r.is_active // 0) == 1 then 2 else 0 end),
                 "name": ($r.title // null),
                 "desc": ($r.description // $r.content // null),
@@ -104,13 +105,17 @@ config:
                 "labels": ($p.tags // null),
                 "threat_actor": (if ($p.adversary // "") == "" then null
                                  else { "name": $p.adversary } end),
+                # malware.classification_ids is required; source has only
+                # family names, so classification is Unknown (0).
                 "malware": (if ($p.malware_families // []) | length > 0
-                            then [ $p.malware_families[] | { "name": . } ]
+                            then [ $p.malware_families[]
+                                   | { "name": ., "classification_ids": [0] } ]
                             else null end),
-                "kill_chain": (if ($p.attack_ids // []) | length > 0
-                               then [ $p.attack_ids[] | { "phase": . } ]
-                               else null end)
-              },
+                # OTX attack_ids are MITRE ATT&CK technique IDs -> attacks[].technique.
+                "attacks": (if ($p.attack_ids // []) | length > 0
+                            then [ $p.attack_ids[] | { "technique": { "uid": . } } ]
+                            else null end)
+              }],
 
               "status_id": (if ($r.is_active // 0) == 1 then 1 else 3 end),
               "message": (($p.name // "OTX indicator")

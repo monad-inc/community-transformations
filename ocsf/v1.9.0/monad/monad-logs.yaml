@@ -60,14 +60,14 @@ config:
               },
               "actor": {
                 "user": {
+                  "name": $r.user_email,
                   "email_addr": $r.user_email
                 }
               },
               "api": {
                 "operation": $r.method,
                 "request": {
-                  "uid": $r.id,
-                  "method": $r.method
+                  "uid": $r.id
                 },
                 "response": {
                   "code": ($r.status | tonumber)

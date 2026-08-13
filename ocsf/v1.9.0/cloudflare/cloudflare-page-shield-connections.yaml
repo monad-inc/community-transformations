@@ -41,9 +41,6 @@ config:
               "status_id":    1,
               "status_detail": (if $mal then "malicious" else "active" end),
               "is_alert":     $mal,
-              "action_id":    0,
-              "disposition_id": 0,
-              "src_url":      $r.url,
 
               "time":       (to_epoch($r.last_seen_at) // to_epoch($r.added_at)),
               "start_time": to_epoch($r.first_seen_at),

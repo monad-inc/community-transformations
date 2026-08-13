@@ -97,6 +97,14 @@ config:
                 port: ( if $r.remoteport then ($r.remoteport | tonumber? // null) else null end )
               },
 
+              # Authentication constraint: at_least_one [service, dst_endpoint].
+              # The connection is made TO the Redshift cluster; identify it by
+              # cluster id / database name so the auth target is expressed.
+              dst_endpoint: ( {
+                svc_name: ($r.clusterid // null),
+                domain: ($r.dbname // null)
+              } | with_entries(select(.value != null)) ),
+
               # authmethod (e.g. "IAM AssumeUser", "password", "MD5") is the
               # protocol/method the client used to authenticate.
               auth_protocol: ($r.authmethod // null),

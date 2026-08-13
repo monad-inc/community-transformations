@@ -144,7 +144,7 @@ config:
                            modified_time: to_epoch($pvd.vendorUpdatedAt),
                            cvss: $cvss,
                            epss: ( if ($r.epss.score // null) != null
-                                   then { score: $r.epss.score } else null end )
+                                   then { score: ($r.epss.score | tostring) } else null end )
                          } | with_entries(select(.value != null)) else null end )
                 }
                 | with_entries(select(.value != null))

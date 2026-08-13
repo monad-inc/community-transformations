@@ -59,7 +59,7 @@ config:
                 tenant_uid: $org,
                 original_time: ($d.updated_at // $r.updated_at // $r.created_at)
               },
-              osint: { value: ($pid // $pname // "unknown"), type_id: 99, type: "Claude Project Resource ID" },
+              osint: [ { value: ($pid // $pname // "unknown"), type_id: 99, type: "Claude Project Resource ID" } ],
               cloud: { provider: "Anthropic", org: (if $org != null then { uid: $org } else null end) },
               resources: [ {
                 type: "claude.project",

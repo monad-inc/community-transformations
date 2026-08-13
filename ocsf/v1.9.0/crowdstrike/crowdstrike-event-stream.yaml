@@ -94,7 +94,6 @@ config:
               message:      $e.DetectDescription,
               risk_level:   $e.SeverityName,
               count:        1,
-              src_url:      $e.FalconHostLink,
 
               device: {
                 type_id:  0,
@@ -105,17 +104,17 @@ config:
                 mac:      $e.MACAddress
               },
 
-              actor: {
-                user: {
-                  type_id: 1,
-                  name:    $e.UserName
-                }
-              },
-
-              # Detection Finding has no top-level `process`; carry the
+              # Detection Finding has no top-level `actor` or `process` in the
+              # validated 1.9.0 schema; carry the initiating user and the
               # offending process (and its file) as an evidence artifact.
               evidences: [
                 {
+                  actor: {
+                    user: {
+                      type_id: 1,
+                      name:    $e.UserName
+                    }
+                  },
                   process: {
                     pid:          $e.ProcessId,
                     created_time: $proc_start,
@@ -139,8 +138,8 @@ config:
 
               observables: [
                 ( if ($e.ComputerName // "") != "" then { name: "device.hostname", type_id: 1, value: $e.ComputerName } else empty end ),
-                ( if ($e.UserName // "") != ""     then { name: "actor.user.name", type_id: 4, value: $e.UserName } else empty end ),
-                ( if ($e.SHA256String // "") != "" then { name: "process.file.hashes", type_id: 8, value: $e.SHA256String } else empty end ),
+                ( if ($e.UserName // "") != ""     then { name: "evidences.actor.user.name", type_id: 4, value: $e.UserName } else empty end ),
+                ( if ($e.SHA256String // "") != "" then { name: "evidences.process.file.hashes", type_id: 8, value: $e.SHA256String } else empty end ),
                 ( if ($e.LocalIP // "") != ""      then { name: "device.ip", type_id: 2, value: $e.LocalIP } else empty end )
               ],
 

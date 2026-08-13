@@ -56,6 +56,16 @@ config:
           # revoked indicators are a Close, otherwise Create
           | (if ($r.revoked == true) then 3 else 1 end) as $act
 
+          # OpenCTI confidence (0-100) -> normalized confidence_id; the OCSF
+          # `confidence` string is the caption sibling, not the raw number
+          # (the numeric score is preserved in unmapped).
+          | (if $r.confidence == null then 0
+             elif $r.confidence >= 70 then 3
+             elif $r.confidence >= 40 then 2
+             elif $r.confidence >= 1  then 1
+             else 0 end) as $conf_id
+          | ({"0":"Unknown","1":"Low","2":"Medium","3":"High","99":"Other"}[$conf_id|tostring]) as $conf_cap
+
           | {
               "category_uid": 2,
               "class_uid":    2004,
@@ -90,7 +100,8 @@ config:
                 {
                   "value": ($r.name // $r.pattern // $r.id),
                   "type_id": $osint_type,
-                  "confidence": ($r.confidence // null),
+                  "confidence_id": $conf_id,
+                  "confidence": $conf_cap,
                   "detection_pattern": ($r.pattern // null),
                   "detection_pattern_type_id": (if $r.pattern_type == "yara" then 2
                                                 elif $r.pattern_type == "sigma" then 5
@@ -114,19 +125,15 @@ config:
               },
 
               "is_alert": ($r.x_opencti_detection // false),
-              "src_url": ($r.externalReferences[0].url // null),
 
-              "confidence_id": (if $r.confidence == null then 0
-                                elif $r.confidence >= 70 then 3
-                                elif $r.confidence >= 40 then 2
-                                elif $r.confidence >= 1  then 1
-                                else 0 end),
-              "confidence": ($r.confidence // null),
+              "confidence_id": $conf_id,
+              "confidence": $conf_cap,
 
               "status_id": (if ($r.revoked == true) then 4 else 1 end),
               "message": ($r.name // ""),
 
               "unmapped": {
+                "confidence": $r.confidence,
                 "x_opencti_score": $r.x_opencti_score,
                 "x_opencti_detection": $r.x_opencti_detection,
                 "kill_chain_phases": $r.killChainPhases,

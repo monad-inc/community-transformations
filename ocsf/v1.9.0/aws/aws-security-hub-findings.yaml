@@ -115,7 +115,6 @@ config:
                 else null end),
               "is_alert": true,
               "message": ($r.Title // ""),
-              "src_url": $r.SourceUrl,
 
               # --- Affected resources ---
               "resources": [
@@ -124,7 +123,7 @@ config:
                   "type":   .Type,
                   "region": .Region,
                   "cloud_partition": .Partition,
-                  "cloud":  { "provider": "AWS" }
+                  "provider": "AWS"
                 }
               ],
 

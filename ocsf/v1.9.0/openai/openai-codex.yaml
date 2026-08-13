@@ -88,7 +88,7 @@ config:
           | ({ type_id: 1,
                name: ($r["user.email"] // (if $has_id then null else "unknown" end)),
                uid: $r["user.account_id"], email_addr: $r["user.email"] }) as $user
-          | ({ user: $user, app_name: "OpenAI Codex" }) as $actor
+          | ({ user: $user, application: { name: "OpenAI Codex" } }) as $actor
           | ({ type_id: 0, hostname: $r["terminal.type"] }) as $device
           # base-required in OCSF 1.9.0
           | ({ provider: "OpenAI" }) as $cloud
@@ -238,7 +238,7 @@ config:
             end
 
           # declare the ai_operation profile when an AI block is present
-          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ["ai_operation"] else . end)
+          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ((.metadata.profiles // []) + ["ai_operation"]) else . end)
           # identity guard: tag + raise severity floor; never drop
           | (if ($has_id | not) then
                .severity_id = ([.severity_id, 3] | max)

@@ -53,7 +53,7 @@ config:
 
               # --- Metadata (REQUIRED) ---
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "security_control"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "Abnormal Security",
@@ -79,7 +79,7 @@ config:
                 "from":        $r.fromAddress,
                 "to":          ($r.toAddresses // []),
                 "cc":          ($r.ccEmails // []),
-                "reply_to":    (($r.replyToEmails // [])[0]),
+                "reply_to_list": ($r.replyToEmails // []),
                 "return_path": $r.returnPath,
                 "subject":     $r.subject,
                 "is_read":     $r.isRead,
@@ -88,7 +88,7 @@ config:
 
               # --- Recommended base fields ---
               "from":         $r.fromAddress,
-              "to":           $r.recipientAddress,
+              "to":           (if ($r.recipientAddress // "") != "" then [$r.recipientAddress] else null end),
               "is_alert":     true,
               "disposition_id": disposition($r.remediationStatus),
               "src_endpoint": (if ($r.senderIpAddress // "") != "" then { "ip": $r.senderIpAddress } else null end),

@@ -46,7 +46,7 @@ config:
 
               # --- Metadata (REQUIRED) ---
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud", "osint", "incident"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "Cloudflare",
@@ -86,7 +86,7 @@ config:
 
               # --- Observables (URL, host, IP seen in the scan) ---
               "observables": (
-                [ ( if $p.url  != null then { "name": "url.url_string", "type_id": 6,  "value": $p.url }  else empty end ),
+                [ ( if $p.url  != null then { "name": "evidences.url.url_string", "type_id": 6,  "value": $p.url }  else empty end ),
                   ( if $p.domain != null then { "name": "device.hostname", "type_id": 1, "value": $p.domain } else empty end ),
                   ( if $p.ip   != null then { "name": "device.ip",       "type_id": 2,  "value": $p.ip }   else empty end )
                 ]
@@ -100,7 +100,7 @@ config:
                     "scheme":     (if ($p.url // "") | startswith("https") then "https" else "http" end)
                   },
                   "device": (
-                    { "hostname": $p.domain, "ip": $p.ip, "region": $p.country }
+                    { "type_id": 0, "hostname": $p.domain, "ip": $p.ip, "region": $p.country }
                     | with_entries(select(.value != null))
                   ),
                   "data": {
