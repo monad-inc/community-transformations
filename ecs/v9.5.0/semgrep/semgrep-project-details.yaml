@@ -1,0 +1,96 @@
+name: "Semgrep Project Metadata to ECS v9.5.0"
+description: "Normalizes a Semgrep Project Metadata (repository/project inventory) record into Elastic Common Schema (ECS) v9.5.0 asset fields (event categorization, service, url, tags, labels) plus the semgrep.project.* vendor namespace."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-project-details"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "semgrep"
+  - "project"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Semgrep Project Metadata -> ECS v9.5.0 (asset inventory)
+          # Input: ONE semgrep-project-details record per invocation.
+          # A Semgrep project is a scanned source-code repository, modeled as
+          # an ECS asset snapshot: event.kind=asset, category=configuration/
+          # type=info. Repo-specific detail lands under the semgrep.* vendor
+          # namespace (allowed by ECS for custom data).
+          # =================================================================
+
+          # Semgrep timestamps ("2020-11-18 23:28:12.391807+00:00": space
+          # separator + numeric offset) are not strict ISO-8601; normalize the
+          # separator and offset so Elasticsearch's date parser accepts them.
+          def iso($ts):
+            if $ts == null then null
+            else ( $ts
+                   | sub(" "; "T")
+                   | sub("[+-][0-9][0-9]:?[0-9][0-9]$"; "Z")
+                   | (if test("Z$") then . else . + "Z" end) )
+            end;
+
+          def host($u):
+            if ($u | type) == "string" and ($u | test("://"))
+            then ($u | sub("^[a-zA-Z]+://"; "") | sub("/.*$"; ""))
+            else null end;
+
+          . as $r
+          | ( host($r.url) ) as $h
+          | {
+              "@timestamp": (iso($r.latest_scan_at // $r.created_at) // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind":     "asset",
+                "category": ["configuration"],
+                "type":     ["info"],
+                "id":       ($r.id | tostring),
+                "provider": "semgrep",
+                "module":   "semgrep",
+                "dataset":  "semgrep.project",
+                "created":  iso($r.created_at)
+              },
+
+              # The scanned project as the observed service/asset.
+              "service": { "id": ($r.id | tostring), "name": $r.name },
+
+              "url": (
+                if $r.url != null
+                then { "full": $r.url, "original": $r.url, "domain": $h }
+                else null end),
+
+              # Semgrep project tags -> ECS top-level keyword tags.
+              "tags": $r.tags,
+
+              "labels": (
+                { "primary_branch": $r.primary_branch,
+                  "default_branch": $r.default_branch }
+                | with_entries(select(.value != null and .value != ""))
+                | if length > 0 then . else null end),
+
+              # Vendor namespace: verbatim project metadata.
+              "semgrep": { "project": {
+                "id":             $r.id,
+                "name":           $r.name,
+                "url":            $r.url,
+                "tags":           $r.tags,
+                "primary_branch": $r.primary_branch,
+                "default_branch": $r.default_branch,
+                "created_at":     $r.created_at,
+                "latest_scan_at": $r.latest_scan_at
+              } }
+            }
+          # Single end-of-pipeline prune (ES rejects nulls; keep arrays intact).
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != {} and .value != []))
+              else . end )

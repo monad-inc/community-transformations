@@ -1,0 +1,89 @@
+name: "Semgrep Deployments to ECS v9.5.0"
+description: "Normalizes Semgrep Deployment (org/tenant) inventory records into Elastic Common Schema (ECS) v9.5.0 asset fields (event, cloud, organization, related) plus a semgrep.* vendor namespace for the deployment slug and findings endpoint."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-deployments"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "semgrep"
+  - "deployment"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Semgrep Deployments  ->  ECS v9.5.0  (asset inventory)
+          #
+          # Input: ONE Semgrep Deployment record per invocation (Semgrep API
+          #   `GET /deployments`). A deployment is a Semgrep org/tenant, i.e.
+          #   SaaS asset-inventory metadata — so event.kind=asset with the
+          #   configuration/info categorization (a valid ECS pairing).
+          #
+          # Field mappings:
+          #   .id            -> cloud.account.id / organization.id / event.id
+          #   .name          -> cloud.account.name / organization.name
+          #   .slug          -> semgrep.deployment.slug (machine identifier)
+          #   .findings.url  -> semgrep.deployment.findings_url
+          # The record carries no timestamp, so @timestamp is stamped at
+          # collection time.
+          # =================================================================
+
+          # Single end-of-pipeline prune: ES rejects nulls and the doc is
+          # nested. This is the one permitted recursive pass.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.id | tostring) as $id
+          | {
+              "@timestamp": (now | todateiso8601),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "asset",
+                "category": [ "configuration" ],
+                "type": [ "info" ],
+                "provider": "semgrep",
+                "module": "semgrep",
+                "dataset": "semgrep.deployment",
+                "action": "deployment-inventory",
+                "id": $id
+              },
+
+              "cloud": {
+                "provider": "semgrep",
+                "account": {
+                  "id": $id,
+                  "name": $r.name
+                }
+              },
+
+              "organization": {
+                "id": $r.slug,
+                "name": $r.name
+              },
+
+              # Vendor namespace (allowed by ECS + validator) for fields with
+              # no core ECS home.
+              "semgrep": {
+                "deployment": {
+                  "id": $r.id,
+                  "slug": $r.slug,
+                  "name": $r.name,
+                  "findings_url": ($r.findings.url // null)
+                }
+              }
+            }
+          | prune

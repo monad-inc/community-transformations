@@ -1,0 +1,130 @@
+name: "Socket Full Scan Findings to ECS v9.5.0"
+description: "Normalizes Socket.dev full-scan SBOM artifact records into Elastic Common Schema (ECS) v9.5.0 fields (event, vulnerability, package, related), one alert-bearing package per document, with event.category=[vulnerability,package] and event.kind=alert."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "socket-full-scans"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "socket"
+  - "vulnerability"
+  - "package"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Socket.dev full-scan SBOM artifact -> ECS v9.5.0
+          # Input: ONE Socket artifact per invocation (one scanned package
+          #   with an alerts[] array). Emitted as a nested ECS document with
+          #   event.kind=alert, event.category=[vulnerability,package],
+          #   event.type=[info], plus the vulnerability.* and package.* sets.
+          # =================================================================
+
+          def to_ts($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else $ts end;
+
+          # Socket severity label ("low"/"middle"/"high"/"critical") -> a
+          # single worst-case ECS severity keyword. "middle" is Socket's
+          # medium bucket.
+          def sev_rank:
+            (. // "" | ascii_downcase) as $s |
+            if   $s == "critical" then 4
+            elif $s == "high"     then 3
+            elif $s == "middle" or $s == "medium" then 2
+            elif $s == "low"      then 1
+            else 0 end;
+          def rank_kw($n):
+            {"4":"critical","3":"high","2":"medium","1":"low","0":"none"}[$n|tostring] // "none";
+
+          . as $r
+          | ($r.alerts // []) as $alerts
+
+          # Reconstruct a package URL when the artifact omits one.
+          | ( ($r.inputPurl)
+              // ( "pkg:" + ($r.type // "generic")
+                   + (if ($r.namespace // "") != "" then "/" + $r.namespace else "" end)
+                   + "/" + ($r.name // "unknown")
+                   + (if ($r.version // "") != "" then "@" + $r.version else "" end) )
+            ) as $purl
+
+          # Worst alert severity across the package -> event severity + outcome.
+          | ( [ $alerts[] | (.severity | sev_rank) ] | (max // 0) ) as $worst
+
+          # CVE ids surfaced by Socket vulnerability alerts (props.cveId).
+          | ( [ $alerts[] | .props.cveId | select(. != null) ] | unique ) as $cves
+          | ( [ $alerts[] | .type | select(. != null) ] | unique ) as $alert_types
+
+          | {
+              "@timestamp": ( to_ts($r.publishedAt) // (now | todateiso8601) ),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "alert",
+                module: "socket",
+                dataset: "socket.full_scans",
+                provider: "socket",
+                category: ["vulnerability", "package"],
+                type: ["info"],
+                # A malware/CVE alert on a package is a failed supply-chain
+                # posture check; a package with no alerts passed.
+                outcome: ( if ($alerts | length) > 0 then "failure" else "success" end ),
+                severity: $worst,
+                risk_score: ( if ($r.score.overall != null) then (1 - $r.score.overall) else null end ),
+                reason: ( if ($alert_types | length) > 0
+                          then "Socket alerts: " + ($alert_types | join(", ")) else null end )
+              },
+
+              vulnerability: {
+                id: ( if ($cves | length) > 0 then $cves else null end ),
+                category: ( if ($alert_types | length) > 0 then $alert_types else null end ),
+                severity: rank_kw($worst),
+                scanner: { vendor: "Socket" },
+                enumeration: ( if ($cves | length) > 0 then "CVE" else null end ),
+                classification: ( if ($cves | length) > 0 then "CVSS" else null end ),
+                reference: ( [ $alerts[] | .props.url | select(. != null) ] | unique
+                             | if length > 0 then . else null end ),
+                description: ( [ $alerts[] | (.props.description // .props.note) | select(. != null) ]
+                               | unique | if length > 0 then (. | join(" | ")) else null end ),
+                score: {
+                  base: ( [ $alerts[] | .props.cvssScore | select(. != null) ] | max )
+                }
+              },
+
+              package: {
+                name: $r.name,
+                version: $r.version,
+                type: $r.type,
+                reference: $purl,
+                size: $r.size,
+                license: $r.license,
+                install_scope: ( if ($r.dev == true) then "development" else null end )
+              },
+
+              related: {
+                # Every package identity + CVE seen, for one-field pivots.
+                hash: ( if ($cves | length) > 0 then $cves else [] end )
+              },
+
+              labels: {
+                socket_score_overall: ( $r.score.overall ),
+                direct_dependency: ( $r.direct ),
+                dev_dependency: ( $r.dev )
+              }
+            }
+
+          # Single end-of-pipeline recursive prune: ES rejects nulls, and the
+          # doc is deeply nested. Drops null, {}, [] everywhere.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

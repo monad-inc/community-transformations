@@ -1,0 +1,106 @@
+name: "Rapid7 InsightVM Assets to ECS v9.5.0"
+description: "Maps Rapid7 InsightVM asset inventory records (GET /api/3/assets) into Elastic Common Schema (ECS) v9.5.0, covering the event, host, host.os, host.risk, and related field sets as an asset snapshot."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "rapid7-assets"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "rapid7"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Rapid7 InsightVM asset inventory -> ECS v9.5.0 (nested). Asset
+          # snapshot: event.kind=asset, category=[host], type=[info].
+          def is_ip($s):
+            ($s | type) == "string" and
+            ( ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))
+              or ($s | test("^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$")) );
+          . as $r |
+          ( ($r.history // []) | map(.date) | map(select(. != null)) | sort ) as $dates |
+          ( if ($dates | length) > 0 then $dates[0]  else null end ) as $first_scan |
+          ( if ($dates | length) > 0 then $dates[-1] else null end ) as $last_scan |
+          # IPs: top-level ip + every addresses[].ip, guarded.
+          ( ( [ $r.ip ] + ( ($r.addresses // []) | map(.ip) ) )
+            | map(select(is_ip(.))) | unique ) as $ips |
+          # MACs: top-level mac + every addresses[].mac.
+          ( ( [ $r.mac ] + ( ($r.addresses // []) | map(.mac) ) )
+            | map(select(. != null and . != "")) | unique ) as $macs |
+          # Hostnames: top-level hostName + every hostNames[].name.
+          ( ( [ $r.hostName ] + ( ($r.hostNames // []) | map(.name) ) )
+            | map(select(. != null and . != "")) | unique ) as $hosts |
+          ( ($r.os // "") ) as $osfull |
+          ( ( ($r.osFingerprint.family // "") + " "
+              + ($r.osFingerprint.systemName // "") + " " + $osfull
+              | ascii_downcase ) ) as $osl |
+          {
+            "@timestamp": ($last_scan // $first_scan // (now | todate)),
+            "ecs": { "version": "9.5.0" },
+            "event": {
+              "kind": "asset",
+              "category": ["host"],
+              "type": ["info"],
+              "outcome": "unknown",
+              "module": "rapid7",
+              "dataset": "rapid7.asset",
+              "provider": "Rapid7 InsightVM",
+              "id": ($r.id | tostring),
+              "created": $first_scan,
+              "ingested": $last_scan
+            },
+            "host": {
+              "id": ($r.id | tostring),
+              "name": ($hosts[0]),
+              "hostname": ($r.hostName // $hosts[0]),
+              "domain": (
+                ( $r.hostName // $hosts[0] // "" ) as $h |
+                if ($h | test("\\.")) then ($h | sub("^[^.]+\\."; "")) else null end
+              ),
+              "ip": (if ($ips | length) > 0 then $ips else null end),
+              "mac": (if ($macs | length) > 0 then $macs else null end),
+              "type": $r.type,
+              "risk": (
+                if $r.riskScore != null then { "static_score": $r.riskScore } else null end
+              ),
+              "os": (
+                if ($osfull != "" or $r.osFingerprint != null) then {
+                  "full": (if $osfull != "" then $osfull else null end),
+                  "name": ($r.osFingerprint.product // (if $osfull != "" then $osfull else null end)),
+                  "version": $r.osFingerprint.version,
+                  "type": (
+                    if   ($osl | test("windows")) then "windows"
+                    elif ($osl | test("linux"))   then "linux"
+                    elif ($osl | test("mac|os x|darwin")) then "macos"
+                    elif ($osl | test("android"))  then "android"
+                    elif ($osl | test("ios"))      then "ios"
+                    else null end
+                  ),
+                  "platform": (
+                    if   ($osl | test("windows")) then "windows"
+                    elif ($osl | test("linux"))   then "linux"
+                    elif ($osl | test("mac|os x|darwin")) then "darwin"
+                    else null end
+                  )
+                } else null end
+              )
+            },
+            "related": {
+              "ip": $ips,
+              "hosts": $hosts
+            }
+          }
+          # Single end-of-pipeline prune: drop null / "" / {} / [] so ES accepts the doc.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )
