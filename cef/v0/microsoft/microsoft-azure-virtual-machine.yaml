@@ -1,0 +1,70 @@
+name: "Microsoft Azure Virtual Machine to CEF"
+description: "Maps Microsoft Azure Compute Virtual Machine (Get/List) inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-virtual-machine"
+tags:
+  - "v0"
+  - "cef"
+  - "microsoft"
+  - "azure"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Microsoft Azure Virtual Machine -> CEF intermediate (T1).
+          # Emits FINAL-FORM values; does NO escaping (the shared CEF
+          # Serializer T2 owns all escaping/header assembly).
+          #   - severity: integer 0-10 (VM inventory is informational)
+          #   - rt: epoch-MILLISECONDS
+          #   - custom slots cs*/cn* always paired with their *Label
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else
+              ( ( ( $ts
+                    | gsub("\\.[0-9]+"; "")
+                    | sub("([+-][0-9]{2}:[0-9]{2}|Z)$"; "") )
+                  + "Z" | fromdateiso8601 ) * 1000 )
+            end;
+
+          . as $r
+          | ($r.properties // {}) as $p
+          | (($r.id // "") | split("/")) as $idp
+          | ($p.storageProfile.imageReference // {}) as $img
+          | ( $p.osProfile.computerName // $r.name ) as $host
+          | { _cef: {
+              vendor: "Microsoft",
+              product: "Azure Virtual Machines",
+              version: "",
+              signature_id: "azure:virtual-machine",
+              name: ("Azure VM inventory: " + ($host // "unknown host")),
+              # Inventory is informational; a non-Succeeded provisioning state
+              # is a degraded/notable condition, so bump the severity.
+              severity: ( if ($p.provisioningState // "Succeeded") == "Succeeded" then 2 else 6 end ),
+              extension: ( {
+                rt:               to_epoch_ms($p.timeCreated),
+                dvchost:          $host,
+                deviceExternalId: $p.vmId,
+                externalId:       $p.vmId,
+                suser:            $p.osProfile.adminUsername,
+                outcome:          $p.provisioningState,
+                sourceServiceName: "Azure Virtual Machines",
+                cs1Label: "osType",         cs1: $p.storageProfile.osDisk.osType,
+                cs2Label: "vmSize",         cs2: $p.hardwareProfile.vmSize,
+                cs3Label: "region",         cs3: $r.location,
+                cs4Label: "imageSku",       cs4: $img.sku,
+                cs5Label: "subscriptionId", cs5: ($idp[2]?),
+                cs6Label: "resourceGroup",  cs6: ($idp[4]?),
+                cn1Label: "vCPUs",          cn1: ($p.hardwareProfile.vmSizeProperties.vCPUsAvailable)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

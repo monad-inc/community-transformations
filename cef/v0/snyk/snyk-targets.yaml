@@ -1,0 +1,66 @@
+name: "Snyk Scan Targets to CEF"
+description: "Maps Snyk Scan Target (source/repo inventory) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-targets"
+tags:
+  - "v0"
+  - "cef"
+  - "snyk"
+  - "targets"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk /orgs/{org_id}/targets -> CEF intermediate (T1). NO escaping.
+          # A "target" is a scanned source (repo / registry / etc.).
+          # severity: integer 0-10 (informational inventory -> 2) ;
+          # rt: epoch-MILLISECONDS ; custom slots cs* paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($r.relationships // {}) as $rel
+          | ($rel.integration.data.attributes.integration_type) as $itype
+          | ($rel.organization.data.id) as $org_id
+          | ($a.url // "") as $url
+          | ( ($url | ltrimstr("https://") | ltrimstr("http://") | split("/") | .[0]) // "" ) as $host
+          | ( ($itype // ($host | ascii_downcase
+                | if contains("github") then "github"
+                  elif contains("gitlab") then "gitlab"
+                  elif contains("bitbucket") then "bitbucket"
+                  elif (contains("azure") or contains("visualstudio")) then "azure-repos"
+                  else . end)) ) as $provider0
+          | ( if ($provider0 // "") == "" then null else $provider0 end ) as $provider
+          | { _cef: {
+              vendor: "Snyk",
+              product: "Snyk",
+              version: "",
+              signature_id: "scan_target",
+              name: ("Snyk scan target: " + ($a.display_name // $r.id)),
+              severity: 2,
+              extension: ( (
+                {
+                  rt:      to_epoch_ms($a.created_at),
+                  act:     "scan-target-inventory",
+                  request: ( if $url == "" then null else $url end ),
+                  dhost:   ( if $host == "" then null else $host end )
+                }
+                + ( if $provider                 then { cs1Label: "sourceType",     cs1: $provider } else {} end )
+                + ( if $a.display_name            then { cs2Label: "displayName",    cs2: $a.display_name } else {} end )
+                + ( if $r.id                      then { cs3Label: "targetId",       cs3: $r.id } else {} end )
+                + ( if $org_id                    then { cs4Label: "organizationId", cs4: $org_id } else {} end )
+                + ( if $rel.integration.data.id   then { cs5Label: "integrationId",  cs5: $rel.integration.data.id } else {} end )
+                + ( if $a.is_private != null      then { cs6Label: "isPrivate",      cs6: ($a.is_private | tostring) } else {} end )
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

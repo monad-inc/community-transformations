@@ -1,0 +1,48 @@
+name: "Semgrep Deployments to CEF"
+description: "Maps Semgrep Deployment (org/tenant) inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-deployments"
+tags:
+  - "v0"
+  - "cef"
+  - "semgrep"
+  - "deployment"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep Deployments -> CEF intermediate (T1).
+          # Input: ONE Semgrep Deployment record (Semgrep API GET /deployments).
+          # A deployment is a Semgrep org/tenant — inventory metadata — so this
+          # is a low-severity informational inventory signature.
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values (severity 0-10; times epoch-ms;
+          # custom slots paired with their *Label). One jq pass; shallow
+          # null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          . as $r
+          | { _cef: {
+              vendor: "Semgrep",
+              product: "Semgrep AppSec Platform",
+              version: "",
+              signature_id: "semgrep.deployment.inventory",
+              name: ("Semgrep deployment inventory: " + ($r.name // $r.slug)),
+              severity: 2,
+              extension: ( {
+                rt:          (now * 1000 | floor),      # no source time; stamp at collection (epoch-ms)
+                cn1Label:    "deploymentId",
+                cn1:         $r.id,                      # Semgrep deployment id (numeric)
+                cs1Label:    "deploymentSlug",
+                cs1:         $r.slug,
+                cs2Label:    "deploymentName",
+                cs2:         $r.name,
+                cs3Label:    "findingsUrl",
+                cs3:         ($r.findings.url // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,61 @@
+name: "Veracode Applications to CEF"
+description: "Maps Veracode Applications API records (application inventory and policy-compliance posture) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "veracode-applications"
+tags:
+  - "v0"
+  - "cef"
+  - "veracode"
+  - "applications"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Veracode Applications -> CEF intermediate (T1). No escaping here.
+          # Emit FINAL-FORM values: severity 0-10, times epoch-MILLISECONDS,
+          # custom slots paired with their *Label. One jq pass; shallow
+          # null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.profile // {}) as $p
+          | (($p.policies // []) | .[0]) as $pol
+          | ($pol.policy_compliance_status // null) as $pcs
+          | (($p.business_owners // []) | .[0]) as $owner
+          | { _cef: {
+              vendor: "Veracode",
+              product: "Veracode Application Security",
+              version: "",
+              signature_id: "veracode.application.posture",
+              name: ( "Application security posture: " + ($p.name // "unknown") ),
+              # business_criticality -> CEF severity bucket (0-10)
+              severity: ( { "VERY_HIGH": 10, "HIGH": 8, "MEDIUM": 5, "LOW": 3, "VERY_LOW": 1 }[$p.business_criticality // ""] // 0 ),
+              extension: ( {
+                rt:            to_epoch_ms($r.modified),
+                end:          to_epoch_ms($r.last_completed_scan_date),
+                deviceExternalId: $r.guid,
+                externalId:    ( $r.id | tostring ),
+                act:           "policy-compliance-check",
+                outcome:       ( { "PASSED": "SUCCESS", "DID_NOT_PASS": "FAILURE" }[$pcs // ""] // $pcs ),
+                duser:         $owner.email,
+                dvchost:       "analysiscenter.veracode.com",
+                # Custom slots (paired with labels) for fields with no dictionary home:
+                cs1Label: "applicationName",       cs1: $p.name,
+                cs2Label: "businessCriticality",   cs2: $p.business_criticality,
+                cs3Label: "policyComplianceStatus", cs3: $pcs,
+                cs4Label: "policyName",            cs4: $pol.name,
+                cs5Label: "businessUnit",          cs5: ( ($p.business_unit // {}).name ),
+                cs6Label: "tags",                  cs6: $p.tags
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
