@@ -1,0 +1,66 @@
+name: "Atlassian Jira Audit Logs to CEF"
+description: "Maps Atlassian Jira audit log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "atlassian"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Atlassian Jira Audit Logs -> CEF intermediate (T1).
+          # Input: one Jira auditing REST record per invocation
+          #   (/rest/api/3/auditing/record). No escaping here — the shared
+          #   CEF Serializer (T2) owns all escaping. Values are final form:
+          #   severity 0-10, times epoch-ms, custom slots paired with labels.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (( $ts
+                    | sub("\\.[0-9]+"; "")
+                    | sub("([+-][0-9]{2}:?[0-9]{2}|Z)$"; "")
+                    | . + "Z"
+                    | fromdateiso8601 ) * 1000)
+            end;
+
+          . as $r
+          | ($r.objectItem // {}) as $obj
+          | { _cef: {
+              vendor: "Atlassian",
+              product: "Jira",
+              version: "",
+              # Low-cardinality event class: the audit category (e.g.
+              # "group management", "user management", "permissions").
+              signature_id: ($r.category // "audit"),
+              name: ($r.summary // "Jira audit event"),
+              # Audit records are completed administrative actions -> Low.
+              severity: 2,
+              extension: ( {
+                rt:      to_epoch_ms($r.created),
+                externalId: (if $r.id == null then null else ($r.id | tostring) end),
+                suser:   $r.authorKey,
+                suid:    $r.authorAccountId,
+                src:     (if ($r.remoteAddress | type) == "string" and ($r.remoteAddress | test("^[0-9A-Fa-f:.]+$")) then $r.remoteAddress else null end),
+                act:     $r.summary,
+                outcome: "SUCCESS",
+                msg:     $r.description,
+                # Target object of the audit action.
+                duser:   (if ($obj.typeName // "") == "USER" then $obj.name else null end),
+                # Overflow to custom slots (each WITH its label).
+                cs1Label: "objectType",   cs1: $obj.typeName,
+                cs2Label: "objectName",   cs2: $obj.name,
+                cs3Label: "eventSource",  cs3: $r.eventSource,
+                cs4Label: "changedValues",
+                cs4: (if ($r.changedValues // []) | length > 0 then ($r.changedValues | tojson) else null end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

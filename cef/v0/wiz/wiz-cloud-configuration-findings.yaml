@@ -1,0 +1,61 @@
+name: "Wiz Cloud Configuration Findings to CEF"
+description: "Maps Wiz Cloud Configuration Findings records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "wiz-cloud-configuration-findings"
+tags:
+  - "v0"
+  - "cef"
+  - "wiz"
+  - "cloud-configuration-findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Wiz Cloud Configuration Findings -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # severity: integer 0-10; times epoch-MILLISECONDS; custom slots
+          # cs*/cn* always paired with their *Label. One jq pass; shallow
+          # null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.resource // {}) as $res
+          | ($r.rule // {}) as $rule
+          | (($r.securitySubCategories // [])[0]) as $ssc
+          | { _cef: {
+              vendor: "Wiz",
+              product: "Wiz Cloud Configuration Findings",
+              version: "",
+              signature_id: ($rule.shortId // $rule.id // "wiz-config-finding"),
+              name: ($rule.name // "Wiz cloud configuration finding"),
+              severity: (
+                { "INFORMATIONAL": 1, "LOW": 3, "MEDIUM": 5, "HIGH": 8, "CRITICAL": 10 }[($r.severity // "") | ascii_upcase] // 0
+              ),
+              extension: ( {
+                rt:                to_epoch_ms($r.firstSeenAt),
+                end:               to_epoch_ms($r.analyzedAt),
+                externalId:        ($r.id // null),
+                msg:               ($rule.description // null),
+                outcome:           ($r.result // null),
+                act:               ($r.status // null),
+                deviceExternalId:  ($res.providerId // $res.id // null),
+                dvchost:           ($res.name // null),
+                cs1Label: "resourceType",       cs1: ($res.type // null),
+                cs2Label: "cloudProvider",       cs2: ($res.cloudPlatform // null),
+                cs3Label: "cloudRegion",         cs3: ($res.region // null),
+                cs4Label: "cloudAccountId",      cs4: ($res.subscription.externalId // null),
+                cs5Label: "complianceStandard",  cs5: ($ssc.category.framework.name // null),
+                cs6Label: "remediation",         cs6: ($r.remediation // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

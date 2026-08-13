@@ -1,0 +1,76 @@
+name: "OpenCTI Indicators to CEF"
+description: "Maps OpenCTI (STIX 2.1) threat-intelligence Indicator records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "opencti-indicators"
+tags:
+  - "v0"
+  - "cef"
+  - "opencti"
+  - "indicators"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OpenCTI (STIX 2.1) Indicator -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping/header assembly. Emit FINAL-FORM values: severity is an
+          # integer 0-10 (from x_opencti_score/10), times are epoch-MS, and
+          # every cs*/cn* custom slot is paired with its *Label.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          . as $r
+          | def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+          ($r.x_opencti_main_observable_type // "indicator") as $mot
+          | ($r.objectMarking[0].definition // null) as $tlp
+          | {
+              _cef: {
+                vendor: "OpenCTI",
+                product: "OpenCTI Indicators",
+                version: ($r.spec_version // ""),
+                signature_id: ("indicator." + ($mot | ascii_downcase)),
+                name: ("OpenCTI indicator: " + ($r.name // $r.pattern // $r.id)),
+                severity: (
+                  if $r.x_opencti_score == null then 0
+                  else (($r.x_opencti_score / 10) | floor
+                        | if . > 10 then 10 elif . < 0 then 0 else . end)
+                  end),
+                extension: ( {
+                  rt:        to_epoch_ms($r.valid_from // $r.created // $r.created_at),
+                  start:     to_epoch_ms($r.valid_from),
+                  end:       to_epoch_ms($r.valid_until),
+                  msg:       ($r.description // null),
+                  externalId: ($r.id // null),
+                  request:   ($r.externalReferences[0].url // null),
+                  outcome:   (if ($r.revoked == true) then "revoked" else "active" end),
+                  suser:     (($r.createdBy.name) // null),
+                  cs1Label:  "indicatorValue",
+                  cs1:       ($r.name // $r.pattern // null),
+                  cs2Label:  "indicatorPattern",
+                  cs2:       ($r.pattern // null),
+                  cs3Label:  "patternType",
+                  cs3:       ($r.pattern_type // null),
+                  cs4Label:  "mainObservableType",
+                  cs4:       ($r.x_opencti_main_observable_type // null),
+                  cs5Label:  "tlp",
+                  cs5:       (if $tlp != null then ($tlp | ltrimstr("TLP:")) else null end),
+                  cs6Label:  "indicatorTypes",
+                  cs6:       (if ($r.indicator_types // null) != null then ($r.indicator_types | join(",")) else null end),
+                  cs7Label:  "labels",
+                  cs7:       (if ($r.labels // null) != null then ($r.labels | join(",")) else null end),
+                  cn1Label:  "openctiScore",
+                  cn1:       ($r.x_opencti_score // null),
+                  cn2Label:  "confidence",
+                  cn2:       ($r.confidence // null)
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

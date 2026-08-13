@@ -1,0 +1,81 @@
+name: "Wiz Vulnerabilities to CEF"
+description: "Maps Wiz vulnerability finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "wiz-vulnerabilities"
+tags:
+  - "v0"
+  - "cef"
+  - "wiz"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Wiz Vulnerabilities -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (mapped from Wiz vendorSeverity)
+          #   - time fields (rt/end): epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass, per-record only; shallow null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.vulnerableAsset // {}) as $a
+          | ($r.name // $r.Name) as $cve_id
+          | ($r.vendorSeverity // $r.VendorSeverity) as $vsev
+          | ($a.ipAddresses // $r.IpAddresses // []) as $ips
+          | { _cef: {
+              vendor: "Wiz",
+              product: "Wiz Vulnerabilities",
+              version: "",
+              signature_id: ($cve_id // "wiz-vulnerability-finding"),
+              name: (
+                "Wiz vulnerability "
+                + ($cve_id // "finding")
+                + " on " + ($a.name // $r.AssetName // "asset")
+              ),
+              severity: (
+                { "CRITICAL": 10, "Critical": 10, "HIGH": 8, "High": 8,
+                  "MEDIUM": 6, "Medium": 6, "LOW": 3, "Low": 3,
+                  "INFORMATIONAL": 1, "Informational": 1 }[$vsev] // 0
+              ),
+              extension: ( {
+                rt:          to_epoch_ms($r.firstDetectedAt // $r.FirstDetected),
+                end:         to_epoch_ms($r.lastDetectedAt // $r.LastDetected),
+                externalId:  ($r.id // $r.ID),
+                msg:         ($r.description // $r.Description),
+                outcome:     ($r.status // $r.FindingStatus),
+                dhost:       ($a.name // $r.AssetName),
+                dvchost:     ($a.name // $r.AssetName),
+                dst:         ([ $ips[] | select(test("^(\\d{1,3}\\.){3}\\d{1,3}$")) ] | first),
+                request:     ($r.portalUrl // $r.WizURL),
+                filePath:    ($r.locationPath // $r.LocationPath),
+                # --- custom string slots (paired labels) ---
+                cs1Label: "cve",              cs1: $cve_id,
+                cs2Label: "vendorSeverity",   cs2: $vsev,
+                cs3Label: "affectedPackage",  cs3: (
+                  ($r.detailedName // $r.DetailedName // "")
+                  + (if ($r.version // $r.Version) then ("@" + ($r.version // $r.Version)) else "" end)
+                  | if . == "" then null else . end
+                ),
+                cs4Label: "fixedVersion",     cs4: ($r.fixedVersion // $r.FixedVersion),
+                cs5Label: "cloudProvider",    cs5: ($a.cloudPlatform // $r.CloudPlatform),
+                cs6Label: "cloudAccount",     cs6: ($a.subscriptionId // $r.SubscriptionId),
+                # --- custom number slots (paired labels) ---
+                cn1Label: "cvssBaseScore",    cn1: ($r.score // $r.Score),
+                cn2Label: "exploitability",   cn2: ($r.exploitabilityScore // $r.ExploitabilityScore),
+                cn3Label: "hasExploit",       cn3: (if ($r.hasExploit // $r.HasExploit) then 1 else 0 end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

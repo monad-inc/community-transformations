@@ -1,0 +1,70 @@
+name: "CrowdStrike Device Details to CEF"
+description: "Maps CrowdStrike Falcon device details records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-device-details"
+tags:
+  - "v0"
+  - "cef"
+  - "crowdstrike"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CrowdStrike Falcon device details -> CEF intermediate (T1).
+          # Emits FINAL-FORM values; does NO escaping (the shared CEF
+          # Serializer T2 owns all escaping/header assembly).
+          #   - severity: integer 0-10 (device inventory is informational)
+          #   - rt: epoch-MILLISECONDS
+          #   - custom slots cs*/cn* always paired with their *Label
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "")
+                   | strptime("%Y-%m-%dT%H:%M:%S") | mktime) * 1000)
+            end;
+
+          . as $r
+          | { _cef: {
+              vendor: "CrowdStrike",
+              product: "Falcon",
+              version: ($r.agent_version // ""),
+              signature_id: "crowdstrike:device-details",
+              name: ("Device inventory: " + ($r.hostname // "unknown host")),
+              # Inventory is informational; a sensor in Reduced Functionality
+              # Mode is a degraded/notable state, so bump the severity.
+              severity: ( if ($r.reduced_functionality_mode // "no") != "no" then 4 else 2 end ),
+              extension: ( {
+                rt:       to_epoch_ms($r.agent_local_time),
+                start:    to_epoch_ms($r.first_seen),
+                end:      to_epoch_ms($r.last_seen),
+                dvchost:  $r.hostname,
+                dvc:      $r.local_ip,
+                dvcmac:   $r.mac_address,
+                externalId: $r.device_id,
+                deviceExternalId: $r.device_id,
+                dhost:    $r.hostname,
+                dntdom:   $r.machine_domain,
+                deviceInboundInterface: $r.interface_name,
+                sourceServiceName: "Falcon",
+                outcome:  $r.status,
+                # OS / platform
+                cs1Label: "osVersion",    cs1: $r.os_version,
+                cs2Label: "osBuild",      cs2: $r.os_build,
+                cs3Label: "platform",     cs3: $r.platform_name,
+                cs4Label: "serialNumber", cs4: $r.serial_number,
+                cs5Label: "cloudProvider", cs5: $r.service_provider,
+                cs6Label: "productType",  cs6: $r.product_type_desc,
+                # numeric custom
+                cn1Label: "agentLoadFlags", cn1: ($r.agent_load_flags | if . == null then null else tonumber end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

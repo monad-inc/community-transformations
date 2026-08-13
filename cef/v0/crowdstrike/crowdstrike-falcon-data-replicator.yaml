@@ -1,0 +1,70 @@
+name: "CrowdStrike Falcon Data Replicator to CEF"
+description: "Maps a CrowdStrike Falcon Data Replicator (FDR) ProcessRollup2 endpoint telemetry record into the normalized CEF intermediate (_cef); the shared CEF serializer renders the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-falcon-data-replicator"
+tags:
+  - "v0"
+  - "cef"
+  - "crowdstrike"
+  - "falcon-data-replicator"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CEF T1 mapping — CrowdStrike Falcon Data Replicator ProcessRollup2
+          # Emits the {_cef:{...}} intermediate. No escaping here; the shared
+          # CEF serializer (T2) owns escaping + header assembly.
+          # ---------------------------------------------------------------
+
+          def basename($p):
+            if $p == null or $p == "" then null
+            else ($p | gsub("\\\\"; "/") | split("/") | last)
+            end;
+
+          # FDR .timestamp is already epoch milliseconds (string) -> number.
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            else ($ts | tonumber | floor)
+            end;
+
+          . as $r
+          | {
+              _cef: {
+                vendor: "CrowdStrike",
+                product: "Falcon Data Replicator",
+                version: "",
+                signature_id: ($r.event_simpleName // "FDR"),
+                name: ("Process execution (" + ($r.event_simpleName // "ProcessRollup2") + ")"),
+                severity: 3,
+                extension: (
+                  {
+                    rt: to_epoch_ms($r.timestamp),
+                    dhost: $r.ComputerName,
+                    dvchost: $r.ComputerName,
+                    suser: $r.UserName,
+                    src: $r.aip,
+                    dproc: basename($r.ImageFileName),
+                    dpid: (if $r.RawProcessId != null then ($r.RawProcessId | tonumber) else null end),
+                    sproc: $r.ParentBaseFileName,
+                    filePath: $r.ImageFileName,
+                    fileHash: $r.SHA256HashData,
+                    act: $r.event_simpleName,
+                    cs1Label: "AgentId",
+                    cs1: $r.aid,
+                    cs2Label: "CustomerId",
+                    cs2: $r.cid,
+                    cs3Label: "CommandLine",
+                    cs3: $r.CommandLine,
+                    cs4Label: "FalconProcessId",
+                    cs4: $r.TargetProcessId
+                  }
+                  | with_entries(select(.value != null and .value != ""))
+                )
+              }
+            }

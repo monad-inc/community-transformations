@@ -1,0 +1,63 @@
+name: "Semgrep Code Vulnerability Findings to CEF"
+description: "Maps Semgrep Code Vulnerability Finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-code-findings"
+tags:
+  - "v0"
+  - "cef"
+  - "semgrep"
+  - "code"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | (($r.rule.cwe_names // []) | map(select(. != null))) as $cwes
+          | ($cwes | map(split(":")[0] | ascii_upcase) | map(select(startswith("CWE"))) | first) as $cwe_id
+          | ($r.location.file_path // "") as $fp
+          | { _cef: {
+              vendor: "Semgrep",
+              product: "Semgrep Code",
+              version: "",
+              signature_id: ($r.rule_name // "semgrep.finding"),
+              name: ($r.rule_message // $r.rule_name // "Semgrep code finding"),
+              severity: ( if $sev == "critical" then 10
+                          elif $sev == "high" then 8
+                          elif $sev == "medium" then 6
+                          elif $sev == "low" then 3
+                          elif $sev == "info" then 1
+                          else 0 end ),
+              extension: ( {
+                rt:       to_epoch_ms($r.created_at // $r.state_updated_at),
+                msg:      ($r.rule_message // $r.rule_name),
+                fname:    (if $fp != "" then ($fp | split("/")[-1]) else null end),
+                filePath: (if $fp != "" then $fp else null end),
+                request:  $r.line_of_code_url,
+                outcome:  ($r.status // $r.state),
+                cn1Label: "lineNumber",
+                cn1:      $r.location.line,
+                cn2Label: "findingId",
+                cn2:      $r.id,
+                cs1Label: "cwe",
+                cs1:      $cwe_id,
+                cs2Label: "owasp",
+                cs2:      (($r.rule.owasp_names // []) | join(", ") | if . == "" then null else . end),
+                cs3Label: "repository",
+                cs3:      $r.repository.name,
+                cs4Label: "confidence",
+                cs4:      $r.confidence
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

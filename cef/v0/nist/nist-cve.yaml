@@ -1,0 +1,82 @@
+name: "NIST NVD CVE to CEF"
+description: "Maps NIST NVD CVE records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "nist-cve"
+tags:
+  - "v0"
+  - "cef"
+  - "nist"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # NIST NVD CVE -> CEF intermediate (T1). No escaping here — the
+          # shared CEF Serializer (T2) owns all escaping. Emit FINAL-FORM:
+          #   - severity: integer 0-10 (CVSS base score maps directly)
+          #   - time fields (rt): epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass; shallow null-drop on extension (no recursive walk).
+          # Input: one NVD CVE record ({cve:{...}}) per invocation.
+          # ---------------------------------------------------------------
+
+          # NVD timestamps lack a zone (e.g. "2024-08-13T18:15:10.017");
+          # strip the fraction, force Z, then to epoch-ms.
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # CVSS baseSeverity string -> CEF severity bucket (fallback when no
+          # numeric base score is present).
+          def sev_bucket($s):
+            ($s // "" | ascii_downcase) as $x |
+            if   $x == "none"     then 0
+            elif $x == "low"      then 3
+            elif $x == "medium"   then 5
+            elif $x == "high"     then 8
+            elif $x == "critical" then 10
+            else 0 end;
+
+          . as $r
+          | ($r.cve // $r) as $c
+          | (($c.descriptions // []) | (map(select(.lang == "en")) | .[0].value) // (.[0].value)) as $desc
+          | (($c.metrics.cvssMetricV31 // $c.metrics.cvssMetricV30 // $c.metrics.cvssMetricV2 // []) | .[0]) as $m
+          | ($m.cvssData // {}) as $cd
+          | ([ ($c.weaknesses // [])[].description[]? | select(.value | test("^CWE-")) | .value ] | unique | join(",")) as $cwe
+          | ([ ($c.references // [])[].url ] | unique) as $refs
+          | (if ($cwe | length) > 0 then $cwe else null end) as $cwe
+          | {
+              _cef: {
+                vendor: "NIST",
+                product: "National Vulnerability Database",
+                version: ($cd.version // ""),
+                signature_id: $c.id,
+                name: ($c.id + (if $desc != null then ": " + ($desc | .[0:180]) else "" end)),
+                severity: (if $cd.baseScore != null then ($cd.baseScore | floor) else sev_bucket($cd.baseSeverity) end),
+                extension: ( {
+                  rt:      to_epoch_ms($c.published),
+                  end:     to_epoch_ms($c.lastModified),
+                  msg:     $desc,
+                  reason:  $cd.baseSeverity,
+                  request: ($refs | first),
+                  outcome: $c.vulnStatus,
+                  cs1Label: "CVE ID",         cs1: $c.id,
+                  cs2Label: "CWE",            cs2: $cwe,
+                  cs3Label: "CVSS Vector",    cs3: $cd.vectorString,
+                  cs4Label: "CVSS Version",   cs4: $cd.version,
+                  cs5Label: "Vuln Status",    cs5: $c.vulnStatus,
+                  cs6Label: "Source",         cs6: $c.sourceIdentifier,
+                  cn1Label: "CVSS Base Score",     cn1: $cd.baseScore,
+                  cn2Label: "Exploitability Score", cn2: $m.exploitabilityScore,
+                  cn3Label: "Impact Score",        cn3: $m.impactScore
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }

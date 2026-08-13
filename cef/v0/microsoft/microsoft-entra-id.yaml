@@ -1,0 +1,77 @@
+name: "Microsoft Entra ID Sign-in Logs to CEF"
+description: "Maps Microsoft Entra ID (Azure AD) sign-in log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-entra-id"
+tags:
+  - "v0"
+  - "cef"
+  - "microsoft"
+  - "entra-id"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Microsoft Entra ID sign-in logs -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values: severity int 0-10, times as
+          # epoch-MILLISECONDS, custom cs*/cn* slots paired with *Label.
+          # One jq pass, per-record only; shallow null-drop on extension.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.status // {} ) as $st
+          | ( $r.deviceDetail // {} ) as $dd
+          | ( $r.location // {} ) as $loc
+          | ( ($st.errorCode // 0) == 0 ) as $ok
+          | ( $r.riskLevelDuringSignIn // $r.riskLevelAggregated // "none" ) as $risk
+          | { _cef: {
+              vendor: "Microsoft",
+              product: "Microsoft Entra ID",
+              version: "",
+              # Low-cardinality signature: sign-in success vs failure.
+              signature_id: ( if $ok then "signin.success" else "signin.failure" end ),
+              name: ( if $ok then "Entra ID sign-in succeeded" else "Entra ID sign-in failed" end ),
+              # Success is informational (2); failure is elevated, and a
+              # medium/high risk sign-in is escalated further.
+              severity: (
+                if ($ok | not) then 8
+                elif ($risk == "high") then 8
+                elif ($risk == "medium") then 5
+                else 2 end
+              ),
+              extension: ( {
+                rt:       to_epoch_ms($r.createdDateTime),
+                suser:    $r.userPrincipalName,
+                suid:     $r.userId,
+                src:      $r.ipAddress,
+                act:      "user-signin",
+                outcome:  ( if $ok then "SUCCESS" else "FAILURE" end ),
+                reason:   ($st.failureReason // $st.additionalDetails),
+                app:      $r.clientAppUsed,
+                dhost:    $dd.displayName,
+                deviceExternalId: $dd.deviceId,
+                requestClientApplication: $dd.browser,
+                externalId: $r.id,
+                # Custom slots (each paired with its *Label):
+                cs1Label: "resource",        cs1: $r.resourceDisplayName,
+                cs2Label: "appDisplayName",  cs2: $r.appDisplayName,
+                cs3Label: "conditionalAccessStatus", cs3: $r.conditionalAccessStatus,
+                cs4Label: "riskLevel",       cs4: $risk,
+                cs5Label: "authRequirement", cs5: $r.authenticationRequirement,
+                cs6Label: "correlationId",   cs6: $r.correlationId,
+                cn1Label: "errorCode",       cn1: ($st.errorCode // 0),
+                cfp1Label: "geoLatitude",    cfp1: ($loc.geoCoordinates.latitude),
+                cfp2Label: "geoLongitude",   cfp2: ($loc.geoCoordinates.longitude)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,59 @@
+name: "Okta Users to CEF"
+description: "Maps Okta Users directory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "okta-users"
+tags:
+  - "v0"
+  - "cef"
+  - "okta"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Okta Users (directory) -> CEF intermediate (T1). No escaping here.
+          # signature_id = okta.user.inventory (stable, low-cardinality).
+          # times epoch-ms; custom cs*/cn* slots paired with *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r |
+          ($r.profile // {}) as $p |
+          {
+            _cef: {
+              vendor: "Okta",
+              product: "Okta Users",
+              version: "",
+              signature_id: "okta.user.inventory",
+              name: ("Okta user inventory record: " + ($p.login // $p.email // $r.id)),
+              severity: 2,
+              extension: ( {
+                rt:       to_epoch_ms($r.lastUpdated // $r.created),
+                start:    to_epoch_ms($r.created),
+                end:      to_epoch_ms($r.lastLogin),
+                suser:    ($p.login // $p.email),
+                suid:     $r.id,
+                duser:    $p.displayName,
+                act:      "user-inventory",
+                outcome:  $r.status,
+                cs1Label: "department",       cs1: $p.department,
+                cs2Label: "title",            cs2: $p.title,
+                cs3Label: "manager",          cs3: $p.manager,
+                cs4Label: "credentialProvider", cs4: ($r.credentials.provider.type // null),
+                cs5Label: "employeeNumber",   cs5: $p.employeeNumber,
+                cs6Label: "userType",         cs6: $p.userType,
+                deviceCustomDate1Label: "passwordChanged",
+                deviceCustomDate1: to_epoch_ms($r.passwordChanged)
+              } | with_entries(select(.value != null and .value != "")) )
+            }
+          }

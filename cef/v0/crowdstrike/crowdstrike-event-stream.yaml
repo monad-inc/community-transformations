@@ -1,0 +1,68 @@
+name: "CrowdStrike Event Stream Detections to CEF"
+description: "Maps CrowdStrike Falcon Event Stream DetectionSummaryEvent records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-event-stream"
+tags:
+  - "v0"
+  - "cef"
+  - "crowdstrike"
+  - "detection"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CrowdStrike Falcon Event Stream (DetectionSummaryEvent) -> CEF (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns it.
+          # Final-form values only: severity int 0-10; times epoch-MILLIS;
+          # custom cs*/cn* slots paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1000000000000 then $ts else ($ts * 1000) end | floor)
+            else null end;
+
+          . as $r
+          | ($r.event // {}) as $e
+          | ($r.metadata // {}) as $m
+          # CrowdStrike Severity 1..5 -> CEF severity 0..10 (x2 clamp)
+          | (($e.Severity // 0) * 2) as $sev
+          | { _cef: {
+              vendor: "CrowdStrike",
+              product: "Falcon",
+              version: ($m.version // ""),
+              signature_id: ($m.eventType // "DetectionSummaryEvent"),
+              name: ($e.DetectName // "CrowdStrike Detection"),
+              severity: (if $sev > 10 then 10 elif $sev < 0 then 0 else $sev end),
+              extension: ( {
+                rt:       to_epoch_ms($m.eventCreationTime),
+                start:    to_epoch_ms($e.ProcessStartTime),
+                dhost:    $e.ComputerName,
+                dvchost:  $e.ComputerName,
+                duser:    $e.UserName,
+                src:      $e.LocalIP,
+                smac:     $e.MACAddress,
+                dntdom:   $e.MachineDomain,
+                msg:      $e.DetectDescription,
+                act:      $e.PatternDispositionDescription,
+                outcome:  (if ($e.PatternDispositionValue // 0) > 0 then "Prevented" else "Detected" end),
+                fname:    $e.FileName,
+                filePath: $e.FilePath,
+                fileHash: $e.SHA256String,
+                dproc:    $e.CommandLine,
+                dpid:     $e.ProcessId,
+                request:  $e.FalconHostLink,
+                cs1Label: "Tactic",          cs1: $e.Tactic,
+                cs2Label: "Technique",       cs2: $e.Technique,
+                cs3Label: "Objective",       cs3: $e.Objective,
+                cs4Label: "SeverityName",    cs4: $e.SeverityName,
+                cs5Label: "MD5",             cs5: $e.MD5String,
+                cs6Label: "DetectId",        cs6: $e.DetectId,
+                cn1Label: "PatternDisposition", cn1: $e.PatternDispositionValue
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

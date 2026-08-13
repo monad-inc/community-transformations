@@ -1,0 +1,66 @@
+name: "GitHub Dependabot Alerts to CEF"
+description: "Maps GitHub Dependabot vulnerability alert records into the normalized {_cef:{...}} CEF intermediate (advisory identifiers, CVSS score, affected package, repository). Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-dependabot-alerts"
+tags:
+  - "v0"
+  - "cef"
+  - "github"
+  - "dependabot"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # GitHub Dependabot Alert -> CEF intermediate (T1).
+          # NO escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Final-form values: severity int 0-10; times epoch-MS; custom
+          # slots paired with their *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.security_advisory // {}) as $adv
+          | ($r.security_vulnerability // {}) as $sv
+          | ($r.dependency // {}) as $dep
+          | (($dep.package // $sv.package // $adv.vulnerabilities[0].package) // {}) as $pkg
+          | ($adv.severity // $sv.severity // "") as $sev
+
+          | { _cef: {
+              vendor: "GitHub",
+              product: "Dependabot",
+              version: "",
+              signature_id: ("dependabot.alert." + ($r.state // "unknown")),
+              name: ($adv.summary // ("Dependabot alert " + ($r.number | tostring))),
+              # GitHub advisory severity -> CEF 0-10 bucket
+              severity: ( { "low": 3, "medium": 6, "high": 8, "critical": 10 }[$sev] // 0 ),
+              extension: ( {
+                rt:      to_epoch_ms($r.updated_at // $r.created_at),
+                start:   to_epoch_ms($r.created_at),
+                msg:     ($adv.summary // $adv.description),
+                act:     $r.state,
+                outcome: (if $r.state == "fixed" then "SUCCESS"
+                          elif ($r.state == "dismissed" or $r.state == "auto_dismissed") then "SUPPRESSED"
+                          else "OPEN" end),
+                request: $r.html_url,
+                fname:   $dep.manifest_path,
+                reason:  $r.dismissed_reason,
+                cat:     $pkg.ecosystem,
+                cs1Label: "cveId",                   cs1: $adv.cve_id,
+                cs2Label: "ghsaId",                  cs2: $adv.ghsa_id,
+                cs3Label: "vulnerablePackage",       cs3: $pkg.name,
+                cs4Label: "vulnerableVersionRange",  cs4: $sv.vulnerable_version_range,
+                cs5Label: "fixedInVersion",          cs5: $sv.first_patched_version.identifier,
+                cs6Label: "repository",              cs6: ($r.repository.full_name // $r.repository.name),
+                cfp1Label: "cvssBaseScore",          cfp1: $adv.cvss.score
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
