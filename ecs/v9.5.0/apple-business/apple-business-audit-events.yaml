@@ -1,0 +1,110 @@
+name: "Apple Business Manager Audit Events to ECS v9.5.0"
+description: "Maps Apple Business Manager audit events into Elastic Common Schema (ECS) v9.5.0 nested documents, populating event categorization (iam/configuration), user, device, group, cloud, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "apple-business-audit-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "apple-business"
+  - "audit-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Apple Business Manager auditEvents -> ECS v9.5.0 (nested).
+          # event.kind=event; category iam+configuration; type from the verb.
+          # One jq pass; single end-of-pipeline walk-based prune.
+          # ---------------------------------------------------------------
+          def has_sub($t; $s): ($t | ascii_upcase | index($s)) != null;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($a.type // "") as $t
+          | ($a.subjectType // "" | ascii_upcase) as $st
+          | ($a.eventDataDeviceAddedToOrg // $a.eventDataDeviceRemovedFromOrg
+             // $a.eventDataDeviceAssignedToServer // $a.eventDataDeviceUnassignedFromServer
+             // $a.eventDataDeviceIsErased // {}) as $devdata
+
+          | (
+              if   has_sub($t;"CREATED") or has_sub($t;"ADDED") or has_sub($t;"ASSOCIATED") or has_sub($t;"GENERATED") then "creation"
+              elif has_sub($t;"DELETED") or has_sub($t;"REMOVED") or has_sub($t;"DISASSOCIATED") or has_sub($t;"REVOKED") then "deletion"
+              elif has_sub($t;"UPDATED") or has_sub($t;"CHANGED") then "change"
+              else "info" end
+            ) as $etype
+
+          | (
+              if   ($a.outcome // "" | ascii_upcase) == "SUCCESS" then "success"
+              elif ($a.outcome // "" | ascii_upcase) == "FAILURE" then "failure"
+              else "unknown" end
+            ) as $outcome
+
+          | [$a.actorName, (if $st == "USER" or $st == "ACCOUNT" or $st == "API_ACCOUNT" then $a.subjectName else null end)]
+            as $rel_users
+
+          | {
+              "@timestamp": $a.eventDateTime,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["iam", "configuration"],
+                "type": [$etype],
+                "action": ($t | ascii_downcase | if . == "" then null else . end),
+                "outcome": $outcome,
+                "id": $r.id,
+                "provider": "apple-business-manager",
+                "module": "apple_business",
+                "dataset": "apple_business.audit",
+                "original": ($r | tojson)
+              },
+
+              "user": {
+                "id": $a.actorId,
+                "name": $a.actorName,
+                "email": ($a.actorName | if (type == "string" and (index("@") != null)) then . else null end),
+                "target": (
+                  if $st == "USER" or $st == "ACCOUNT" or $st == "API_ACCOUNT" then {
+                    "id": $a.subjectId,
+                    "name": $a.subjectName
+                  } else null end)
+              },
+
+              "device": (
+                if $st == "DEVICE" then {
+                  "id": $a.subjectId,
+                  "serial_number": $devdata.serialNumber,
+                  "model": { "name": $a.subjectName }
+                } else null end),
+
+              "host": (
+                if $st == "DEVICE" then {
+                  "id": $a.subjectId,
+                  "name": $a.subjectName
+                } else null end),
+
+              "group": { "id": $a.groupId },
+
+              "organization": { "name": "Apple Business Manager" },
+
+              "cloud": {
+                "provider": "apple",
+                "service": { "name": "Apple Business Manager" }
+              },
+
+              "related": {
+                "user": ($rel_users | map(select(. != null and . != "")) | unique)
+              },
+
+              "message": (($a.actorName // "actor") + " " + $t + " on " + ($a.subjectName // ($a.subjectType // "resource")))
+            }
+
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end)

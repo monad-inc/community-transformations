@@ -1,0 +1,91 @@
+name: "AlienVault OTX Subscribed Pulses to ECS v9.5.0"
+description: "Maps AlienVault OTX subscribed-pulse threat-intelligence records into Elastic Common Schema (ECS) v9.5.0, populating the event categorization, threat.feed/group/software/technique field sets, related.* aggregation, and an alienvault_otx.* vendor namespace for the indicator list."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-subscribed-pulses"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "alienvault"
+  - "threat-intelligence"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AlienVault OTX subscribed pulse -> ECS v9.5.0 (nested).
+          # event.kind=enrichment, event.category=[threat], event.type=[indicator].
+          # A pulse is a feed of many indicators; ECS threat.indicator is
+          # singular, so the pulse metadata maps to threat.feed/group/
+          # software/technique, indicator values aggregate into related.*,
+          # and the full indicator list is preserved (as a JSON string) under
+          # the alienvault_otx.* vendor namespace to avoid mapping explosion.
+          # One jq pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) or ($s | test("^[0-9a-fA-F:]+:[0-9a-fA-F:]*$")));
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          . as $p
+          | ($p.indicators // []) as $ind
+          | ((($p.TLP // "") | ascii_upcase) | if . == "" then null else . end) as $tlp
+          | {
+              "@timestamp": ($p.modified // $p.created),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "enrichment",
+                "category": ["threat"],
+                "type": ["indicator"],
+                "outcome": "unknown",
+                "id": ($p.id | tostring),
+                "provider": "AlienVault OTX",
+                "module": "otx",
+                "dataset": "otx.pulse",
+                "created": $p.created,
+                "reference": ($p.references[0]? )
+              },
+              "message": $p.description,
+              "tags": $p.tags,
+              "threat": {
+                "feed": {
+                  "name": $p.name,
+                  "description": $p.description,
+                  "reference": ($p.references[0]?)
+                },
+                "group": { "name": $p.adversary },
+                "software": {
+                  "name": ($p.malware_families[0]?),
+                  "alias": $p.malware_families
+                },
+                "technique": { "id": $p.attack_ids },
+                "indicator": {
+                  "marking": ({ "tlp": $tlp } | with_entries(select(.value != null)))
+                }
+              },
+              "related": {
+                "ip":    ([ $ind[] | select((.type // "" | ascii_downcase | startswith("ipv")) or (.type // "") == "CIDR") | .indicator | select(is_ip(.)) ] | unique),
+                "hash":  ([ $ind[] | select(.type // "" | ascii_downcase | startswith("filehash")) | .indicator ] | unique),
+                "hosts": ([ $ind[] | select((.type // "") == "domain" or (.type // "") == "hostname") | .indicator ] | unique)
+              },
+              "alienvault_otx": {
+                "pulse": {
+                  "id": $p.id,
+                  "revision": $p.revision,
+                  "author_name": $p.author_name,
+                  "public": $p.public,
+                  "adversary": $p.adversary,
+                  "malware_families": $p.malware_families,
+                  "attack_ids": $p.attack_ids,
+                  "targeted_countries": $p.targeted_countries,
+                  "industries": $p.industries,
+                  "indicator_count": ($ind | length)
+                },
+                "indicators": json_str($ind)
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)

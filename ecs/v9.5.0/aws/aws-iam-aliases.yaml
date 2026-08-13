@@ -1,0 +1,83 @@
+name: "AWS IAM Account Aliases to ECS v9.5.0"
+description: "Normalizes AWS IAM account-alias inventory records (an AWS account and its IAM account alias) into Elastic Common Schema (ECS) v9.5.0 asset-inventory fields (event, cloud.account, organization, related), emitted as event.kind: asset in the iam category."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-iam-aliases"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "iam"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS IAM Account Aliases -> ECS v9.5.0 (asset inventory)
+          #
+          # Input: one aws-iam-aliases record per invocation, shape:
+          #   { "AccountID": "123456789012", "Alias": "acme-production" }
+          # from the Monad `aws-iam-aliases` input connector — each AWS
+          # account and its single IAM account alias.
+          #
+          # This is an inventory SNAPSHOT (no event time, no actor), so:
+          #   event.kind     = asset
+          #   event.category = [iam]   (account/alias is IAM configuration)
+          #   event.type     = [info]  (iam permits info; snapshot, no change)
+          #   event.outcome  = success
+          #   @timestamp     = collection time (now); source has none
+          #   .AccountID -> cloud.account.id
+          #   .Alias     -> cloud.account.name / organization.name
+          # =================================================================
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.AccountID // null) as $acct
+          | ($r.Alias // null) as $alias
+          | (now | todateiso8601) as $ts
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $ts,
+
+              event: {
+                kind: "asset",
+                module: "aws",
+                dataset: "aws.iam",
+                provider: "iam.amazonaws.com",
+                action: "iam-account-alias-inventory",
+                category: ["iam"],
+                type: ["info"],
+                outcome: "success"
+              },
+
+              cloud: {
+                provider: "aws",
+                account: {
+                  id: $acct,
+                  name: $alias
+                }
+              },
+
+              # The account alias is the human-facing name of the AWS account,
+              # which ECS also models as the owning organization's name.
+              organization: {
+                id: $acct,
+                name: $alias
+              }
+            }
+          | prune

@@ -1,0 +1,85 @@
+name: "Abnormal Security Cases to ECS v9.5.0"
+description: "Transforms Abnormal Security case records (account-takeover / email-security cases from the /v1/cases API) into a nested Elastic Common Schema (ECS) v9.5.0 document, populating event categorization, user, observer, related, and the abnormal.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-cases"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "abnormal"
+  - "cases"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # ECS v9.5.0 — Abnormal Security case (email-security detection)
+          # event.kind=alert  category=[intrusion_detection]  type=[info]
+          # Input: one Abnormal case record per invocation.
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.affectedEmployee // null) as $emp
+          | (if ($emp != null) then ($emp | split("@")[0]) else null end) as $emp_local
+          | ((($r.severity // "") | ascii_downcase)) as $sev
+
+          # Severity text -> ECS numeric event.severity (0-100 style banding).
+          | (if   ($sev | test("takeover|compromis|exfiltrat")) then 73
+             elif  ($sev | test("phish|fraud|impersonat"))      then 47
+             elif  ($sev == "")                                 then null
+             else                                                    47
+             end) as $severity_num
+
+          | {
+              "@timestamp": $r.firstObserved,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind":     "alert",
+                "category": ["intrusion_detection"],
+                "type":     ["info"],
+                "outcome":  "unknown",
+                "id":       ($r.caseId | tostring),
+                "action":   $r.analysis,
+                "severity": $severity_num,
+                "reason":   $r.description,
+                "provider": "abnormal-cases",
+                "module":   "abnormal"
+              },
+
+              "message": ($r.genai_summary // $r.description),
+
+              "user": ({
+                 "email": $emp,
+                 "name":  $emp_local
+               } | with_entries(select(.value != null and .value != ""))),
+
+              "observer": {
+                "vendor":  "Abnormal Security",
+                "product": "Abnormal Behavior Platform"
+              },
+
+              "related": ({
+                 "user": ([$emp, $emp_local] | map(select(. != null and . != "")) | unique)
+               } | with_entries(select(.value | length > 0))),
+
+              # --- Vendor namespace (allowed by ECS for custom data) ---
+              "abnormal": ({
+                 "case_id":            ($r.caseId | tostring),
+                 "case_status":        $r.case_status,
+                 "remediation_status": $r.remediation_status,
+                 "severity":           $r.severity,
+                 "analysis":           $r.analysis,
+                 "affected_employee":  $emp,
+                 "threat_ids":         $r.threatIds,
+                 "genai_summary":      $r.genai_summary
+               } | with_entries(select(.value != null and .value != "")))
+            }
+          # Single end-of-pipeline prune: ES rejects nulls; drop empties.
+          | walk(if type == "object"
+                 then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                 else . end)

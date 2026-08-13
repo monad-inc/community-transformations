@@ -1,0 +1,112 @@
+name: "Anthropic Compliance Activities to ECS v9.5.0"
+description: "Maps Anthropic Claude Compliance API activity-feed records into nested Elastic Common Schema (ECS) v9.5.0 documents, covering event categorization, user, source, user_agent, organization, cloud, related.*, and the anthropic.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-activities"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "compliance-activities"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Compliance API activity feed -> ECS v9.5.0
+          # One activity record in -> one nested ECS document out.
+          #
+          # event.category routing (by activity `type`):
+          #   login/logout/sso/mfa/session   -> authentication (start/end/info)
+          #   user/role/group/scim/invite    -> iam            (creation/deletion/change/info)
+          #   everything else                -> api            (creation/access/change/deletion/info)
+          # ---------------------------------------------------------------
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")) or ($s | test(":")));
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != ""))
+              else . end);
+
+          . as $r
+          | ($r.actor // {}) as $a
+          | ($a.email_address // $a.unauthenticated_email_address) as $email
+          | ($a.user_id // $a.api_key_id // $a.admin_api_key_id // $a.directory_id) as $auid
+          | ($a.ip_address) as $ip
+          | ($r.type // "") as $t
+          | ($t | ascii_downcase) as $tl
+          | (def has($s): ($tl | contains($s));
+             if (has("login") or has("logout") or has("logon") or has("logoff")
+                 or has("sso") or has("sign_in") or has("sign_out") or has("mfa")
+                 or has("session_") or has("authenticat")) then "authentication"
+             elif (has("_user") or has("user_") or has("role") or has("group")
+                   or has("scim") or has("invite") or has("permission") or has("member")) then "iam"
+             else "api" end) as $category
+          | (def has($s): ($tl | contains($s));
+             if $category == "authentication" then
+               (if (has("login") or has("logon") or has("sign_in")) then "start"
+                elif (has("logout") or has("logoff") or has("sign_out")) then "end"
+                else "info" end)
+             else
+               (if (has("created") or has("added") or has("uploaded") or has("invited")
+                    or has("generated") or has("enrolled") or has("installed")) then "creation"
+                elif (has("deleted") or has("removed") or has("revoked")
+                      or has("archived") or has("uninstalled")) then "deletion"
+                elif (has("updated") or has("changed") or has("renamed") or has("modified")
+                      or has("enabled") or has("disabled") or has("accepted") or has("assigned")) then "change"
+                elif ($category == "api" and (has("viewed") or has("read") or has("listed")
+                      or has("exported") or has("downloaded") or has("accessed") or has("retrieved"))) then "access"
+                else "info" end)
+             end) as $etype
+          | (def has($s): ($tl | contains($s));
+             if (has("failed") or has("denied") or has("rejected")
+                 or has("blocked") or has("error")) then "failure"
+             else "success" end) as $outcome
+          | {
+              "@timestamp": $r.created_at,
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: [ $category ],
+                type: [ $etype ],
+                outcome: $outcome,
+                action: $r.type,
+                id: $r.id,
+                provider: "anthropic",
+                module: "anthropic_compliance",
+                dataset: "anthropic.compliance_activities"
+              },
+              user: {
+                email: $email,
+                id: $auid,
+                name: ($email // $a.type)
+              },
+              source: (if is_ip($ip) then { ip: $ip } else null end),
+              user_agent: (if $a.user_agent then { original: $a.user_agent } else null end),
+              organization: { id: $r.organization_id },
+              cloud: { provider: "anthropic" },
+              related: {
+                user: ([ $email, $auid ] | map(select(. != null)) | unique),
+                ip:   ([ $ip ] | map(select(is_ip(.))) | unique)
+              },
+              anthropic: {
+                activity: { id: $r.id, type: $r.type },
+                actor: { type: $a.type, user_agent: $a.user_agent },
+                chat: { id: $r.claude_chat_id },
+                project: { id: $r.claude_project_id },
+                organization: { uuid: $r.organization_uuid },
+                directory: { id: $a.directory_id, idp_connection_type: $a.idp_connection_type },
+                workos_event_id: $a.workos_event_id,
+                filename: $r.filename
+              }
+            }
+          | prune

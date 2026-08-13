@@ -1,0 +1,90 @@
+name: "Atlassian Jira Users to ECS v9.5.0"
+description: "Normalizes Atlassian Jira Cloud user directory records (from the atlassian-jira-users input) into Elastic Common Schema (ECS) v9.5.0 identity fields (event, user, user.group, user.roles, related), with the non-ECS Jira attributes preserved under the atlassian.* namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "atlassian"
+  - "jira"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Atlassian Jira Users  ->  ECS v9.5.0
+          #
+          # Input: ONE Jira Cloud user record per invocation (Jira platform
+          # REST v3 users API). A Jira user record has no timestamp of its
+          # own, so @timestamp is the collection time (now). This is a
+          # directory/inventory snapshot -> event.kind: asset, category iam.
+          #
+          #   .accountId        -> user.id
+          #   .displayName      -> user.name / user.full_name
+          #   .emailAddress     -> user.email (+ user.domain from the domain part)
+          #   .accountType      -> user.entity.type
+          #   .groups.items[]   -> user.group.* (first) + atlassian.user.groups
+          #   .applicationRoles -> user.roles
+          #   .active           -> atlassian.user.active
+          # =================================================================
+          . as $r
+          | ($r.emailAddress // "") as $email
+          | ($r.groups.items // []) as $groups
+          | ($r.applicationRoles.items // []) as $approles
+          | {
+              "@timestamp": (now | todateiso8601),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "asset",
+                "category": ["iam"],
+                "type": ["user", "info"],
+                "outcome": "success",
+                "action": "user-inventory",
+                "provider": "jira",
+                "module": "atlassian",
+                "dataset": "atlassian.jira.users"
+              },
+
+              "user": ( {
+                "id":        $r.accountId,
+                "name":      ($r.displayName // $email),
+                "full_name": $r.displayName,
+                "email":     ( if $email != "" then $email else null end ),
+                "domain":    ( if ($email | contains("@")) then ($email | split("@") | last) else null end ),
+                "roles":     ( ($approles | map(.name // .key) | map(select(. != null)))
+                               | if length > 0 then . else null end ),
+                "group":     ( ($groups | first) as $g
+                               | if $g == null then null
+                                 else ( { "name": $g.name, "id": $g.groupId }
+                                        | with_entries(select(.value != null)) )
+                                 end ),
+                "entity":    ( { "id": $r.accountId, "name": $r.displayName, "type": [ ($r.accountType // "atlassian") ] }
+                               | with_entries(select(.value != null)) )
+              } | with_entries(select(.value != null)) ),
+
+              "related": ( {
+                "user": ( [ $r.displayName, $email, $r.accountId ]
+                          | map(select(. != null and . != "")) | unique )
+              } ),
+
+              # Non-ECS Jira attributes preserved under a vendor namespace.
+              "atlassian": ( { "user": ( {
+                  "account_id":   $r.accountId,
+                  "account_type": $r.accountType,
+                  "active":       ( if ($r.active|type) == "boolean" then $r.active else null end ),
+                  "time_zone":    $r.timeZone,
+                  "locale":       $r.locale,
+                  "self":         $r.self,
+                  "groups":       ( ($groups | map(.name) | map(select(. != null))) | if length > 0 then . else null end )
+                } | with_entries(select(.value != null)) ) } )
+            }
+          # single end-of-pipeline prune: drop null / {} / [] anywhere
+          | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null)) else . end )

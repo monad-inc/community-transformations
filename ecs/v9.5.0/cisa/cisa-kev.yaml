@@ -1,0 +1,86 @@
+name: "CISA Known Exploited Vulnerabilities to ECS v9.5.0"
+description: "Maps CISA Known Exploited Vulnerabilities (KEV) catalog entries into Elastic Common Schema (ECS) v9.5.0, populating event categorization and the vulnerability.* field set."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cisa-kev"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cisa"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CISA KEV catalog entry -> ECS v9.5.0 (nested).
+          # event.kind=alert, event.category=[vulnerability], event.type=[info]
+          # (the only type ECS pairs with the vulnerability category),
+          # event.outcome=unknown (a catalog listing, not an assessed result).
+          # KEV-specific fields with no ECS home live under the `cisa.*`
+          # custom namespace. One jq pass; single trailing prune.
+          # ---------------------------------------------------------------
+          . as $r |
+
+          # KEV dates are date-only; render an ISO-8601 instant for @timestamp
+          # and the date fields.
+          def iso($d): if $d == null then null else ($d + "T00:00:00.000Z") end;
+
+          ( (($r.notes // "") | split(";") | map(gsub("^\\s+|\\s+$"; ""))
+             | map(select(. != "" and startswith("http")))) ) as $refs |
+
+          (if (($r.knownRansomwareCampaignUse // "") | ascii_downcase) == "known"
+             then "Critical" else "High" end) as $sev |
+
+          {
+            "@timestamp": (iso($r.dateAdded)),
+            "ecs": { "version": "9.5.0" },
+
+            "message": $r.vulnerabilityName,
+
+            "event": {
+              "kind": "alert",
+              "category": ["vulnerability"],
+              "type": ["info"],
+              "outcome": "unknown",
+              "provider": "CISA",
+              "module": "cisa-kev",
+              "dataset": "cisa.kev",
+              "reference": ($refs | first),
+              "created": (iso($r.dateAdded))
+            },
+
+            "vulnerability": {
+              "id": $r.cveID,
+              "enumeration": "CVE",
+              "description": $r.shortDescription,
+              "reference": ($refs | first),
+              "category": (if $r.vendorProject != null then [$r.vendorProject] else null end),
+              "severity": $sev,
+              "scanner": { "vendor": "CISA" }
+            },
+
+            # KEV-only fields with no ECS field home (custom vendor namespace,
+            # allowed by ECS and the validator).
+            "cisa": {
+              "vendor_project": $r.vendorProject,
+              "product": $r.product,
+              "vulnerability_name": $r.vulnerabilityName,
+              "required_action": $r.requiredAction,
+              "date_added": (iso($r.dateAdded)),
+              "due_date": (iso($r.dueDate)),
+              "known_ransomware_campaign_use": $r.knownRansomwareCampaignUse,
+              "cwes": $r.cwes
+            },
+
+            "tags": (if (($r.knownRansomwareCampaignUse // "") | ascii_downcase) == "known"
+                       then ["known-exploited", "ransomware"] else ["known-exploited"] end)
+          }
+          # Single recursive prune: drop null / {} / [] (ES rejects nulls).
+          | walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null))
+                 else . end)

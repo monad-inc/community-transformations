@@ -1,0 +1,124 @@
+name: "AWS Redshift Audit Logs to ECS v9.5.0"
+description: "Normalizes AWS Redshift database audit connection-log records into Elastic Common Schema (ECS) v9.5.0 security fields (event, cloud, user, source, tls, related), mapping Redshift authentication/connection events to event.category authentication."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-redshift-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "redshift"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Redshift audit connection log  ->  ECS v9.5.0
+          # Input: ONE Redshift connection-log record per invocation, as
+          #   emitted by the `aws-redshift-audit-logs` input connector.
+          #
+          #   .recordtime   -> @timestamp
+          #   .event        -> event.action  (+ category/type/outcome)
+          #   .username     -> user.name
+          #   .dbname       -> user.domain / source db context
+          #   .remotehost   -> source.ip / source.address
+          #   .remoteport   -> source.port
+          #   .sslversion   -> tls.version   .sslcipher -> tls.cipher
+          #   .region/.account -> cloud.region / cloud.account.id
+          #
+          # Redshift's connection log is an authentication stream, so every
+          # record lands in event.category=authentication, which is what SIEM
+          # detection content keys on.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.event // "" | ascii_downcase) as $ev
+
+          # ECS category=authentication pairs with type start/end/info.
+          # authenticated / initiating session -> start; disconnecting -> end.
+          | ( if ($ev | test("disconnect")) then ["end"]
+              elif ($ev | test("auth|initiat|session|connect")) then ["start"]
+              else ["info"] end ) as $type
+
+          | ( if ($ev | test("fail|denied|error")) then "failure"
+              elif ($ev | test("auth|initiat|session|connect")) then "success"
+              else "unknown" end ) as $outcome
+
+          | {
+              "@timestamp": $r.recordtime,
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                module: "aws",
+                dataset: "aws.redshift_audit",
+                provider: "redshift",
+                action: ($r.event // null),
+                category: ["authentication"],
+                type: $type,
+                outcome: $outcome
+              },
+
+              cloud: {
+                provider: "aws",
+                region: ($r.region // null),
+                account: ( if $r.account then { id: ($r.account | tostring) } else null end )
+              },
+
+              user: {
+                name: ($r.username // null),
+                domain: ($r.dbname // null)
+              },
+
+              source: {
+                address: ($r.remotehost // null),
+                ip: ( if is_ip($r.remotehost) then $r.remotehost else null end ),
+                port: ( if $r.remoteport then ($r.remoteport | tonumber? // null) else null end )
+              },
+
+              tls: {
+                version: ($r.sslversion // null | if . == null then null else (ltrimstr("TLSv") | ltrimstr("SSLv")) end),
+                version_protocol: ( if ($r.sslversion // "" | test("TLS")) then "tls"
+                                    elif ($r.sslversion // "" | test("SSL")) then "ssl"
+                                    else null end ),
+                cipher: ($r.sslcipher // null)
+              },
+
+              redshift: {
+                cluster_id: ($r.clusterid // null),
+                pid: ($r.pid // null),
+                session_id: ($r.sessionid // null),
+                auth_method: ($r.authmethod // null),
+                application_name: ($r.application_name // null),
+                driver_version: ($r.driver_version // null),
+                os_version: ($r.os_version // null),
+                plugin_name: ($r.plugin_name // null),
+                protocol_version: ($r.protocol_version // null),
+                iam_auth_guid: ($r.iamauthguid // null),
+                duration_us: ($r.duration // null)
+              },
+
+              related: {
+                ip: ( if is_ip($r.remotehost) then [$r.remotehost] else [] end ),
+                user: ( [ $r.username ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune

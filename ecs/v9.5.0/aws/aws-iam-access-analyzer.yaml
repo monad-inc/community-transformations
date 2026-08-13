@@ -1,0 +1,126 @@
+name: "AWS IAM Access Analyzer Findings to ECS v9.5.0"
+description: "Normalizes AWS IAM Access Analyzer external-access finding records into Elastic Common Schema (ECS) v9.5.0 fields (event, cloud, user, related, rule) as security alerts, and preserves the raw finding under the aws.access_analyzer.* namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-iam-access-analyzer"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "access-analyzer"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS IAM Access Analyzer  ->  ECS v9.5.0
+          #
+          # Input: ONE Access Analyzer Finding record per invocation, from the
+          # Monad `aws-iam-access-analyzer` input connector.
+          #
+          # A finding has no success/failure semantics, so it maps to
+          #   event.kind: alert  (security findings are alerts in ECS)
+          #   event.category: [configuration, iam]
+          #   event.type: [info]      (legal for both categories)
+          #   event.outcome: unknown
+          # Field mappings:
+          #   .analyzedAt          -> @timestamp
+          #   .id                  -> event.id, rule.id
+          #   .status              -> event.action, aws.access_analyzer.status
+          #   .isPublic            -> event.severity
+          #   .resource            -> cloud.* + related, aws.access_analyzer.*
+          #   .resourceOwnerAccount-> cloud.account.id
+          #   .principal           -> user.* / related.user (external principal)
+          # =================================================================
+
+          def json_str: if . == null then null else (. | tojson) end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.status // "ACTIVE" ) as $status
+          | ( [ ($r.principal // {}) | to_entries[] | .value ] ) as $principals
+          # Analyzer ARN carries the region; S3 resource ARNs do not.
+          | ( ($r.analyzerArn // "") | split(":") ) as $aarn
+          | ( if ($aarn | length) > 3 and ($aarn[3] != "") then $aarn[3] else null end ) as $region
+
+          | {
+              "@timestamp": ($r.analyzedAt // $r.updatedAt // $r.createdAt),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": ["configuration", "iam"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": $r.id,
+                "action": (if $status != null then ("access-analyzer-finding-" + ($status | ascii_downcase)) else null end),
+                "provider": "access-analyzer",
+                "module": "access-analyzer",
+                "created": $r.createdAt,
+                "severity": (if ($r.isPublic // false) == true then 73 else 47 end),
+                "risk_score": (if ($r.isPublic // false) == true then 73 else 47 end),
+                "reason": ("External access to " + ($r.resourceType // "resource") + " " + ($r.resource // $r.id))
+              },
+
+              "rule": {
+                "id": $r.id,
+                "name": "IAM Access Analyzer external access finding",
+                "ruleset": "IAM Access Analyzer"
+              },
+
+              "cloud": {
+                "provider": "aws",
+                "region": $region,
+                "account": { "id": $r.resourceOwnerAccount }
+              },
+
+              # The external principal that has access to the resource.
+              "user": (if ($principals | length) > 0
+                       then { "id": $principals[0], "name": $principals[0] }
+                       else null end),
+
+              "related": {
+                "user": ($principals | map(select(. != null)) | unique)
+              },
+
+              "message": ("External access finding for " + ($r.resource // $r.id) + " (" + $status + ")"),
+
+              "tags": (if ($r.isPublic // false) == true then ["public-access"] else ["external-access"] end),
+
+              # Vendor namespace: raw finding detail, deep maps serialized to
+              # JSON strings to avoid Elasticsearch mapping explosion.
+              "aws": {
+                "access_analyzer": {
+                  "finding_id": $r.id,
+                  "status": $status,
+                  "is_public": $r.isPublic,
+                  "resource": $r.resource,
+                  "resource_type": $r.resourceType,
+                  "resource_owner_account": $r.resourceOwnerAccount,
+                  "actions": $r.action,
+                  "principal": ($r.principal | json_str),
+                  "condition": ($r.condition | json_str),
+                  "sources": ($r.sources | json_str),
+                  "resource_control_policy_restriction": $r.resourceControlPolicyRestriction,
+                  "analyzer_arn": $r.analyzerArn,
+                  "analyzed_at": $r.analyzedAt,
+                  "created_at": $r.createdAt,
+                  "updated_at": $r.updatedAt,
+                  "error": $r.error
+                }
+              }
+            }
+          | prune

@@ -1,0 +1,86 @@
+name: "Buildkite Audit Logs to ECS v9.5.0"
+description: "Maps Buildkite Audit Log events into nested Elastic Common Schema (ECS) v9.5.0 documents, populating event categorization (iam), user, source, user_agent, organization, and related.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "buildkite-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "buildkite"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Buildkite Audit Logs -> ECS v9.5.0 (nested).
+          # event.kind=event, event.category=[iam], event.type derived from the
+          # SCREAMING_SNAKE `type` suffix (creation/deletion/change/user/info).
+          # One jq pass; bind-once; is_ip guard on ip fields; related.* union;
+          # single end-of-pipeline walk prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+
+          . as $r
+          | ($r.type // "") as $t
+          | (if   ($t | endswith("_CREATED")) then ["user","creation"]
+             elif ($t | endswith("_DELETED")) then ["user","deletion"]
+             elif ($t | endswith("_UPDATED")) then ["user","change"]
+             else ["user","info"] end) as $etype
+          | ($r.context.request_ip // null) as $src_ip
+          | {
+              "@timestamp": ($r.occurred_at // null),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["iam"],
+                "type": $etype,
+                "action": ($t | ascii_downcase),
+                "outcome": "success",
+                "id": ($r.uuid // null),
+                "provider": "buildkite-audit-log",
+                "module": "buildkite"
+              },
+
+              "user": ({
+                "id":         ($r.subject.uuid // null),
+                "name":       ($r.subject.name // null),
+                "email":      ($r.data.email // null)
+              } | with_entries(select(.value != null))),
+
+              # The acting administrator (actor) under related + source.user
+              "source": ({
+                "ip":   (if is_ip($src_ip) then $src_ip else null end),
+                "user": ({
+                  "id":   ($r.actor.uuid // null),
+                  "name": ($r.actor.name // null)
+                } | with_entries(select(.value != null)))
+              } | with_entries(select(.value != null))),
+
+              "user_agent": ({
+                "original": ($r.context.request_user_agent // null)
+              } | with_entries(select(.value != null))),
+
+              "organization": ({
+                "name": ($r.url // "" | capture("/organizations/(?<slug>[^/]+)/") | .slug // null)
+              } | with_entries(select(.value != null))),
+
+              "related": {
+                "user": ([$r.actor.name, $r.subject.name, $r.data.email]
+                         | map(select(. != null)) | unique),
+                "ip":   ([ (if is_ip($src_ip) then $src_ip else null end) ]
+                         | map(select(. != null)) | unique)
+              }
+            }
+          | walk(
+              if   type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array"  then map(select(. != null))
+              else . end
+            )

@@ -1,0 +1,93 @@
+name: "Atlassian Jira Project Roles to ECS v9.5.0"
+description: "Maps Atlassian Jira project-role membership records (atlassian-jira-roles) into Elastic Common Schema (ECS) v9.5.0, covering event categorization (iam), user/group/related field sets, and the jira.* vendor namespace."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-roles"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "atlassian"
+  - "roles"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Atlassian Jira ProjectRole (atlassian-jira-roles) -> ECS v9.5.0.
+          # One nested ECS document per record. A roles pull is a state
+          # snapshot of a project role and its members:
+          #   event.kind=state, event.category=[iam],
+          #   event.type=[group,info], event.outcome=success.
+          # Deeply-nested vendor data goes under the jira.* namespace
+          # (actors serialized to a JSON string to avoid mapping explosion).
+          # One construction pass; single walk prune at the end.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.actors // []) as $actors
+          | ($r.scope.project // {}) as $proj
+          | {
+              "@timestamp": ($r.collected_at // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "state",
+                "category": ["iam"],
+                "type": ["group", "info"],
+                "outcome": "success",
+                "action": "project-role-membership",
+                "module": "jira",
+                "dataset": "jira.roles",
+                "provider": "jira",
+                "id": ($r.id | tostring),
+                "original": ($r | tojson)
+              },
+
+              # The role modeled as both a user-role assignment and a group.
+              "user": { "roles": [ $r.name ] },
+              "group": { "name": $r.name, "id": ($r.id | tostring) },
+
+              "organization": { "name": $proj.name },
+
+              "related": {
+                "user": (
+                  [ $actors[]
+                    | ( .actorUser.accountId, .displayName, .actorGroup.name ) ]
+                  | map(select(. != null)) | unique
+                )
+              },
+
+              "labels": {
+                "jira_project_key": $proj.key
+              },
+
+              # Vendor namespace (allowed by ECS for custom data).
+              "jira": {
+                "project": {
+                  "id":   $proj.id,
+                  "key":  $proj.key,
+                  "name": $proj.name
+                },
+                "role": {
+                  "id":           ($r.id | tostring),
+                  "name":         $r.name,
+                  "description":  $r.description,
+                  "admin":        $r.admin,
+                  "default":      $r["default"],
+                  "configurable": $r.roleConfigurable,
+                  "member_count": ($actors | length)
+                },
+                "actors": ($actors | tojson)
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

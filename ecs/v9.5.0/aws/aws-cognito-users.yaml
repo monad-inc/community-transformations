@@ -1,0 +1,109 @@
+name: "AWS Cognito Users to ECS v9.5.0"
+description: "Normalizes AWS Cognito user-pool user records (ListUsers UserType) into Elastic Common Schema (ECS) v9.5.0 identity-inventory fields (event, user, cloud, related) plus an aws.cognito.* namespace for user status, MFA, and verification state."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-cognito-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "cognito"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Cognito Users -> ECS v9.5.0
+          #
+          # Input: ONE Cognito user-pool user record per invocation (the
+          #   ListUsers/AdminGetUser UserType), as emitted by the Monad
+          #   `aws-cognito-users` input connector.
+          #
+          # A user-pool listing is an identity inventory snapshot, so:
+          #   event.kind     = asset       (inventory/state snapshot)
+          #   event.category = [iam]
+          #   event.type     = [user, info]
+          #
+          # ECS fields carry the identity; the aws.cognito.* namespace carries
+          # Cognito-specific status/MFA/verification detail (ES-safe custom
+          # namespace, no mapping explosion).
+          # =================================================================
+
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( ( $r.Attributes // [] )
+              | map(select(.Name != null))
+              | map({ (.Name): .Value }) | add // {} ) as $a
+          | ( $a["email"] ) as $email
+          | ( $a["sub"] // $r.Username ) as $uid
+          | ( $a["preferred_username"] // $a["name"] // $r.Username ) as $display
+          | ( (( $r.MFAOptions // [] ) | length) > 0 ) as $has_mfa
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $r.UserLastModifiedDate,
+
+              event: {
+                kind: "asset",
+                module: "aws",
+                dataset: "aws.cognito",
+                provider: "cognito-idp.amazonaws.com",
+                action: "cognito-user-inventory",
+                category: ["iam"],
+                type: ["user", "info"]
+              },
+
+              cloud: {
+                provider: "aws",
+                service: { name: "Cognito" }
+              },
+
+              user: {
+                id: $uid,
+                name: ($r.Username // $display),
+                full_name: $a["name"],
+                email: $email
+              },
+
+              related: {
+                user: ( [ $r.Username, $display, $a["name"], $a["preferred_username"], $email ]
+                        | map(select(. != null)) | unique )
+              },
+
+              aws: {
+                cognito: {
+                  username: $r.Username,
+                  sub: $a["sub"],
+                  user_status: $r.UserStatus,
+                  enabled: (if ($r.Enabled != null) then truthy($r.Enabled) else null end),
+                  create_date: $r.UserCreateDate,
+                  last_modified_date: $r.UserLastModifiedDate,
+                  email_verified: (if ($a["email_verified"] != null) then truthy($a["email_verified"]) else null end),
+                  phone_number: $a["phone_number"],
+                  phone_number_verified: (if ($a["phone_number_verified"] != null) then truthy($a["phone_number_verified"]) else null end),
+                  given_name: $a["given_name"],
+                  family_name: $a["family_name"],
+                  preferred_username: $a["preferred_username"],
+                  has_mfa: $has_mfa,
+                  mfa_delivery_mediums: ( ( $r.MFAOptions // [] ) | map(.DeliveryMedium) | map(select(. != null)) )
+                }
+              }
+            }
+          | prune

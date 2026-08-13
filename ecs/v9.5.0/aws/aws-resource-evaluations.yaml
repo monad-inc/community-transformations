@@ -1,0 +1,103 @@
+name: "AWS Config Resource Evaluations to ECS v9.5.0"
+description: "Normalizes AWS Config resource compliance evaluation results (EvaluationResult) into Elastic Common Schema (ECS) v9.5.0 fields (event, cloud, rule) plus the aws.config.* vendor namespace, modeling each result as a configuration compliance state."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-resource-evaluations"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "config"
+  - "compliance"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Config resource evaluations  ->  ECS v9.5.0
+          #
+          # Input: ONE AWS Config EvaluationResult record per invocation.
+          # A compliance evaluation is a state assessment of a resource, so
+          # it maps to event.kind=state / event.category=configuration.
+          #
+          #   .ResultRecordedTime                   -> @timestamp
+          #   .ComplianceType                       -> event.outcome
+          #   qualifier.ConfigRuleName              -> rule.name / event.action
+          #   qualifier.ResourceType/ResourceId     -> aws.config.resource_*
+          #   .Annotation                           -> message / event.reason
+          #   identifier.ResourceEvaluationId       -> event.id
+          #   .AwsAccountId / .AwsRegion            -> cloud.account.id / cloud.region
+          # =================================================================
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.EvaluationResultIdentifier // {} ) as $id
+          | ( $id.EvaluationResultQualifier // {} ) as $q
+          | ( $r.ComplianceType // "" ) as $ct
+
+          | ( { "COMPLIANT": "success", "NON_COMPLIANT": "failure" }[$ct] // "unknown" ) as $outcome
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": ($r.ResultRecordedTime // $id.OrderingTimestamp),
+
+              message: $r.Annotation,
+
+              event: {
+                kind: "state",
+                module: "aws",
+                dataset: "aws.config",
+                provider: "config.amazonaws.com",
+                action: "resource-evaluation",
+                id: $id.ResourceEvaluationId,
+                category: ["configuration"],
+                type: ["info"],
+                outcome: $outcome,
+                reason: $r.Annotation,
+                created: $id.OrderingTimestamp
+              },
+
+              cloud: {
+                provider: "aws",
+                region: $r.AwsRegion,
+                account: { id: $r.AwsAccountId }
+              },
+
+              rule: {
+                name: $q.ConfigRuleName,
+                ruleset: "AWS Config Managed Rules"
+              },
+
+              # AWS Config specifics with no ECS home live under the vendor
+              # namespace (accepted by the ECS validator as custom fields).
+              aws: {
+                config: {
+                  compliance_type: (if $ct != "" then $ct else null end),
+                  resource_type: $q.ResourceType,
+                  resource_id: $q.ResourceId,
+                  evaluation_mode: $q.EvaluationMode,
+                  resource_evaluation_id: $id.ResourceEvaluationId,
+                  ordering_timestamp: $id.OrderingTimestamp,
+                  config_rule_invoked_time: $r.ConfigRuleInvokedTime,
+                  result_recorded_time: $r.ResultRecordedTime
+                }
+              },
+
+              related: {
+                hosts: ( [ $q.ResourceId ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune

@@ -1,0 +1,101 @@
+name: "Aikido Issues to ECS v9.5.0"
+description: "Maps Aikido Security issue export records into Elastic Common Schema (ECS) v9.5.0, covering the event, vulnerability, package, file, rule, and cloud field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-issues"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aikido"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          . as $r
+          | {
+              "@timestamp": (
+                if $r.first_detected_at != null then ($r.first_detected_at | todate) else (now | todate) end
+              ),
+              "ecs": { "version": "9.5.0" },
+              "message": ($r.rule // null),
+              "event": {
+                "kind": "alert",
+                "category": ["vulnerability"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": ($r.id | tostring),
+                "module": "aikido",
+                "provider": "aikido",
+                "dataset": "aikido.issues",
+                "severity": ($r.severity_score // null),
+                "created": (if $r.first_detected_at != null then ($r.first_detected_at | todate) else null end),
+                "reference": (
+                  if $r.group_id != null
+                  then "https://app.aikido.dev/feature/issues/" + ($r.group_id | tostring)
+                  else null end
+                )
+              },
+              "vulnerability": {
+                "id": ($r.cve_id // null),
+                "enumeration": (if $r.cve_id != null then "CVE" else null end),
+                "classification": (if $r.original_cvss_severity_score != null then "CVSS" else null end),
+                "severity": ($r.severity // null),
+                "description": ($r.rule // null),
+                "category": ([ $r.type ] | map(select(. != null))),
+                "reference": (
+                  if $r.group_id != null
+                  then "https://app.aikido.dev/feature/issues/" + ($r.group_id | tostring)
+                  else null end
+                ),
+                "report_id": ($r.id | tostring),
+                "status": ($r.status // null),
+                "scanner": { "vendor": "Aikido Security" },
+                "score": {
+                  "base": (if $r.original_cvss_severity_score != null then ($r.original_cvss_severity_score / 10) else null end)
+                }
+              },
+              "package": (
+                if $r.affected_package != null
+                then {
+                  "name": $r.affected_package,
+                  "version": ($r.installed_version // null),
+                  "type": ($r.programming_language // null)
+                }
+                else null end
+              ),
+              "file": (
+                if $r.affected_file != null
+                then { "path": $r.affected_file, "name": ($r.affected_file | split("/") | last) }
+                else null end
+              ),
+              "rule": {
+                "name": ($r.rule // null),
+                "id": ($r.rule_id // null),
+                "ruleset": ($r.type // null)
+              },
+              "cloud": (
+                if $r.cloud_name != null then { "account": { "name": $r.cloud_name } } else null end
+              ),
+              "host": (
+                if $r.virtual_machine_name != null then { "name": $r.virtual_machine_name } else null end
+              ),
+              "labels": {
+                "attack_surface": ($r.attack_surface // null),
+                "exploitability": ($r.exploitability // null),
+                "issue_type": ($r.type // null),
+                "code_repo": ($r.code_repo_name // null),
+                "container_repo": ($r.container_repo_name // null),
+                "sla_days": (if $r.sla_days != null then ($r.sla_days | tostring) else null end)
+              },
+              "tags": ($r.cwe_classes // [])
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

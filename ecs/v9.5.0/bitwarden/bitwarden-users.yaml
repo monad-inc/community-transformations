@@ -1,0 +1,86 @@
+name: "Bitwarden Organization Members to ECS v9.5.0"
+description: "Maps Bitwarden Public API organization member records into Elastic Common Schema (ECS) v9.5.0 (event categorization, user.*, related.*, and the bitwarden.* vendor namespace)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bitwarden-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "bitwarden"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Bitwarden organization member -> ECS v9.5.0 (nested).
+          # A member listing is an identity inventory snapshot:
+          #   event.kind=asset, event.category=[iam], event.type=[user,info].
+          # One jq construction pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          . as $m
+          | ( { "0": "Owner", "1": "Admin", "2": "User", "3": "Manager" }[($m.type // -1 | tostring)] // "unknown" ) as $role
+          | ( { "-1": "revoked", "0": "invited", "1": "accepted", "2": "confirmed" }[($m.status // -99 | tostring)] // "unknown" ) as $status
+
+          # single recursive prune (the one permitted recursive pass)
+          | def prune: walk(
+              if   type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array"  then map(select(. != null))
+              else . end);
+
+          {
+            "@timestamp": (now | todateiso8601),
+            "ecs": { "version": "9.5.0" },
+
+            "event": {
+              "kind": "asset",
+              "category": ["iam"],
+              "type": ["user", "info"],
+              "outcome": "success",
+              "provider": "bitwarden",
+              "module": "bitwarden",
+              "dataset": "bitwarden.members",
+              "action": "member-inventory"
+            },
+
+            "user": {
+              "id":        $m.userId,
+              "name":      $m.email,
+              "email":     $m.email,
+              "full_name": $m.name,
+              "roles":     (if $role == "unknown" then null else [$role] end)
+            },
+
+            "organization": { "name": "bitwarden" },
+
+            "related": {
+              "user": ([ $m.email, $m.name ] | map(select(. != null and . != "")) | unique)
+            },
+
+            "labels": {
+              "two_factor_enabled": (if $m.twoFactorEnabled == true then "true" elif $m.twoFactorEnabled == false then "false" else null end),
+              "membership_status":  $status,
+              "member_role":        $role
+            },
+
+            # vendor namespace (ECS-permitted custom fields)
+            "bitwarden": {
+              "member": {
+                "id":                 $m.id,
+                "user_id":            $m.userId,
+                "status":             $status,
+                "status_code":        $m.status,
+                "type":               $role,
+                "type_code":          $m.type,
+                "two_factor_enabled": $m.twoFactorEnabled,
+                "access_all":         $m.accessAll,
+                "external_id":        $m.externalId,
+                "collection_ids":     (if ($m.collections | type) == "array" then ($m.collections | map(.id)) else null end),
+                "collections":        (if $m.collections then ($m.collections | tostring) else null end)
+              }
+            }
+          } | prune

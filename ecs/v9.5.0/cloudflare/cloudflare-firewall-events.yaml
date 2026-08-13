@@ -1,0 +1,148 @@
+name: "Cloudflare Firewall Events to ECS v9.5.0"
+description: "Transforms Cloudflare firewall_events (WAF / firewall rule matches) records into a nested Elastic Common Schema (ECS) v9.5.0 document, populating event categorization, source/geo/AS, http, url, rule, observer, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-firewall-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "firewall-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare firewall_events -> ECS v9.5.0 (nested).
+          # One record per invocation; single construction pass; one prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | def is_ip($s): ($s | type) == "string"
+              and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$|:"));
+
+          # @timestamp as ISO-8601 (Datetime may be ISO string or epoch s/ms).
+          ( if ($r.Datetime | type) == "number"
+              then ( ( if $r.Datetime > 1e12 then ($r.Datetime/1000)
+                       elif $r.Datetime > 1e10 then ($r.Datetime/1000)
+                       else $r.Datetime end ) | floor | todateiso8601 )
+            elif ($r.Datetime | type) == "string" then $r.Datetime
+            else null end ) as $ts
+
+          | ($r.Action // "" | ascii_downcase) as $action
+
+          # Action -> event.type (allowed/denied) + event.kind
+          | ( if ($action | IN("allow","bypass","skip","log")) then ["allowed","connection"]
+              else ["denied","connection"] end ) as $etypes
+          | ( if ($action | IN("block","drop","connectionclose","challenge","managedchallenge","jschallenge"))
+              then "alert" else "event" end ) as $ekind
+
+          | {
+              "@timestamp": $ts,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": $ekind,
+                "category": ["network", "web", "intrusion_detection"],
+                "type": $etypes,
+                "outcome": "success",
+                "action": $r.Action,
+                "id": $r.RayID,
+                "provider": "cloudflare",
+                "module": "cloudflare",
+                "dataset": "cloudflare.firewall_events",
+                "reference": $r.Ref
+              },
+
+              "message": $r.Description,
+
+              "rule": {
+                "id": $r.RuleID,
+                "name": $r.Ref,
+                "description": $r.Description,
+                "ruleset": ($r.Metadata.ruleset_id // null),
+                "category": $r.Source
+              },
+
+              "source": {
+                "ip": (if is_ip($r.ClientIP) then $r.ClientIP else null end),
+                "as": {
+                  "number": $r.ClientASN,
+                  "organization": { "name": $r.ClientASNDescription }
+                },
+                "geo": {
+                  "country_iso_code": (if ($r.ClientCountry // "") != "" then ($r.ClientCountry | ascii_upcase) else null end)
+                }
+              },
+
+              "client": {
+                "ip": (if is_ip($r.ClientIP) then $r.ClientIP else null end)
+              },
+
+              "http": {
+                "request": {
+                  "method": $r.ClientRequestMethod,
+                  "referrer": (if ($r.ClientRefererHost // "") != ""
+                               then (($r.ClientRefererScheme // "https") + "://" + $r.ClientRefererHost + ($r.ClientRefererPath // "")) else null end)
+                },
+                "response": {
+                  "status_code": (if ($r.EdgeResponseStatus // 0) > 0 then $r.EdgeResponseStatus else null end)
+                },
+                "version": (if ($r.ClientRequestProtocol // "") != ""
+                            then ($r.ClientRequestProtocol | ltrimstr("HTTP/")) else null end)
+              },
+
+              "url": {
+                "domain": $r.ClientRequestHost,
+                "path": $r.ClientRequestPath,
+                "query": (if ($r.ClientRequestQuery // "") != "" then ($r.ClientRequestQuery | ltrimstr("?")) else null end),
+                "scheme": $r.ClientRequestScheme,
+                "full": (if ($r.ClientRequestHost // "") != ""
+                         then (($r.ClientRequestScheme // "https") + "://" + $r.ClientRequestHost + ($r.ClientRequestPath // "") + ($r.ClientRequestQuery // "")) else null end)
+              },
+
+              "user_agent": {
+                "original": $r.ClientRequestUserAgent
+              },
+
+              "network": {
+                "protocol": "http"
+              },
+
+              "observer": {
+                "vendor": "Cloudflare",
+                "product": "Cloudflare WAF",
+                "type": "firewall"
+              },
+
+              "cloud": {
+                "provider": "cloudflare"
+              },
+
+              "related": {
+                "ip": ([ $r.ClientIP ] | map(select(is_ip(.))) | unique),
+                "hosts": ([ $r.ClientRequestHost, $r.ClientRefererHost ] | map(select(. != null and . != "")) | unique)
+              },
+
+              # Vendor-specific fields ECS does not define (cloudflare.* namespace).
+              "cloudflare": {
+                "kind": $r.Kind,
+                "source": $r.Source,
+                "client_ip_class": $r.ClientIPClass,
+                "edge_colo_code": $r.EdgeColoCode,
+                "match_index": $r.MatchIndex,
+                "origin_response_status": (if ($r.OriginResponseStatus // 0) > 0 then $r.OriginResponseStatus else null end),
+                "originator_ray_id": (if ($r.OriginatorRayID // "00") != "00" then $r.OriginatorRayID else null end),
+                "zone_name": $r.ZoneName,
+                "leaked_credential_check_result": $r.LeakedCredentialCheckResult,
+                "ruleset_type": ($r.Metadata.type // null)
+              }
+            }
+
+          # Single recursive prune: ES rejects nulls; drop null/""/{}/[].
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null and . != {} and . != []))
+                  else . end )

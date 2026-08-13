@@ -1,0 +1,64 @@
+name: "Anthropic Compliance Organizations to ECS v9.5.0"
+description: "Maps Anthropic Compliance API organization directory records (List organizations endpoint) into Elastic Common Schema (ECS) v9.5.0 documents, covering the event.* categorization (asset/iam/info) and the organization.* field set."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-organizations"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "iam"
+  - "compliance"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Compliance API - List organizations -> ECS v9.5.0
+          # One organization record in -> one nested ECS document out.
+          #
+          # The connector polls a complete snapshot of every linked
+          # organization each sync run, so this is inventory/directory state:
+          #   event.kind    = asset   (an inventory/state record, not a change)
+          #   event.category= [iam]   (identity & access directory data)
+          #   event.type    = [info]  (info is a legal type for the iam category)
+          #   event.outcome = success (the directory read succeeded)
+          #
+          # Source fields (all documented): uuid, name, created_at.
+          #   uuid       -> organization.id
+          #   name       -> organization.name
+          #   created_at -> @timestamp (organization creation, ISO-8601)
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.created_at) as $ca
+          | {
+              "@timestamp": ($ca // (now | todateiso8601)),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "asset",
+                category: [ "iam" ],
+                type: [ "info" ],
+                outcome: "success",
+                action: "organization-snapshot",
+                dataset: "anthropic.compliance_organizations",
+                module: "anthropic",
+                provider: "compliance-api",
+                created: $ca,
+                original: ($r | tojson)
+              },
+              organization: {
+                id: $r.uuid,
+                name: $r.name
+              }
+            }
+          # single end-of-pipeline prune: drop null / "" / {} / [] leaves
+          | walk(if type == "object"
+                 then with_entries(select(
+                        (.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)

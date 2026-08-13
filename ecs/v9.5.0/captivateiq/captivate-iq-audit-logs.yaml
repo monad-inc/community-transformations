@@ -1,0 +1,88 @@
+name: "CaptivateIQ Audit Logs to ECS v9.5.0"
+description: "Maps CaptivateIQ Audit Logs records into Elastic Common Schema (ECS) v9.5.0, covering event categorization (configuration), user, source, organization, related, and a captivateiq.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "captivate-iq-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "captivateiq"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # CaptivateIQ audit_log -> ECS v9.5.0 (nested).
+          # event.category=configuration (CRUD on commission config objects).
+          # One jq pass, bind-once, is_ip guard, related.*, single prune.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test(":"));
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          . as $r
+          | ($r.event_type // "" | ascii_downcase) as $et
+          | ( { "create": "creation", "update": "change", "delete": "deletion" }[$et] // "info" ) as $etype
+          | ($r.ip_address) as $ip
+          | {
+              "@timestamp": $r.created_at,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["configuration"],
+                "type": [$etype],
+                "outcome": "success",
+                "action": $r.event_type,
+                "id": $r.id,
+                "provider": "captivateiq",
+                "module": "audit",
+                "original": ($r | tojson)
+              },
+
+              "user": ( {
+                "id": $r.user_id,
+                "name": $r.user_name,
+                "email": $r.user_email
+              } | with_entries(select(.value != null)) ),
+
+              "source": ( if is_ip($ip) then { "ip": $ip } else null end ),
+
+              "organization": ( {
+                "id": $r.organization_id,
+                "name": $r.organization_name
+              } | with_entries(select(.value != null)) ),
+
+              "related": {
+                "ip":   ( [ $ip ] | map(select(. != null and is_ip(.))) | unique ),
+                "user": ( [ $r.user_name, $r.user_email, $r.logged_in_user_name, $r.logged_in_user_email ]
+                          | map(select(. != null)) | unique )
+              },
+
+              # Vendor namespace (ECS-allowed custom top-level). Deep blobs
+              # serialized to JSON strings to avoid mapping explosion.
+              "captivateiq": ( {
+                "object": {
+                  "id":   $r.object_id,
+                  "name": $r.object_name,
+                  "type": $r.object_type
+                },
+                "api_version": $r.version,
+                "logged_in_user": {
+                  "id":    $r.logged_in_user_id,
+                  "name":  $r.logged_in_user_name,
+                  "email": $r.logged_in_user_email
+                },
+                "data": json_str($r.data),
+                "parent_objects": json_str($r.parent_objects)
+              } )
+            }
+          # Single end-of-pipeline recursive prune (the one permitted pass).
+          | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null))
+                  else . end )

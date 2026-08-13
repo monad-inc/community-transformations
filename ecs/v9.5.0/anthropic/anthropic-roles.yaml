@@ -1,0 +1,64 @@
+name: "Anthropic Organization Roles to ECS v9.5.0"
+description: "Maps Anthropic Admin API organization user/role records into Elastic Common Schema (ECS) v9.5.0, covering event categorization (iam), the user.* field set (including user.roles), and related.user."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-roles"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "roles"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Admin API organization user/role -> ECS v9.5.0.
+          # Input: one org user record (GET /v1/organizations/users):
+          #   { id, added_at, email, name, role, type }
+          # Modeled as an IAM user inventory snapshot:
+          #   event.kind=asset, event.category=[iam], event.type=[user,info].
+          # One jq pass, bind-once, single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.role // null) as $role
+          | ($r.email // null) as $email
+          | ($r.name // null) as $fullname
+          | {
+              "@timestamp": ($r.added_at // null),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind":     "asset",
+                "category": [ "iam" ],
+                "type":     [ "user", "info" ],
+                "outcome":  "success",
+                "action":   "organization-user-inventory",
+                "id":       $r.id,
+                "module":   "anthropic",
+                "provider": "anthropic-admin-api",
+                "dataset":  "anthropic.roles"
+              },
+
+              "user": {
+                "id":        $r.id,
+                "name":      ($email // $fullname),
+                "email":     $email,
+                "full_name": $fullname,
+                "roles":     ( if $role != null then [ $role ] else null end )
+              },
+
+              "cloud": {
+                "provider": "anthropic"
+              },
+
+              "related": {
+                "user": ( [ $email, $fullname ] | map(select(. != null)) | unique )
+              }
+            }
+          # Single recursive prune: ES rejects nulls; drop null/{}/[] leaves.
+          | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) else . end )

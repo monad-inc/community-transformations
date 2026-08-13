@@ -1,0 +1,133 @@
+name: "Cloudflare Zones to ECS v9.5.0"
+description: "Maps Cloudflare Zones inventory records into Elastic Common Schema (ECS) v9.5.0, populating event categorization, cloud.*, organization.*, host.*, related.*, and a cloudflare.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zones"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "zones"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Zone (GET /zones) -> ECS v9.5.0 (nested).
+          # An inventory snapshot of a cloud-managed web asset:
+          #   event.kind=asset, category=[configuration], type=[info].
+          # One jq construction pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+
+          def to_iso($ts):
+            if $ts == null then null
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z")) end;
+
+          . as $r
+          | ($r.account // {}) as $acct
+          | ($r.owner // {}) as $owner
+          | ($r.plan // {}) as $plan
+          | ($r.meta // {}) as $meta
+          | ((($r.name_servers // []) + [$r.name]) | map(select(. != null)) | unique) as $hosts
+          | {
+              "@timestamp": (to_iso($r.modified_on // $r.created_on)),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "asset",
+                "category": ["configuration"],
+                "type": ["info"],
+                "outcome": (if $r.status == "active" then "success" else "unknown" end),
+                "id": $r.id,
+                "action": "zone-inventory",
+                "provider": "cloudflare",
+                "module": "cloudflare",
+                "dataset": "cloudflare.zones",
+                "created": (to_iso($r.created_on))
+              },
+
+              "cloud": {
+                "provider": "cloudflare",
+                "account": (
+                  { "id": $acct.id, "name": $acct.name }
+                  | with_entries(select(.value != null))
+                )
+              },
+
+              "organization": (
+                { "id": ($owner.id // $acct.id), "name": ($owner.name // $acct.name) }
+                | with_entries(select(.value != null))
+              ),
+
+              "host": (
+                { "name": $r.name, "id": $r.id, "type": "cloudflare_zone" }
+                | with_entries(select(.value != null))
+              ),
+
+              "service": (
+                { "name": ($plan.name), "type": "cloudflare" }
+                | with_entries(select(.value != null))
+              ),
+
+              "related": {
+                "hosts": $hosts
+              },
+
+              "labels": (
+                { "zone_status": $r.status,
+                  "zone_type": $r.type,
+                  "paused": (if ($r.paused != null) then ($r.paused | tostring) else null end),
+                  "phishing_detected": (if ($meta.phishing_detected != null) then ($meta.phishing_detected | tostring) else null end) }
+                | with_entries(select(.value != null))
+              ),
+
+              # Vendor namespace — fields with no ECS home.
+              "cloudflare": {
+                "zone": (
+                  { "id": $r.id,
+                    "name": $r.name,
+                    "status": $r.status,
+                    "paused": $r.paused,
+                    "type": $r.type,
+                    "development_mode": $r.development_mode,
+                    "name_servers": $r.name_servers,
+                    "original_name_servers": $r.original_name_servers,
+                    "original_registrar": $r.original_registrar,
+                    "original_dnshost": $r.original_dnshost,
+                    "activated_on": (to_iso($r.activated_on)),
+                    "permissions": $r.permissions,
+                    "plan": (
+                      { "id": $plan.id,
+                        "name": $plan.name,
+                        "legacy_id": $plan.legacy_id,
+                        "price": $plan.price,
+                        "currency": $plan.currency,
+                        "frequency": $plan.frequency,
+                        "is_subscribed": $plan.is_subscribed }
+                      | with_entries(select(.value != null))
+                    ),
+                    "meta": (
+                      { "cdn_only": $meta.cdn_only,
+                        "dns_only": $meta.dns_only,
+                        "foundation_dns": $meta.foundation_dns,
+                        "phishing_detected": $meta.phishing_detected,
+                        "custom_certificate_quota": $meta.custom_certificate_quota,
+                        "page_rule_quota": $meta.page_rule_quota,
+                        "step": $meta.step }
+                      | with_entries(select(.value != null))
+                    ) }
+                  | with_entries(select(.value != null))
+                )
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(
+                  .value != null and .value != "" and .value != {} and .value != []
+                ))
+              else . end
+            )
