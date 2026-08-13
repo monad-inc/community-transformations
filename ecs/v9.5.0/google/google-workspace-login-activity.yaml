@@ -1,0 +1,105 @@
+name: "Google Workspace Login Activity to ECS v9.5.0"
+description: "Normalizes Google Workspace (Admin SDK Reports API) login activity records into Elastic Common Schema (ECS) v9.5.0 core security fields (event, user, source, cloud, related), categorized as authentication."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-workspace-login-activity"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "google"
+  - "login"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Google Workspace login activity -> ECS v9.5.0 (core fields)
+          # Input: ONE Reports API login activity record per invocation.
+          #   .id.time            -> @timestamp
+          #   .events[0].name     -> event.action / outcome / type
+          #   .id.uniqueQualifier -> event.id
+          #   .actor.email        -> user.email / user.name
+          #   .actor.profileId    -> user.id
+          #   .ipAddress          -> source.ip / source.address
+          # =================================================================
+
+          # An ES `ip` field rejects a non-IP document, so guard before use.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.events[0] // {}) as $ev
+          | ($ev.parameters // []) as $params
+          | ($ev.name // "") as $ename
+          | def param($n): ($params | map(select(.name == $n)) | first);
+            def pstr($n): (param($n) | if . == null then null
+                           else (.value // ((.multiValue // []) | join(","))) end);
+            ($r.actor.email) as $email
+          | ($r.ipAddress) as $ip
+
+          # event.outcome (closed enum)
+          | ( if $ename == "login_success" then "success"
+              elif ($ename | startswith("login_failure") or startswith("suspicious")) then "failure"
+              else "unknown" end ) as $outcome
+
+          # event.type (must be legal for category=authentication: start/end/info)
+          | ( if ($ename | startswith("logout")) then ["end"]
+              elif ($ename | startswith("login_success") or startswith("login_failure") or startswith("suspicious")) then ["start"]
+              else ["info"] end ) as $type
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $r.id.time,
+
+              event: {
+                kind: "event",
+                module: "google_workspace",
+                dataset: "google_workspace.login",
+                provider: ($r.id.applicationName // "login"),
+                action: $ename,
+                id: ($r.id.uniqueQualifier | tostring),
+                category: ["authentication"],
+                type: $type,
+                outcome: $outcome
+              },
+
+              user: {
+                id: ($r.actor.profileId // null),
+                name: $email,
+                email: $email,
+                domain: ($r.ownerDomain // null)
+              },
+
+              source: {
+                address: $ip,
+                ip: ( if is_ip($ip) then $ip else null end )
+              },
+
+              cloud: {
+                provider: "google_workspace",
+                account: { id: ($r.id.customerId // null) }
+              },
+
+              related: {
+                ip: ( if is_ip($ip) then [$ip] else [] end ),
+                user: ( [ $email, ($r.actor.profileId), (pstr("affected_email_address")) ]
+                        | map(select(. != null)) | unique )
+              }
+            }
+          | prune

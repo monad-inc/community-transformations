@@ -1,0 +1,88 @@
+name: "Okta Users to ECS v9.5.0"
+description: "Maps Okta Users directory records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event.*, user.*, related.*, and organization.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "okta-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "okta"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Okta Users (directory) -> ECS v9.5.0 (nested).
+          # User inventory snapshot: event.kind=state, category=[iam],
+          # type=[user,info], outcome=success.
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            else ($ts | gsub("\\.[0-9]+Z$"; "Z"))
+            end;
+
+          . as $r |
+          ($r.profile // {}) as $p |
+          {
+            "@timestamp": (to_iso($r.lastUpdated // $r.created)),
+            "ecs": { "version": "9.5.0" },
+
+            "event": {
+              "kind": "state",
+              "category": ["iam"],
+              "type": ["user", "info"],
+              "outcome": "success",
+              "action": "user-inventory",
+              "provider": "okta",
+              "module": "okta",
+              "dataset": "okta.users",
+              "id": $r.id,
+              "created": (to_iso($r.created))
+            },
+
+            "user": {
+              "id":        $r.id,
+              "name":      ($p.login // $p.email),
+              "email":     $p.email,
+              "full_name": ($p.displayName // (($p.firstName // "") + " " + ($p.lastName // "") | ltrimstr(" ") | rtrimstr(" "))),
+              "domain":    (($p.email // $p.login // "") | (split("@") | if length > 1 then .[1] else null end))
+            },
+
+            "organization": {
+              "name": $p.organization
+            },
+
+            "source": {
+              "user": {
+                "id":    $r.id,
+                "name":  ($p.login // $p.email),
+                "email": $p.email
+              }
+            },
+
+            "okta": {
+              "user": {
+                "status":           $r.status,
+                "title":            $p.title,
+                "department":       $p.department,
+                "employee_number":  $p.employeeNumber,
+                "manager":          $p.manager,
+                "user_type":        $p.userType,
+                "last_login":       (to_iso($r.lastLogin)),
+                "status_changed":   (to_iso($r.statusChanged)),
+                "password_changed": (to_iso($r.passwordChanged)),
+                "activated":        (to_iso($r.activated)),
+                "credential_provider": ($r.credentials.provider.type // null)
+              }
+            },
+
+            "related": {
+              "user": ([$p.login, $p.email, $r.id, $p.displayName] | map(select(. != null and . != "")) | unique)
+            }
+          }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)

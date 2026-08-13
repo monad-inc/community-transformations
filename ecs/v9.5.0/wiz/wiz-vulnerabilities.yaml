@@ -1,0 +1,134 @@
+name: "Wiz Vulnerabilities to ECS v9.5.0"
+description: "Normalizes individual Wiz vulnerability finding records into Elastic Common Schema (ECS) v9.5.0 (event, vulnerability, package, cloud, host, file, related), modeling each finding as an event.kind alert in the vulnerability category."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "wiz-vulnerabilities"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "wiz"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Wiz Vulnerabilities  ->  ECS v9.5.0
+          # Input: ONE Wiz vulnerability finding record per invocation.
+          # A detected vulnerability is a finding, so event.kind=alert,
+          # event.category=[vulnerability], event.type=[info] (the only
+          # ECS-legal type for the vulnerability category).
+          # =================================================================
+
+          # An ES `ip` field rejects a document if handed a hostname, so guard
+          # every value routed to an ip-typed field.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "string" then $ts
+            else null end;
+
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.vulnerableAsset // {}) as $a
+          | ($r.name // $r.Name) as $cve_id
+          | ($r.vendorSeverity // $r.VendorSeverity) as $vsev
+          | ($r.cloudPlatform // $a.cloudPlatform // $r.CloudPlatform) as $provider
+          | ($a.ipAddresses // $r.IpAddresses // []) as $ips
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": ($r.firstDetectedAt // $r.FirstDetected),
+
+              event: {
+                kind: "alert",
+                module: "wiz",
+                dataset: "wiz.vulnerabilities",
+                provider: "wiz",
+                id: ($r.id // $r.ID),
+                category: ["vulnerability"],
+                type: ["info"],
+                outcome: "unknown",
+                severity: (
+                  { "CRITICAL": 5, "Critical": 5, "HIGH": 4, "High": 4,
+                    "MEDIUM": 3, "Medium": 3, "LOW": 2, "Low": 2,
+                    "INFORMATIONAL": 1, "Informational": 1 }[$vsev] // 0
+                ),
+                url: ($r.portalUrl // $r.WizURL),
+                created: ($r.firstDetectedAt // $r.FirstDetected),
+                start: ($r.firstDetectedAt // $r.FirstDetected),
+                end: ($r.lastDetectedAt // $r.LastDetected),
+                reason: ($r.description // $r.Description)
+              },
+
+              vulnerability: {
+                id: $cve_id,
+                enumeration: (if ($cve_id | type) == "string" and ($cve_id | startswith("CVE-")) then "CVE" else null end),
+                description: ($r.CVEDescription // $r.description // $r.Description),
+                severity: $vsev,
+                status: ($r.status // $r.FindingStatus),
+                reference: ($r.link // $r.Link),
+                classification: "CVSS",
+                scanner: { vendor: "Wiz" },
+                score: {
+                  base: ($r.score // $r.Score),
+                  version: (if ($r.score // $r.Score) then "3.1" else null end)
+                }
+              },
+
+              package: {
+                name: ($r.detailedName // $r.DetailedName),
+                version: ($r.version // $r.Version),
+                path: ($r.locationPath // $r.LocationPath),
+                type: (if ($r.detectionMethod // $r.DetectionMethod) then ($r.detectionMethod // $r.DetectionMethod) else null end)
+              },
+
+              file: {
+                path: ($r.locationPath // $r.LocationPath)
+              },
+
+              host: {
+                id: ($a.id // $r.AssetID),
+                name: ($a.name // $r.AssetName),
+                os: { full: ($a.operatingSystem // $r.OperatingSystem) },
+                ip: ([ $ips[] | select(is_ip(.)) ])
+              },
+
+              cloud: {
+                provider: (($provider // "") | ascii_downcase | if . == "" then null else . end),
+                region: ($a.region // $r.AssetRegion),
+                account: {
+                  id: ($a.subscriptionId // $r.SubscriptionId),
+                  name: ($a.subscriptionName // $r.SubscriptionName)
+                },
+                instance: {
+                  id: ($a.providerUniqueId // $r.ProviderUniqueId),
+                  name: ($a.name // $r.AssetName)
+                }
+              },
+
+              related: {
+                ip: ([ $ips[] | select(is_ip(.)) ] | unique),
+                hosts: ([ ($a.name // $r.AssetName) ] | map(select(. != null)) | unique)
+              },
+
+              tags: (
+                if $r.projects then $r.projects
+                elif $r.Projects then $r.Projects
+                else null end
+              )
+            }
+          | prune

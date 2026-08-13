@@ -1,0 +1,119 @@
+name: "Microsoft Azure Activity Logs to ECS v9.5.0"
+description: "Normalizes individual Microsoft Azure Activity Log records (control-plane management operations) into the Elastic Common Schema (ECS) v9.5.0 core security fields (event, cloud, user, source, related), deriving event categorization from the Azure operationName verb and resultType."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-activity-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "microsoft"
+  - "azure"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Microsoft Azure Activity Log  ->  ECS v9.5.0  (CORE fields)
+          #
+          # Input: ONE Azure Activity Log record per invocation (Azure Monitor
+          #   resource-log schema, as emitted by the microsoft-azure-activity-logs
+          #   input connector).
+          #
+          #   .time / .eventTimestamp   -> @timestamp
+          #   .operationName            -> event.action  (+ verb -> event.type)
+          #   .eventDataId              -> event.id
+          #   .resultType / .status     -> event.outcome
+          #   .callerIpAddress          -> source.ip / source.address
+          #   .caller                   -> user.name
+          #   .subscriptionId           -> cloud.account.id
+          #   .location                 -> cloud.region
+          # =================================================================
+
+          # A callerIpAddress can be absent or a non-IP token; an ES ip-mapped
+          # field rejects a document handed a hostname, so guard it.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # operationName / resultType may arrive as {value, localizedValue}.
+          def strv($f):
+            if ($f | type) == "object" then ($f.value // $f.localizedValue)
+            else $f end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.identity.claims // {} ) as $claims
+          | ( strv($r.operationName) // "" ) as $op
+          | ( $op | ascii_downcase ) as $opl
+          | ( strv($r.resultType) // $r.status // "" ) as $result
+          | ( $r.caller
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]
+              // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"] ) as $caller
+          | ( $claims["http://schemas.microsoft.com/identity/claims/objectidentifier"] ) as $caller_uid
+          | ( $r.callerIpAddress // $claims.ipaddr ) as $caller_ip
+
+          # ---- outcome ----------------------------------------------------
+          | ( if ($result | ascii_downcase | startswith("succ")) then "success"
+              elif ($result | ascii_downcase | startswith("fail")) then "failure"
+              else "unknown" end ) as $outcome
+
+          # ---- event.type from the Azure operation verb -------------------
+          # Azure control-plane ops are configuration changes; the trailing
+          # verb selects the ECS type (all legal for category=configuration).
+          | ( if ($opl | endswith("/write")) then ["change"]
+              elif ($opl | endswith("/read")) then ["access"]
+              elif ($opl | endswith("/delete")) then ["deletion"]
+              else ["info"] end ) as $type
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": ($r.time // $r.eventTimestamp),
+
+              event: {
+                kind: "event",
+                module: "azure",
+                dataset: "azure.activitylogs",
+                provider: ($op | split("/")[0]),
+                action: $op,
+                id: $r.eventDataId,
+                category: ["configuration"],
+                type: $type,
+                outcome: $outcome
+              },
+
+              cloud: {
+                provider: "azure",
+                region: $r.location,
+                account: { id: $r.subscriptionId }
+              },
+
+              user: {
+                name: $caller,
+                id: $caller_uid
+              },
+
+              source: {
+                address: $caller_ip,
+                ip: ( if is_ip($caller_ip) then $caller_ip else null end )
+              },
+
+              related: {
+                ip: ( if is_ip($caller_ip) then [$caller_ip] else [] end ),
+                user: ( [ $caller, $caller_uid ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune

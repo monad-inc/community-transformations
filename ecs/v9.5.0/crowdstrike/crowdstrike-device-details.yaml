@@ -1,0 +1,119 @@
+name: "CrowdStrike Device Details to ECS v9.5.0"
+description: "Normalizes individual CrowdStrike Falcon device details records into Elastic Common Schema (ECS) v9.5.0 asset-inventory fields (event, host, host.os, cloud, agent, observer, related), modeling each record as a host asset snapshot."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "crowdstrike-device-details"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "crowdstrike"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # CrowdStrike Falcon device details -> ECS v9.5.0
+          #
+          # One device record per invocation (Falcon Hosts API
+          # /devices/entities/devices/v2). A device inventory snapshot is an
+          # ASSET state report, so:
+          #   event.kind     = asset
+          #   event.category = [host]
+          #   event.type     = [info]   (host allows access/change/end/info/start)
+          #   event.outcome  = success
+          # =================================================================
+
+          # An ES `ip`-mapped field rejects the whole document if handed a
+          # non-IP string, so guard every ip field.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$")
+                 or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # Recursively drop nulls / empty objects / empty arrays (ES rejects
+          # nulls; the doc is deeply nested). The one permitted recursive pass.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( [ $r.local_ip, $r.external_ip, $r.connection_ip, $r.default_gateway_ip ]
+              | map(select(is_ip(.))) | unique ) as $ips
+          | ( [ $r.mac_address, $r.connection_mac_address ]
+              | map(select(. != null)) | unique ) as $macs
+          | {
+              "@timestamp": $r.agent_local_time,
+
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "asset",
+                module: "crowdstrike",
+                dataset: "crowdstrike.device",
+                category: ["host"],
+                type: ["info"],
+                outcome: "success",
+                created: $r.modified_timestamp
+              },
+
+              host: {
+                id: $r.device_id,
+                name: $r.hostname,
+                hostname: $r.hostname,
+                domain: $r.machine_domain,
+                type: $r.product_type_desc,
+                ip: ( if ($ips | length) > 0 then $ips else null end ),
+                mac: ( if ($macs | length) > 0 then $macs else null end ),
+                architecture: ( if $r.platform_name == "Windows" then "x86_64" else null end ),
+                os: {
+                  name: $r.os_version,
+                  version: $r.os_version,
+                  full: $r.os_version,
+                  kernel: $r.kernel_version,
+                  type: ( ($r.platform_name // "") | ascii_downcase
+                          | if . == "mac" then "macos" else . end ),
+                  platform: ( ($r.platform_name // null) | if . == null then null else ascii_downcase end ),
+                  family: $r.platform_name
+                }
+              },
+
+              cloud: {
+                provider: ( ($r.service_provider // "") | ascii_downcase
+                            | if startswith("aws") then "aws"
+                              elif startswith("azure") then "azure"
+                              elif startswith("gcp") or startswith("google") then "gcp"
+                              else null end ),
+                account: { id: $r.service_provider_account_id },
+                instance: { id: $r.instance_id }
+              },
+
+              agent: {
+                type: "crowdstrike-falcon",
+                id: $r.device_id,
+                name: $r.hostname,
+                version: $r.agent_version
+              },
+
+              observer: {
+                vendor: "CrowdStrike",
+                product: "Falcon",
+                type: "edr"
+              },
+
+              related: {
+                ip: $ips,
+                hosts: ( [ $r.hostname ] | map(select(. != null)) | unique )
+              }
+            }
+          | prune

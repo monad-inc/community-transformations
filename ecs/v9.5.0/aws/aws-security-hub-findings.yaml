@@ -1,0 +1,119 @@
+name: "AWS Security Hub Findings to ECS v9.5.0"
+description: "Maps AWS Security Hub findings (ASFF) into Elastic Common Schema (ECS) v9.5.0, covering event categorization (alert / intrusion_detection), rule.*, cloud.*, source/destination network, host.*, related.* and vulnerability.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-hub-findings"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "security-hub"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Security Hub finding (ASFF) -> ECS v9.5.0 (nested).
+          # event.kind=alert; event.category=[intrusion_detection];
+          # event.type=[info]; event.outcome=unknown.
+          # One jq pass, bind-once, is_ip guard, related.* union, single prune.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string"
+            and ($s|test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") or ($s|test(":")));
+
+          . as $r
+          | ($r.Severity // {}) as $sev
+          | ($r.Network // {}) as $net
+          | ($r.Resources // []) as $res
+          | ($r.Remediation.Recommendation // {}) as $rem
+          | ([ $net.SourceIpV4, $net.DestinationIpV4,
+               ($res[]?.Details?.AwsEc2Instance?.IpV4Addresses[]?) ]
+             | map(select(is_ip(.))) | unique) as $ips
+          | {
+              "@timestamp": ($r.UpdatedAt // $r.CreatedAt),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": ["intrusion_detection"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": $r.Id,
+                "provider": $r.ProductName,
+                "module": "security_hub",
+                "dataset": "aws.securityhub",
+                "severity": $sev.Normalized,
+                "created": $r.CreatedAt,
+                "start": $r.FirstObservedAt,
+                "end": $r.LastObservedAt,
+                "url": $r.SourceUrl,
+                "action": ($r.Types[0]?),
+                "reason": $r.Description,
+                "risk_score": $sev.Normalized
+              },
+
+              "message": $r.Title,
+
+              "rule": {
+                "id": $r.GeneratorId,
+                "name": ($r.Types[0]?),
+                "ruleset": $r.ProductName,
+                "reference": $rem.Url,
+                "description": $rem.Text
+              },
+
+              "cloud": {
+                "provider": "aws",
+                "account": { "id": $r.AwsAccountId },
+                "region": $r.Region
+              },
+
+              "organization": { "name": $r.CompanyName },
+
+              "source": (
+                if is_ip($net.SourceIpV4) then
+                  { "ip": $net.SourceIpV4, "port": $net.SourcePort }
+                else null end),
+              "destination": (
+                if is_ip($net.DestinationIpV4) then
+                  { "ip": $net.DestinationIpV4, "port": $net.DestinationPort }
+                else null end),
+              "network": (
+                if ($net.Protocol // $net.Direction) != null then
+                  { "transport": ($net.Protocol | ascii_downcase? // null),
+                    "direction": ($net.Direction | ascii_downcase? // null) }
+                else null end),
+
+              "host": (
+                ($res[] | select(.Type == "AwsEc2Instance") | .Details.AwsEc2Instance) as $ec2
+                | if $ec2 != null then
+                    { "type": $ec2.Type, "ip": ($ec2.IpV4Addresses // []) }
+                  else null end),
+
+              "related": {
+                "ip": $ips,
+                "hosts": ([ $res[]? | select(.Type=="AwsEc2Instance") | .Id ]
+                          | map(select(. != null)) | unique)
+              },
+
+              "tags": $r.Types,
+
+              "labels": {
+                "record_state": $r.RecordState,
+                "workflow_status": ($r.Workflow.Status?),
+                "compliance_status": ($r.Compliance.Status?),
+                "severity_label": $sev.Label
+              }
+            }
+            # Single end-of-pipeline prune (ES rejects nulls; drop {} and []).
+            | walk(
+                if type == "object" then
+                  with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                elif type == "array" then
+                  map(select(. != null))
+                else . end)

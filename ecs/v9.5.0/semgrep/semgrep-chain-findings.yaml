@@ -1,0 +1,90 @@
+name: "Semgrep Supply Chain Findings to ECS v9.5.0"
+description: "Maps Semgrep Supply Chain (dependency) Findings into Elastic Common Schema (ECS) v9.5.0, populating the event, vulnerability, package, file, rule, and observer field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-chain-findings"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "semgrep"
+  - "supply-chain"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep Supply Chain Findings -> ECS v9.5.0 (nested).
+          # event.kind=alert; category=[vulnerability,package]; type=[info].
+          # One jq pass; single end-of-pipeline walk prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.found_dependency // {}) as $dep
+          | ($r.rule.cwe_names[0] // null) as $cwe0
+          | ($r.rule.vulnerability_identifier // null) as $cve
+          | {
+              "@timestamp": $r.created_at,
+              "ecs": { "version": "9.5.0" },
+              "message": $r.rule_message,
+              "tags": $r.categories,
+
+              "event": {
+                "kind": "alert",
+                "category": ["vulnerability", "package"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": ($r.id | tostring),
+                "created": $r.created_at,
+                "provider": "semgrep",
+                "module": "semgrep",
+                "dataset": "semgrep.supply_chain",
+                "reference": ($r.repository.url // null),
+                "original": ($r | tojson)
+              },
+
+              "vulnerability": {
+                "id": $cve,
+                "description": $r.rule_message,
+                "severity": $r.severity,
+                "category": ["supply-chain"],
+                "classification": ($cwe0 | if . != null then (split(":")[0]) else null end),
+                "enumeration": (if $cve != null then "CVE" else null end),
+                "reference": ($r.rule.references // null),
+                "scanner": { "vendor": "Semgrep" },
+                "status": ($r.status // $r.state)
+              },
+
+              "package": {
+                "name": ($dep.package // null),
+                "version": ($dep.version // null),
+                "type": ($dep.ecosystem // null),
+                "reference": ($dep.lockfile_line_url // null)
+              },
+
+              "file": {
+                "path": ($r.location.file_path // null),
+                "name": (if ($r.location.file_path // null) != null then ($r.location.file_path | split("/")[-1]) else null end)
+              },
+
+              "rule": {
+                "id": $r.rule_name,
+                "name": $r.rule_name,
+                "description": $r.rule_message,
+                "reference": ($r.rule.references // null)
+              },
+
+              "observer": {
+                "vendor": "Semgrep",
+                "product": "Semgrep Supply Chain"
+              },
+
+              "related": {
+                "hosts": ([$r.repository.name] | map(select(. != null)) | unique)
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != [] and .value != {} and .value != "")) else . end)

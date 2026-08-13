@@ -1,0 +1,120 @@
+name: "OpenCTI Indicators to ECS v9.5.0"
+description: "Maps OpenCTI (STIX 2.1) threat-intelligence Indicator records into Elastic Common Schema (ECS) v9.5.0, populating the event categorization and the threat.indicator.* / threat.feed.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "opencti-indicators"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "opencti"
+  - "indicators"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OpenCTI (STIX 2.1) Indicator -> ECS v9.5.0 (nested document).
+          # Threat intel -> event.kind:enrichment, category:[threat],
+          # type:[indicator]; the indicator itself lives under threat.indicator.*
+          # One jq pass, bind-once, is_ip guard, single walk-based prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | def is_ip($s):
+              ($s | type) == "string"
+              and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+          def conf($c):
+              if $c == null then null
+              elif $c >= 70 then "High"
+              elif $c >= 40 then "Medium"
+              elif $c >= 1  then "Low"
+              else "None" end;
+          ($r.x_opencti_main_observable_type // "") as $mot
+          | (if   ($mot | test("Domain";"i"))        then "domain-name"
+             elif ($mot | test("IPv4";"i"))           then "ipv4-addr"
+             elif ($mot | test("IPv6";"i"))           then "ipv6-addr"
+             elif ($mot | test("Url";"i"))            then "url"
+             elif ($mot | test("Hostname";"i"))       then "domain-name"
+             elif ($mot | test("StixFile|File";"i"))  then "file"
+             elif ($mot | test("Email-Addr";"i"))     then "email-addr"
+             elif ($mot | test("Certificate|X509";"i")) then "x509-certificate"
+             else ($mot | ascii_downcase) end) as $ind_type
+          | ($r.name // $r.pattern // $r.id) as $val
+          | ($r.objectMarking[0].definition // null) as $tlp_def
+          | {
+              "@timestamp": ($r.valid_from // $r.created // $r.created_at),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "enrichment",
+                "category": ["threat"],
+                "type": ["indicator"],
+                "id": $r.id,
+                "created": ($r.created_at // $r.created),
+                "module": "opencti",
+                "dataset": "opencti.indicators",
+                "provider": (($r.createdBy.name) // "OpenCTI")
+              },
+
+              "threat": {
+                "feed": {
+                  "name": (($r.createdBy.name) // "OpenCTI"),
+                  "reference": ($r.externalReferences[0].url // null)
+                },
+                "indicator": {
+                  "id": [$r.id],
+                  "name": $val,
+                  "type": $ind_type,
+                  "description": ($r.description // null),
+                  "confidence": conf($r.confidence),
+                  "first_seen": ($r.valid_from // null),
+                  "last_seen": ($r.valid_until // null),
+                  "modified_at": ($r.modified // $r.updated_at // null),
+                  "provider": (($r.createdBy.name) // null),
+                  "reference": ($r.externalReferences[0].url // null),
+                  "sightings": null,
+                  "marking": {
+                    "tlp": (if $tlp_def != null
+                            then ($tlp_def | ltrimstr("TLP:"))
+                            else null end)
+                  },
+                  "ip": (if $ind_type == "ipv4-addr" or $ind_type == "ipv6-addr"
+                         then (if is_ip($val) then $val else null end)
+                         else null end),
+                  "url": (if $ind_type == "url"
+                          then { "original": $val, "full": $val }
+                          else (if $ind_type == "domain-name"
+                                then { "domain": $val }
+                                else null end)
+                          end)
+                }
+              },
+
+              "related": {
+                "hosts": (if $ind_type == "domain-name" then [$val] else null end),
+                "ip": (if ($ind_type | startswith("ip")) and is_ip($val) then [$val] else null end)
+              },
+
+              "tags": ($r.labels // null),
+
+              "opencti": {
+                "score": ($r.x_opencti_score // null),
+                "detection": ($r.x_opencti_detection // null),
+                "pattern": ($r.pattern // null),
+                "pattern_type": ($r.pattern_type // null),
+                "indicator_types": ($r.indicator_types // null),
+                "revoked": ($r.revoked // null),
+                "kill_chain_phases": ($r.killChainPhases // null),
+                "main_observable_type": ($r.x_opencti_main_observable_type // null)
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

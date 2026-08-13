@@ -1,0 +1,93 @@
+name: "Google Cloud Audit Logs to ECS v9.5.0"
+description: "Transforms Google Cloud (Cloud Audit) Logs into Elastic Common Schema (ECS) v9.5.0, populating the event, cloud, user, source, user_agent, service, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-cloud-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "google"
+  - "gcp"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Google Cloud Audit Logs -> ECS v9.5.0 (nested). One record/call.
+          # event.category: api  (cloud management API activity)
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string" and ($s|test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or ($s|test(":")));
+
+          . as $r
+          | ($r.protoPayload // {}) as $pp
+          | ($pp.requestMetadata // {}) as $rm
+          | ($pp.authenticationInfo // {}) as $ai
+          | (($r.resource // {}).labels // {}) as $lbl
+          | ($pp.methodName // "") as $mn
+          | ($mn | ascii_downcase) as $mnl
+          | (if   ($mnl | test("insert|create")) then "creation"
+             elif ($mnl | test("delete|remove")) then "deletion"
+             elif ($mnl | test("update|patch|set|write")) then "change"
+             elif ($mnl | test("get|list|read|aggregatedlist|search|batchget")) then "access"
+             else "info" end) as $etype
+          | (($pp.status // {}).code // 0) as $status_code
+          | {
+              "@timestamp": $r.timestamp,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["api"],
+                "type": [$etype],
+                "outcome": (if $status_code == 0 then "success" else "failure" end),
+                "action": $mn,
+                "id": $r.insertId,
+                "provider": $pp.serviceName,
+                "created": $r.receiveTimestamp,
+                "code": ($status_code | tostring)
+              },
+
+              "cloud": {
+                "provider": "gcp",
+                "project": { "id": $lbl.project_id },
+                "availability_zone": $lbl.zone,
+                "service": { "name": $pp.serviceName },
+                "instance": { "id": $lbl.instance_id }
+              },
+
+              "user": {
+                "name": $ai.principalEmail,
+                "email": $ai.principalEmail
+              },
+
+              "source": {
+                "ip": (if is_ip($rm.callerIp) then $rm.callerIp else null end),
+                "address": $rm.callerIp
+              },
+
+              "user_agent": {
+                "original": $rm.callerSuppliedUserAgent
+              },
+
+              "service": {
+                "name": $pp.serviceName
+              },
+
+              "log": {
+                "level": ($r.severity | ascii_downcase?),
+                "logger": $r.logName
+              },
+
+              "message": ($mn + " on " + ($pp.resourceName // "")),
+
+              "related": {
+                "ip": ([ (if is_ip($rm.callerIp) then $rm.callerIp else empty end) ] | unique),
+                "user": ([ $ai.principalEmail ] | map(select(. != null)) | unique)
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)
