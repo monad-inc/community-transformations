@@ -1,0 +1,61 @@
+name: "GitHub Copilot Logs to CEF"
+description: "Maps GitHub Copilot activity records (from GitHub Enterprise audit logs) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-copilot-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "github"
+  - "copilot"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # GitHub audit logs -> CEF intermediate (T1). No escaping here —
+          # the shared CEF Serializer (T2) owns all escaping. Final-form
+          # values: severity int 0-10, times epoch-MILLISECONDS, custom
+          # slots paired with *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          . as $r
+          | def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then ($ts | floor) else (($ts * 1000) | floor) end)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+
+          # operation_type -> coarse severity bucket (0-10).
+          ( { "remove": 6, "modify": 5, "create": 4, "transfer": 6,
+                "authentication": 3, "access": 2 }[$r.operation_type] // 3 ) as $sev
+
+          | { _cef: {
+              vendor: "GitHub",
+              product: "GitHub Audit Log",
+              version: "",
+              signature_id: $r.action,
+              name: (($r.actor // "?") + " " + ($r.action // "?")),
+              severity: $sev,
+              extension: ( {
+                rt:       to_epoch_ms($r.created_at // $r["@timestamp"]),
+                suser:    $r.actor,
+                suid:     (if $r.actor_id != null then ($r.actor_id | tostring) else null end),
+                src:      $r.actor_ip,
+                duser:    $r.user,
+                duid:     (if $r.user_id != null then ($r.user_id | tostring) else null end),
+                act:      $r.action,
+                outcome:  "SUCCESS",
+                requestClientApplication: $r.user_agent,
+                cs1Label: "org",            cs1:  $r.org,
+                cs2Label: "repository",     cs2:  ($r.repo // $r.repository),
+                cs3Label: "team",           cs3:  $r.team,
+                cs4Label: "operationType",  cs4:  $r.operation_type,
+                cs5Label: "actorCountry",   cs5:  $r.actor_location.country_code,
+                cs6Label: "documentId",     cs6:  $r._document_id
+              } | with_entries(select(.value != null and .value != "")) )
+          } }
