@@ -1,0 +1,108 @@
+name: "GitLab Issues to ECS v9.5.0"
+description: "Maps GitLab Issues API records into Elastic Common Schema (ECS) v9.5.0 nested documents — event categorization (api), user, url, related, and tags field sets, with GitLab-specific identifiers under the gitlab.* namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "gitlab-issues"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "gitlab"
+  - "issues"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # GitLab Issues API record -> ECS v9.5.0 (nested document).
+          # One issue per invocation.
+          #
+          # Categorization: event.kind=event, event.category=[api],
+          #   event.type=[creation] on create, [change] on update.
+          #   (created_at == updated_at => creation, else change.)
+          # ECS has no native "issue" concept; GitLab identifiers that have no
+          # ECS home live under the allowed vendor namespace gitlab.*.
+          # -----------------------------------------------------------------
+
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test(":"));
+
+          # GitLab issue severity -> a small numeric scale for event.severity.
+          def sev_num($s):
+            ({ "critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0 }
+              [($s // "" | ascii_downcase)] // 0);
+
+          . as $r
+          | ($r.author // {}) as $au
+          | (($r.assignees // []) | map(.username) | map(select(. != null))) as $assignees
+          | (if ($r.created_at == $r.updated_at) then "creation" else "change" end) as $etype
+          | (if $etype == "creation" then "issue-created" else "issue-updated" end) as $eaction
+
+          | {
+              "@timestamp": ($r.updated_at // $r.created_at),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                category: ["api"],
+                type: [$etype],
+                outcome: "success",
+                action: $eaction,
+                id: (if $r.id != null then ($r.id | tostring) else null end),
+                created: $r.created_at,
+                provider: "gitlab",
+                module: "gitlab",
+                dataset: "gitlab.issues",
+                url: $r.web_url,
+                severity: sev_num($r.severity),
+                reason: $r.title
+              },
+
+              message: $r.title,
+
+              user: {
+                id: (if $au.id != null then ($au.id | tostring) else null end),
+                name: $au.username,
+                full_name: $au.name
+              },
+
+              url: {
+                full: $r.web_url,
+                original: $r.web_url
+              },
+
+              related: {
+                user: ([$au.username] + $assignees | map(select(. != null)) | unique)
+              },
+
+              tags: ($r.labels // []),
+
+              # GitLab-specific identifiers with no ECS home (allowed vendor namespace).
+              gitlab: {
+                issue: {
+                  id: $r.id,
+                  iid: $r.iid,
+                  project_id: $r.project_id,
+                  type: ($r.issue_type // $r.type),
+                  state: $r.state,
+                  severity: $r.severity,
+                  confidential: $r.confidential,
+                  upvotes: $r.upvotes,
+                  downvotes: $r.downvotes,
+                  merge_requests_count: $r.merge_requests_count,
+                  user_notes_count: $r.user_notes_count,
+                  due_date: $r.due_date,
+                  closed_at: $r.closed_at,
+                  milestone: ($r.milestone.title // null),
+                  assignees: $assignees,
+                  reference: ($r.references.full // null)
+                }
+              }
+            }
+            # Single end-of-pipeline prune (ES rejects nulls; drop empties).
+            | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                    elif type == "array" then map(select(. != null))
+                    else . end )

@@ -1,0 +1,125 @@
+name: "GitHub Advisory Database to ECS v9.5.0"
+description: "Normalizes GitHub Advisory Database (Global Security Advisory) records into Elastic Common Schema (ECS) v9.5.0, populating the event categorization (kind=enrichment, category=vulnerability, type=info), the vulnerability.* field set (id, classification, severity, scoring, reference), package.* for the affected package, and a github.advisory.* vendor namespace preserving GHSA-specific detail."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-advisory-db"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "github"
+  - "advisory"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # GitHub Advisory Database  ->  ECS v9.5.0
+          #
+          # Input: ONE GitHub Global Security Advisory record per invocation
+          #   (the github-advisory-db input connector). This is reference /
+          #   catalog data (a published advisory), not a host-scoped scan
+          #   result, so it maps to:
+          #     event.kind     = "enrichment"   (reference/context data)
+          #     event.category = ["vulnerability"]
+          #     event.type     = ["info"]        (the only type ECS pairs with
+          #                                       category=vulnerability)
+          #
+          # ECS has no host/asset here, so no ip-typed fields are emitted; the
+          # single end-of-pipeline `prune` drops nulls/empties.
+          # =================================================================
+
+          def to_iso($ts):
+            if ($ts | type) == "string" then $ts else null end;
+
+          # CVSS version ("3.1", "4.0", ...) from the vector prefix.
+          def cvss_ver($vec):
+            if ($vec | type) == "string" and ($vec | startswith("CVSS:"))
+            then ($vec | ltrimstr("CVSS:") | split("/")[0])
+            else null end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.references // []) as $refs
+          | ($r.vulnerabilities // []) as $vulns
+          | ($r.cwes // []) as $cwes
+          | (($r.cvss_severities.cvss_v3 // $r.cvss // {})) as $cv
+          | ($vulns | first) as $v0
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $r.published_at,
+
+              event: {
+                kind: "enrichment",
+                module: "github",
+                dataset: "github.advisory",
+                category: ["vulnerability"],
+                type: ["info"],
+                id: $r.ghsa_id,
+                url: $r.html_url,
+                reference: $r.source_code_location,
+                created: to_iso($r.github_reviewed_at),
+                # ECS event.severity is a long; GHSA severity is a label, so it
+                # lives in vulnerability.severity, not here.
+                original: ($r | tostring)
+              },
+
+              vulnerability: {
+                # Prefer the CVE as the canonical id; GHSA when no CVE assigned.
+                id: ($r.cve_id // $r.ghsa_id),
+                description: $r.summary,
+                severity: $r.severity,
+                reference: $r.html_url,
+                classification: (if $cv.vector_string != null then "CVSS" else null end),
+                enumeration: (if $r.cve_id != null then "CVE" else "GHSA" end),
+                category: ([ $vulns[]?.package.ecosystem ] | map(select(. != null)) | unique),
+                scanner: { vendor: "GitHub" },
+                score: {
+                  base: $cv.score,
+                  version: cvss_ver($cv.vector_string)
+                }
+              },
+
+              # The affected software package (first entry; full list preserved
+              # in the vendor namespace below).
+              package: (if $v0 != null then {
+                name: $v0.package.name,
+                type: $v0.package.ecosystem,
+                version: $v0.vulnerable_version_range,
+                reference: $r.source_code_location
+              } else null end),
+
+              # Vendor namespace for GHSA-specific detail ECS has no home for.
+              # Deeply-nested arrays are serialized to JSON strings to avoid an
+              # Elasticsearch mapping explosion.
+              github: {
+                advisory: {
+                  ghsa_id: $r.ghsa_id,
+                  cve_id: $r.cve_id,
+                  type: $r.type,
+                  summary: $r.summary,
+                  cwes: ([ $cwes[]?.cwe_id ] | map(select(. != null)) | unique),
+                  cvss_vector: $cv.vector_string,
+                  published_at: $r.published_at,
+                  updated_at: $r.updated_at,
+                  withdrawn_at: $r.withdrawn_at,
+                  references: $refs,
+                  affected: (if ($vulns | length) > 0 then ($vulns | tostring) else null end)
+                }
+              }
+            }
+          | prune

@@ -1,0 +1,101 @@
+name: "Google Workspace Gemini Activity to ECS v9.5.0"
+description: "Maps Google Workspace Admin SDK Reports 'gemini_in_workspace_apps' activity records into a nested Elastic Common Schema (ECS) v9.5.0 document (event categorization, user, source, cloud, and related.* field groups)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "google-workspace-gemini-activity"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "google"
+  - "google-workspace"
+  - "gemini"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Google Workspace "gemini_in_workspace_apps" activity -> ECS v9.5.0
+          # event.category "api" (a Gemini feature-utilization is an
+          # application/API interaction). One nested doc; one prune pass.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todate)
+            else $ts end;
+
+          . as $r
+          | ($r.id // {}) as $id
+          | ($r.actor // {}) as $ac
+          | ($r.events[0] // {}) as $ev
+          | ((($ev.parameters // []) | map({ (.name): (.value // .boolValue // .intValue // .multiValue) }) | add) // {}) as $p
+          | ($r.ipAddress // null) as $ip
+
+          | {
+              "@timestamp": to_iso($id.time),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["api"],
+                "type": ["access", "info"],
+                "outcome": "success",
+                "action": ($p.action // $ev.name // null),
+                "provider": ($id.applicationName // "gemini_in_workspace_apps"),
+                "id": ($id.uniqueQualifier // null),
+                "module": "google_workspace",
+                "dataset": "google_workspace.gemini"
+              },
+
+              "user": {
+                "email": ($ac.email // null),
+                "name": ($ac.email | if . == null then null else split("@")[0] end),
+                "id": ($ac.profileId // null),
+                "domain": ($r.ownerDomain // null)
+              },
+
+              "source": {
+                "ip": (if is_ip($ip) then $ip else null end),
+                "address": $ip
+              },
+
+              "cloud": {
+                "provider": "google_workspace",
+                "account": { "id": ($id.customerId // null) }
+              },
+
+              "organization": {
+                "name": ($r.ownerDomain // null)
+              },
+
+              "related": {
+                "user": ([$ac.email, $ac.profileId] | map(select(. != null)) | unique),
+                "ip": ([ (if is_ip($ip) then $ip else null end) ] | map(select(. != null)) | unique)
+              },
+
+              "google_workspace": {
+                "gemini": {
+                  "app_name": ($p.app_name // null),
+                  "action": ($p.action // null),
+                  "event_category": ($p.event_category // null),
+                  "feature_source": ($p.feature_source // null)
+                },
+                "event": {
+                  "type": ($ev.type // null),
+                  "name": ($ev.name // null)
+                }
+              }
+            }
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

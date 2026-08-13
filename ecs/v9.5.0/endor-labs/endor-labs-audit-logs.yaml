@@ -1,0 +1,108 @@
+name: "Endor Labs Audit Logs to ECS v9.5.0"
+description: "Maps Endor Labs Audit Log (AuditLog) records into a nested Elastic Common Schema (ECS) v9.5.0 document, covering event categorization (configuration), user, source, cloud, related.*, and an endor_labs.* custom namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "endor-labs-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "endor-labs"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Endor Labs AuditLog -> ECS v9.5.0 (nested document).
+          # Admin audit CRUD -> event.category "configuration".
+          # One pass: bind once, is_ip guard, related.* union, single prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test(":"));
+
+          def email_of($cb):
+            if $cb == null then null
+            else ($cb | split("@")) as $p
+              | (if ($p | length) >= 2 then ($p[0] + "@" + $p[1]) else $cb end)
+            end;
+
+          # OCSF-agnostic ECS event.type per Endor operation.
+          def ecs_type($op):
+            { "OPERATION_CREATE": "creation", "OPERATION_READ": "access",
+              "OPERATION_UPDATE": "change",   "OPERATION_DELETE": "deletion",
+              "OPERATION_UPSERT": "change" }[$op] // "info";
+
+          . as $r
+          | ($r.meta // {}) as $m
+          | ($r.spec // {}) as $s
+          | (email_of($m.created_by)) as $email
+          | ($s.remote_address) as $ip
+          | {
+              "@timestamp": ($m.create_time // $m.upsert_time // $m.update_time),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                category: ["configuration"],
+                type: [ ecs_type($s.operation) ],
+                action: ($s.operation // null),
+                outcome: "success",
+                id: ($r.uuid // null),
+                provider: "endor-labs",
+                module: "audit",
+                dataset: "endor_labs.audit"
+              },
+
+              user: {
+                name:  ($email // $m.created_by),
+                id:    ($m.created_by // $email),
+                email: $email
+              },
+
+              source: {
+                ip: (if is_ip($ip) then $ip else null end)
+              },
+
+              service: {
+                name: "endor-labs"
+              },
+
+              cloud: {
+                provider: "endor-labs",
+                account: { name: ($r.tenant_meta.namespace // null) }
+              },
+
+              organization: {
+                name: ($r.tenant_meta.namespace // null)
+              },
+
+              related: {
+                ip:   ([ $ip ] | map(select(is_ip(.))) | unique),
+                user: ([ ($email // $m.created_by), $m.created_by ]
+                        | map(select(. != null)) | unique)
+              },
+
+              endor_labs: {
+                message_kind: ($s.message_kind // null),
+                message_uuid: ($s.message_uuid // null),
+                operation:    ($s.operation // null),
+                namespace:    ($r.tenant_meta.namespace // null),
+                created_by:   ($m.created_by // null)
+              }
+            }
+          # Single recursive prune: drop null / "" / {} / [].
+          | walk(
+              if type == "object" then
+                with_entries(select(
+                  .value != null and .value != "" and .value != {} and .value != []
+                ))
+              elif type == "array" then
+                map(select(. != null and . != "" and . != {} and . != []))
+              else .
+              end
+            )

@@ -1,0 +1,163 @@
+name: "OpenAI Codex (OTLP) to ECS v9.5.0"
+description: "Transforms OTLP telemetry from OpenAI Codex into nested Elastic Common Schema (ECS) v9.5.0 documents, fanning out one document per OTLP logRecord. Populates event categorization (event.kind/category/type/outcome), the gen_ai.* field set for LLM/API activity (model, provider, token usage), process.* for shell/tool execution, file.* for file tool results, user.*, service.*, and related.* aggregation."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-codex"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "openai"
+  - "ai"
+  - "gen_ai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Codex RAW OTLP logs -> ECS v9.5.0 (nested, fan-out)
+          # One OTLP envelope in -> one ECS document per logRecord out.
+          # Metrics envelopes (resourceMetrics) produce no output.
+          #
+          # Categorization by event.name attribute ("codex.<event>"):
+          #   api_request/sse_event/user_prompt/conversation_starts
+          #                              -> event.category ["process"], type ["info"]
+          #   tool_result (file)         -> event.category ["file"],  type [access|change|creation]
+          #   tool_result (mcp)          -> event.category ["network"], type ["connection"]
+          #   tool_result (shell/other)  -> event.category ["process"], type ["start"]
+          #   tool_decision              -> event.category ["configuration"], type ["change"]
+          #   sandbox_outcome            -> event.category ["process"], type ["info"]
+          #   (other)                    -> event.kind "event" (no category)
+          # LLM events also emit the gen_ai.* field set (model/provider/tokens).
+          # -----------------------------------------------------------------
+
+          def num($x):
+            if $x == null or $x == "" then null
+            elif ($x | type) == "string" then ($x | tonumber? // null)
+            else $x end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+          def prune: walk(if type == "object"
+              then with_entries(select((.value != null) and (.value != "")
+                     and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+              elif type == "array" then map(select(. != null))
+              else . end);
+
+          (.resourceLogs // [])[] as $rl
+          | kv($rl.resource.attributes) as $res
+          | ($rl.scopeLogs // [])[] as $sl
+          | ($sl.logRecords // [])[] as $lr
+          | ($res + kv($lr.attributes)) as $r
+          | ( ($lr.body.stringValue) as $b
+              | if (($r["event.name"]) // "") != "" then $r["event.name"]
+                elif ($b != null and ($b | startswith("codex."))) then $b
+                else "codex.unknown" end ) as $en
+          | ($en | ltrimstr("codex.")) as $eshort
+          | (($r["event.timestamp"])
+             // ((($lr.timeUnixNano // "0") | tonumber / 1000000000
+                  | todate))) as $ts
+          | ($r["model"] // "unknown") as $model
+          | ($r["user.email"]) as $email
+          | (($r["error.message"] // $r["error"])) as $err
+          | (num($r["http.response.status_code"])) as $status
+
+          # per-event categorization + outcome
+          | (if $en == "codex.tool_result" then truthy($r["success"])
+             elif $en == "codex.tool_decision" then (($r["decision"] // "approved") | ascii_downcase | startswith("approv"))
+             elif $en == "codex.sandbox_outcome" then ((($r["outcome"] // "") | ascii_downcase) | . == "success" or . == "ok")
+             elif $err != null then false
+             elif ($status != null and $status >= 400) then false
+             else true end) as $ok
+          | ($ok | if . then "success" else "failure" end) as $outcome
+
+          | (($r["mcp_server"] // "") != "") as $is_mcp
+          | ($r["tool_name"] // "" | ascii_downcase) as $tl
+          | (($tl | test("(read_file|write_file|apply_patch|edit|patch|read|write)")) and (($r["arguments"] // "") != "")) as $is_file
+
+          | (if ($en | test("^codex\\.(api_request|sse_event|user_prompt|conversation_starts)$"))
+                then { kind: "event", category: ["process"], type: ["info"] }
+             elif $en == "codex.tool_result" and $is_mcp
+                then { kind: "event", category: ["network"], type: ["connection"] }
+             elif $en == "codex.tool_result" and $is_file
+                then { kind: "event", category: ["file"], type: ["change"] }
+             elif $en == "codex.tool_result"
+                then { kind: "event", category: ["process"], type: ["start"] }
+             elif $en == "codex.tool_decision"
+                then { kind: "event", category: ["configuration"], type: ["change"] }
+             elif $en == "codex.sandbox_outcome"
+                then { kind: "event", category: ["process"], type: ["info"] }
+             else { kind: "event" } end) as $cat
+
+          # gen_ai.* only for LLM/API activity
+          | (if ($en | test("^codex\\.(api_request|sse_event|user_prompt|conversation_starts)$"))
+             then { provider: { name: "openai" },
+                    operation: { name: "chat" },
+                    request: { model: $model },
+                    response: { model: $model },
+                    usage: { input_tokens: num($r["input_token_count"]),
+                             output_tokens: num($r["output_token_count"]) } }
+             else null end) as $gen_ai
+
+          # tool file path / command for tool_result
+          | ( ($r["arguments"] // "") as $a
+              | if ($a | type) == "string" and $a != "" then ($a | fromjson? // {})
+                elif ($a | type) == "object" then $a else {} end ) as $args
+          | (($args["file_path"]) // ($args["path"]) // ($args["notebook_path"])) as $path
+
+          | {
+              "@timestamp": $ts,
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": $cat.kind,
+                "category": $cat.category,
+                "type": $cat.type,
+                "outcome": $outcome,
+                "action": $eshort,
+                "module": "codex",
+                "provider": "openai-codex",
+                "id": $r["conversation.id"],
+                "duration": ((num($r["duration_ms"]) // num($r["initial_duration_ms"])) as $d
+                             | if $d == null then null else ($d * 1000000) end),
+                "reason": $err
+              },
+              "user": { "id": $r["user.account_id"], "email": $email, "name": $email },
+              "service": { "name": "codex", "type": "openai-codex", "version": ($r["app.version"] // $r["service.version"]) },
+              "gen_ai": $gen_ai,
+              "process": (if ($en == "codex.tool_result" and ($is_mcp | not) and ($is_file | not))
+                          then { "name": $r["tool_name"], "command_line": ($args["command"] // $args["cmd"] // $r["arguments"]) }
+                          elif ($en | test("^codex\\.(api_request|sse_event|user_prompt|conversation_starts)$"))
+                          then { "name": "codex" } else null end),
+              "file": (if ($en == "codex.tool_result" and $is_file and $path != null)
+                       then { "path": $path } else null end),
+              "destination": (if ($en == "codex.tool_result" and $is_mcp)
+                              then { "address": $r["mcp_server"] } else null end),
+              "related": { "user": ([ $email ] | map(select(. != null)) | unique) },
+              "labels": {
+                "conversation_id": $r["conversation.id"],
+                "auth_mode": $r["auth_mode"],
+                "originator": $r["originator"],
+                "terminal_type": $r["terminal.type"],
+                "model": $model,
+                "tool_name": $r["tool_name"],
+                "call_id": $r["call_id"],
+                "decision": $r["decision"],
+                "sandbox_outcome": $r["outcome"],
+                "sse_kind": $r["event.kind"]
+              },
+              "message": ($model + " " + $eshort)
+            }
+          | prune

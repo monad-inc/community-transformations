@@ -1,0 +1,89 @@
+name: "Glean Overview Insights to ECS v9.5.0"
+description: "Maps Glean Overview Insights usage/adoption snapshot records into Elastic Common Schema (ECS) v9.5.0 nested documents (event categorization + host/organization + the glean.* metric namespace)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "glean-overview-insights"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "glean"
+  - "overview-insights"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Glean Overview Insights -> ECS v9.5.0 (nested).
+          # An org-level usage/adoption metrics snapshot => event.kind: metric.
+          # There is no ECS event.category for adoption analytics, so category
+          # /type are omitted (honest) and the metrics live under glean.*.
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor | todateiso8601)
+            else $ts end;
+
+          . as $r
+          | ($r.monthlyActiveUserTimeseries.countInfo[-1].organization
+             // $r.weeklyActiveUserTimeseries.countInfo[-1].organization) as $org
+          | {
+              "@timestamp": to_iso($r.lastUpdatedTs),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "metric",
+                "outcome": "success",
+                "module": "glean",
+                "dataset": "glean.overview_insights",
+                "provider": "glean",
+                "action": "overview-insights-snapshot"
+              },
+              "observer": {
+                "vendor": "Glean",
+                "product": "Glean Overview Insights"
+              },
+              "organization": { "name": $org },
+              "user": { "id": ($r.totalSignups | tostring) },
+              "message": "Glean adoption snapshot: \($r.monthlyActiveUsers // 0) MAU, \($r.weeklyActiveUsers // 0) WAU across \($r.totalSignups // 0) signups",
+              "glean": {
+                "monthly_active_users":        $r.monthlyActiveUsers,
+                "weekly_active_users":         $r.weeklyActiveUsers,
+                "employee_count":              $r.employeeCount,
+                "total_signups":               $r.totalSignups,
+                "search_session_satisfaction": $r.searchSessionSatisfaction,
+                "departments":                 $r.departments,
+                "organization":                $org,
+                "search": {
+                  "monthly_active_users": $r.searchSummary.monthlyActiveUsers,
+                  "weekly_active_users":  $r.searchSummary.weeklyActiveUsers,
+                  "num_searches":         $r.searchSummary.numSearches,
+                  "num_search_users":     $r.searchSummary.numSearchUsers,
+                  "datasource_counts":    $r.searchDatasourceCounts
+                },
+                "chat": {
+                  "monthly_active_users": $r.chatSummary.monthlyActiveUsers,
+                  "weekly_active_users":  $r.chatSummary.weeklyActiveUsers,
+                  "num_chats":            $r.chatSummary.numChats,
+                  "num_chat_users":       $r.chatSummary.numChatUsers,
+                  "datasource_counts":    $r.chatDatasourceCounts
+                },
+                "extension": {
+                  "monthly_active_users": $r.extensionSummary.monthlyActiveUsers,
+                  "weekly_active_users":  $r.extensionSummary.weeklyActiveUsers
+                },
+                "ugc": {
+                  "monthly_active_users": $r.ugcSummary.monthlyActiveUsers,
+                  "weekly_active_users":  $r.ugcSummary.weeklyActiveUsers
+                }
+              }
+            }
+          # Single end-of-pipeline recursive prune (ES rejects nulls; drop
+          # null/{}/[] leaves). This is the one permitted recursive pass.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              else . end
+            )
