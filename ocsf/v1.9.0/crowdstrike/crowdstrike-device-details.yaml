@@ -57,6 +57,7 @@ config:
 
               # ---- metadata (required: product, version) ----
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "name": "Falcon",

@@ -104,6 +104,7 @@ config:
                 status: (if $state == "OK" then "Success" elif $state == "ERROR" then "Failure" else "Unknown" end),
 
                 metadata: {
+                "profiles": ["cloud", "osint"],
                   version: "1.9.0",
                   product: { vendor_name: "MLflow", name: "MLflow GenAI Traces" },
                   uid: $tid,

@@ -58,6 +58,7 @@ config:
               "is_mfa":       (if ($r.mfa | type) == "boolean" then $r.mfa else null end),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": $r.id,
                 "product": {

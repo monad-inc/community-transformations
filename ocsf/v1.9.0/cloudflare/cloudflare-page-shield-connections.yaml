@@ -50,6 +50,7 @@ config:
               "end_time":   to_epoch($r.last_seen_at),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "Cloudflare",

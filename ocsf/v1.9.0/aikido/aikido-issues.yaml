@@ -113,6 +113,7 @@ config:
                 else null end
               ),
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "product": {
                   "name": "Aikido Security",
                   "vendor_name": "Aikido"

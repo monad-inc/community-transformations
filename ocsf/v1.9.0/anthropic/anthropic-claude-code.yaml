@@ -109,7 +109,8 @@ config:
                       .["app.version"], .["prompt.id"], .["service.name"], .["service.version"])) as $unmapped
 
           | ({ time: $time,
-               metadata: { version: "1.9.0",
+               metadata: {
+                "profiles": ["cloud", "osint"], version: "1.9.0",
                  product: { vendor_name: "Anthropic", name: "Claude Code", version: $ver },
                  log_name: $en, uid: $r["prompt.id"], sequence: $r["event.sequence"],
                  tenant_uid: $r["organization.id"] },

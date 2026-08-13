@@ -50,6 +50,7 @@ config:
                 ( $a.problems[]? | select(.source == "NVD") | { "value": .id, "type_id": 99, "src_url": .url } )
               ],
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "name": "Snyk",

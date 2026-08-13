@@ -54,6 +54,7 @@ config:
               severity_id:  1,
               time:         $t,
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "CrowdStrike",

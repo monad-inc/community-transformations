@@ -119,6 +119,7 @@ config:
               },
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 uid: ($r.id.uniqueQualifier | tostring),
                 original_time: ($r.id.time // ""),

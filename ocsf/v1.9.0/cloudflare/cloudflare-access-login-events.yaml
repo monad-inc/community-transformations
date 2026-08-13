@@ -50,6 +50,7 @@ config:
               time: to_epoch($r.created_at),
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "Cloudflare",

@@ -59,6 +59,7 @@ config:
               end_time: to_epoch($r.EdgeEndTimestamp),
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "Cloudflare",

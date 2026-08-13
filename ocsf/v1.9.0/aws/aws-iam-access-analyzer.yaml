@@ -84,6 +84,7 @@ config:
               "time": (to_epoch($r.analyzedAt) // to_epoch($r.updatedAt) // to_epoch($r.createdAt)),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": $r.id,
                 "product": {

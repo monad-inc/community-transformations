@@ -104,7 +104,8 @@ config:
                       .["model"], .["slug"], .["terminal.type"])) as $unmapped
 
           | ({ time: $time,
-               metadata: { version: "1.9.0",
+               metadata: {
+                "profiles": ["cloud", "osint"], version: "1.9.0",
                  product: { vendor_name: "OpenAI", name: "Codex", version: $ver },
                  log_name: $en, uid: $r["conversation.id"] },
                cloud: $cloud, osint: $osint,

@@ -59,6 +59,7 @@ config:
               severity_id:  $sevid,
               time:         to_epoch($r.timestamp // $r.dateCreated),
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: { vendor_name: "Brinqa", name: "Brinqa" }
               },

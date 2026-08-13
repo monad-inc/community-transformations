@@ -67,6 +67,7 @@ config:
               "time": to_epoch($r.created),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "AlienVault",

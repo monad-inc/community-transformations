@@ -47,6 +47,7 @@ config:
               time: $time,
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: { vendor_name: "Anthropic", name: "Claude Enterprise" },
                 labels: ([ $r.source_type ] | map(select(. != null and . != ""))),

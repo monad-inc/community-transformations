@@ -91,6 +91,7 @@ config:
               "status_detail": ($r.status // null),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": ($r.id // null),
                 "product": {

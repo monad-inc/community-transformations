@@ -97,6 +97,7 @@ config:
               "time": to_epoch($r.eventTime),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": $r.eventID,
                 "product": {

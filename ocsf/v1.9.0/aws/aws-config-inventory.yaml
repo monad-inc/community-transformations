@@ -79,6 +79,7 @@ config:
               message: ( "AWS Config inventory: " + ($r.resourceType // "resource") + " " + ($r.resourceId // "") ),
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "AWS",

@@ -63,6 +63,7 @@ config:
               time: to_epoch($r.recordtime),
 
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "AWS",

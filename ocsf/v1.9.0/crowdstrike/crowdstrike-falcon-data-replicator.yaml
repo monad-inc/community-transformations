@@ -49,6 +49,7 @@ config:
               severity_id:  1,
               time:         to_epoch_ms($r.timestamp),
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: {
                   vendor_name: "CrowdStrike",

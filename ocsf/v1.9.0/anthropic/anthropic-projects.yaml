@@ -52,6 +52,7 @@ config:
               severity_id: 1,
               time: $time,
               metadata: {
+                "profiles": ["cloud", "osint"],
                 version: "1.9.0",
                 product: { vendor_name: "Anthropic", name: "Claude", feature: { name: "Projects" } },
                 log_name: "anthropic.projects",

@@ -47,6 +47,7 @@ config:
               "class_uid": 6003,
               "severity_id": $severity_id,
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "product": {
                   "name": "Monad",
                   "vendor_name": "Monad",

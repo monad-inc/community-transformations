@@ -60,6 +60,7 @@ config:
               "time": $time,
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": ($r.id | tostring),
                 "product": {

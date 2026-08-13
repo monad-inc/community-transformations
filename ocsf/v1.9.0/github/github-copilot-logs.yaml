@@ -48,6 +48,7 @@ config:
               "time": to_epoch_ms($r.created_at // $r["@timestamp"]),
 
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "GitHub",

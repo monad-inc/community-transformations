@@ -104,6 +104,7 @@ config:
 
               # --- Metadata (required) ---
               "metadata": {
+                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "uid": $r.eventID,
                 "correlation_uid": $r.requestID,

@@ -43,6 +43,7 @@ config:
             "status": $result,
             "time": to_epoch($r.timestamp),
             "metadata": {
+                "profiles": ["cloud", "osint"],
               "version": "1.9.0",
               "log_name": $action,
               "tenant_uid": $r.organizationId,
