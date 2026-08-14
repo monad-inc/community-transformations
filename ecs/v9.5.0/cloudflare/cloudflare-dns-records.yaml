@@ -1,0 +1,102 @@
+name: "Cloudflare DNS Records to ECS v9.5.0"
+description: "Maps Cloudflare DNS Records inventory into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization, the dns.* field set, cloud.*, related.*, and a cloudflare.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-dns-records"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "dns-records"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare DNS Records -> ECS v9.5.0 (nested).
+          # A DNS record is a configuration asset snapshot:
+          #   event.kind=asset, event.category=[configuration], type=[info].
+          # One jq construction pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) or ($s | test(":")));
+
+          . as $r
+          | ($r.content // null) as $content
+          | (if is_ip($content) then $content else null end) as $ip
+          | {
+              "@timestamp": ($r.modified_on // $r.created_on),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "asset",
+                "category": ["configuration"],
+                "type": ["info"],
+                "outcome": "success",
+                "id": $r.id,
+                "provider": "cloudflare",
+                "module": "dns",
+                "dataset": "cloudflare.dns_records",
+                "created": $r.created_on
+              },
+
+              "cloud": {
+                "provider": "cloudflare",
+                "service": { "name": "DNS" }
+              },
+
+              "dns": {
+                "type": "answer",
+                "question": {
+                  "name": $r.name,
+                  "registered_domain": $r.zone_name,
+                  "type": $r.type
+                },
+                "answers": [
+                  {
+                    "name": $r.name,
+                    "type": $r.type,
+                    "class": "IN",
+                    "ttl": $r.ttl,
+                    "data": $content
+                  }
+                ],
+                "resolved_ip": (if $ip != null then [$ip] else null end)
+              },
+
+              "tags": ($r.tags // null),
+
+              "related": {
+                "hosts": ([$r.name, $r.zone_name] | map(select(. != null)) | unique),
+                "ip": (if $ip != null then [$ip] else null end)
+              },
+
+              # Vendor namespace for fields ECS does not model (avoids mapping
+              # explosion; nested blobs serialized to JSON strings).
+              "cloudflare": {
+                "zone": { "id": $r.zone_id, "name": $r.zone_name },
+                "record": {
+                  "id": $r.id,
+                  "type": $r.type,
+                  "content": $content,
+                  "ttl": $r.ttl,
+                  "proxied": $r.proxied,
+                  "proxiable": $r.proxiable,
+                  "comment": $r.comment,
+                  "settings": ($r.settings | if . == null then null else tojson end),
+                  "meta": ($r.meta | if . == null then null else tojson end),
+                  "created_on": $r.created_on,
+                  "modified_on": $r.modified_on
+                }
+              }
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

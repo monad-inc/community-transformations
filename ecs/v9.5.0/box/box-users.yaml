@@ -1,0 +1,99 @@
+name: "Box Users to ECS v9.5.0"
+description: "Maps Box User account records (Admin API /2.0/users) into an Elastic Common Schema (ECS) v9.5.0 document covering event categorization, the user and organization field sets, and a box.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "box-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "box"
+  - "users"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Box User account -> ECS v9.5.0 (nested).
+          # event.kind: asset (inventory snapshot of a user account)
+          # event.category: [iam]  event.type: [user, info]
+          # One jq pass; single end-of-pipeline walk-based prune.
+          # ---------------------------------------------------------------
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null and . != {} and . != []))
+              else . end
+            );
+
+          . as $u |
+          # login is an email; derive the domain part for user.domain
+          (($u.login // "") | if index("@") then split("@")[1] else null end) as $domain |
+
+          {
+            "@timestamp": ($u.modified_at // $u.created_at),
+            "ecs": { "version": "9.5.0" },
+
+            "event": {
+              "kind": "asset",
+              "category": ["iam"],
+              "type": ["user", "info"],
+              "outcome": "success",
+              "provider": "box",
+              "module": "box",
+              "dataset": "box.users",
+              "action": "user-inventory",
+              "id": ($u.id | tostring),
+              "created": $u.created_at
+            },
+
+            "user": {
+              "id": ($u.id | tostring),
+              "name": ($u.login // $u.name),
+              "email": $u.login,
+              "full_name": $u.name,
+              "domain": $domain,
+              "roles": (if ($u.role // "") != "" then [$u.role] else null end)
+            },
+
+            "organization": {
+              "id": ($u.enterprise.id // null | if . == null then null else (. | tostring) end),
+              "name": $u.enterprise.name
+            },
+
+            "related": {
+              "user": ([$u.login, $u.name, ($u.id | tostring)] | map(select(. != null and . != "")) | unique)
+            },
+
+            "box": {
+              "type": $u.type,
+              "status": $u.status,
+              "role": $u.role,
+              "job_title": $u.job_title,
+              "language": $u.language,
+              "timezone": $u.timezone,
+              "phone": $u.phone,
+              "address": $u.address,
+              "space_amount": $u.space_amount,
+              "space_used": $u.space_used,
+              "max_upload_size": $u.max_upload_size,
+              "is_sync_enabled": $u.is_sync_enabled,
+              "is_external_collab_restricted": $u.is_external_collab_restricted,
+              "is_exempt_from_device_limits": $u.is_exempt_from_device_limits,
+              "is_exempt_from_login_verification": $u.is_exempt_from_login_verification,
+              "is_platform_access_only": $u.is_platform_access_only,
+              "can_see_managed_users": $u.can_see_managed_users,
+              "external_app_user_id": $u.external_app_user_id,
+              "hostname": $u.hostname,
+              "notification_email": ($u.notification_email.email // null),
+              "enterprise": {
+                "id": ($u.enterprise.id // null),
+                "name": ($u.enterprise.name // null),
+                "type": ($u.enterprise.type // null)
+              }
+            }
+          } | prune

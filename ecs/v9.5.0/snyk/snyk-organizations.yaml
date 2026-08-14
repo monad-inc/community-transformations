@@ -1,0 +1,59 @@
+name: "Snyk Organizations to ECS v9.5.0"
+description: "Maps Snyk Organization inventory records (Snyk REST GET /orgs) into a nested Elastic Common Schema (ECS) v9.5.0 asset document, populating event.*, organization.*, and the snyk.* vendor namespace."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-organizations"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "snyk"
+  - "organizations"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk Organizations -> ECS v9.5.0 (nested).
+          # An org record is an inventory/entity snapshot:
+          #   event.kind=asset, event.category=[iam], event.type=[info].
+          # One jq pass; single end-of-pipeline walk prune (ES rejects nulls).
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.attributes // {}) as $a
+          | {
+              "@timestamp": ($a.created_at // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "asset",
+                "category": ["iam"],
+                "type": ["info"],
+                "id": $r.id,
+                "created": $a.created_at,
+                "provider": "snyk",
+                "module": "snyk",
+                "dataset": "snyk.organizations"
+              },
+              "organization": {
+                "id": $r.id,
+                "name": $a.name
+              },
+              "message": ("Snyk organization: " + ($a.name // $r.id)),
+              "snyk": {
+                "organization": {
+                  "slug": $a.slug,
+                  "group_id": $a.group_id,
+                  "is_personal": $a.is_personal,
+                  "access_requests_enabled": $a.access_requests_enabled
+                }
+              }
+            }
+          | walk(
+              if type == "object"
+              then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              else . end
+            )

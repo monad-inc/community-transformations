@@ -1,0 +1,119 @@
+name: "Cloudflare Security Insights to ECS v9.5.0"
+author: "Monad"
+description: "Normalizes Cloudflare Security Center Insights (security posture / misconfiguration findings) records into Elastic Common Schema (ECS) v9.5.0 fields (event categorization as an alert, host, cloud, rule, related), with the source-specific detail under the cloudflare.* namespace."
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-security-insights"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "security_insights"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Cloudflare Security Center Insights  ->  ECS v9.5.0
+          #
+          # Input: ONE Security Center Insight (issue) record per invocation
+          #   from the `cloudflare-security-insights` connector.
+          #
+          # A Security Insight is a posture/misconfiguration finding, which
+          # in ECS is event.kind=alert. There is no success/failure outcome
+          # for a standing finding, so event.outcome=unknown. The affected
+          # subject is a domain -> host.name / related.hosts.
+          #
+          #   .timestamp      -> @timestamp
+          #   .id             -> event.id
+          #   .issue_type     -> event.action / rule.id
+          #   .issue_class    -> rule.category
+          #   .resolve_text   -> event.reason / rule.name / message
+          #   .resolve_link   -> event.url
+          #   .since          -> event.created
+          #   .subject        -> host.name / related.hosts
+          #   .severity       -> event.severity (bucketed) + cloudflare.severity
+          # =================================================================
+
+          # A subject can be a bare hostname or a wildcard/partial domain; ES
+          # host.name is a keyword, so no ip guard is needed here.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.payload ) as $p
+          # ECS event.severity is a free long; bucket the Cloudflare label
+          # onto a coarse 0-100 scale for cross-source ordering.
+          | ( { "Low": 21, "Moderate": 47, "Critical": 90 }[$r.severity] // 0 ) as $sev
+          | {
+              "@timestamp": $r.timestamp,
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "alert",
+                category: ["configuration"],
+                type: ["info"],
+                outcome: "unknown",
+                module: "cloudflare",
+                dataset: "cloudflare.security_insights",
+                provider: "cloudflare",
+                id: $r.id,
+                action: $r.issue_type,
+                reason: $r.resolve_text,
+                url: $r.resolve_link,
+                created: $r.since,
+                severity: $sev
+              },
+
+              rule: {
+                id: $r.issue_type,
+                name: ($r.resolve_text // $r.issue_type),
+                category: $r.issue_class
+              },
+
+              host: {
+                name: $r.subject,
+                domain: $r.subject
+              },
+
+              cloud: {
+                provider: "cloudflare"
+              },
+
+              message: ($r.resolve_text // $r.issue_type),
+
+              related: {
+                hosts: ( if $r.subject != null then [ $r.subject ] else [] end )
+              },
+
+              # Source-specific fields under the vendor namespace (allowed by
+              # ECS for custom data; keeps them off the ECS core fields).
+              cloudflare: {
+                security_insights: {
+                  id:                   $r.id,
+                  issue_type:           $r.issue_type,
+                  issue_class:          $r.issue_class,
+                  severity:             $r.severity,
+                  status:               $r.status,
+                  dismissed:            $r.dismissed,
+                  has_extended_context: $r.has_extended_context,
+                  user_classification:  $r.user_classification,
+                  subject:              $r.subject,
+                  resolve_text:         $r.resolve_text,
+                  resolve_link:         $r.resolve_link,
+                  since:                $r.since,
+                  zone_tag:             ( if ($p | type) == "object" then $p.zone_tag else null end ),
+                  detection_method:     ( if ($p | type) == "object" then $p.detection_method else null end )
+                }
+              }
+            }
+          | prune

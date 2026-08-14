@@ -1,0 +1,97 @@
+name: "OpenAI Enterprise Audit Logs to ECS v9.5.0"
+description: "Transforms OpenAI Enterprise audit log events into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization (authentication / iam / configuration), user, source, cloud, related, and error field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-enterprise-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "openai"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Enterprise Audit Logs -> ECS v9.5.0 (single nested doc)
+          # login.*/logout.* -> authentication; identity mgmt -> iam;
+          # everything else -> configuration. event.type kept within the
+          # allowed pairing for the chosen category.
+          # -----------------------------------------------------------------
+
+          def is_ip($s): ($s | type) == "string"
+            and (($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")) or ($s | test(":")));
+
+          . as $r
+          | ($r.type // "") as $etype
+          | ($etype | split(".")) as $seg
+          | ($seg[0]) as $head
+          | ($seg[-1]) as $tail
+          | ($r.actor // {}) as $act
+          | ($act.session // {}) as $sess
+          | ($act.api_key // {}) as $ak
+          | ($sess.user // $ak.user // {}) as $u
+          | ($ak.service_account // {}) as $sa
+          | ($sess.ip_address // null) as $ip
+          | ($u.email // null) as $email
+          | ($u.id // $sa.id // $ak.id // null) as $uid
+          | ($r.project // {}) as $proj
+          | ($r[$etype] // {}) as $payload
+
+          | (if ($head == "login" or $head == "logout") then ["authentication"]
+             elif ($etype | test("^(user|group|role|invite|service_account|api_key|scim|tenant)")) then ["iam"]
+             else ["configuration"] end) as $category
+          | (if $head == "login" then ["start"]
+             elif $head == "logout" then ["end"]
+             elif ($tail | test("^(created|sent|registered|accepted|activated|enabled|added|provisioned|issued|upserted|started|bound_to_resource)$")) then ["creation"]
+             elif ($tail | test("^(updated|migrated)$")) then ["change"]
+             elif ($tail | test("^(deleted|removed|archived|deactivated|disabled|revoked|declined|detached|unbound_from_resource)$")) then ["deletion"]
+             else ["info"] end) as $etypes
+          | (if $tail == "failed" then "failure" else "success" end) as $outcome
+
+          | {
+              "@timestamp": ($r.effective_at
+                | if . == null then null
+                  elif type == "number" then (. | todate)
+                  else . end),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "event",
+                "category": $category,
+                "type": $etypes,
+                "action": $etype,
+                "outcome": $outcome,
+                "id": $r.id,
+                "provider": "openai-enterprise-audit-logs",
+                "module": "openai"
+              },
+              "user": (if ($email // $uid) != null then
+                         { "id": $uid, "email": $email, "name": ($email // $uid) }
+                       else null end),
+              "source": (if is_ip($ip) then { "ip": $ip } else null end),
+              "cloud": {
+                "provider": "openai",
+                "project": (if ($proj.id // $proj.name) != null then
+                              { "id": $proj.id, "name": $proj.name }
+                            else null end)
+              },
+              "related": {
+                "user": ([ $email, $uid, $sa.id ] | map(select(. != null)) | unique),
+                "ip": ([ $ip ] | map(select(. != null and is_ip(.))) | unique)
+              },
+              "error": (if $tail == "failed" then
+                          { "code": ($payload.error_code // null),
+                            "message": ($payload.error_message // null) }
+                        else null end)
+            }
+
+          # single recursive prune: drop null / "" / empty array / empty object
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)

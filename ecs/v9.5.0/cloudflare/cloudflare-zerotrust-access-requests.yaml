@@ -1,0 +1,84 @@
+name: "Cloudflare Zero Trust Access Requests to ECS v9.5.0"
+description: "Maps Cloudflare Zero Trust Access authentication (access_requests) logs into Elastic Common Schema (ECS) v9.5.0, covering event categorization, user, source, url, cloud, and related field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zerotrust-access-requests"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "access-requests"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Zero Trust Access access_requests -> ECS v9.5.0
+          # One nested ECS document per record. Single construction pass;
+          # one end-of-pipeline walk prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]+(\\.[0-9]+){3}$")) or ($s | test(":")));
+
+          . as $r
+          | (($r.action // "") | ascii_downcase) as $act
+          | (if ($act | startswith("logout") or startswith("logoff")) then "end"
+             else "start" end) as $etype
+          | (if $r.allowed == true then "success"
+             elif $r.allowed == false then "failure"
+             else "unknown" end) as $outcome
+          | {
+              "@timestamp": $r.created_at,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["authentication"],
+                "type": [$etype],
+                "outcome": $outcome,
+                "action": $r.action,
+                "provider": $r.connection,
+                "id": $r.ray_id
+              },
+
+              "user": {
+                "email": $r.user_email,
+                "name": $r.user_email
+              },
+
+              "source": (
+                if is_ip($r.ip_address) then { "ip": $r.ip_address } else null end
+              ),
+
+              "url": (
+                if ($r.app_domain // "") != "" then { "domain": $r.app_domain } else null end
+              ),
+
+              "cloud": { "provider": "cloudflare" },
+
+              "cloudflare": {
+                "access": {
+                  "app_uid": $r.app_uid,
+                  "app_domain": $r.app_domain,
+                  "connection": $r.connection,
+                  "allowed": $r.allowed
+                }
+              },
+
+              "related": {
+                "user": ([$r.user_email] | map(select(. != null)) | unique),
+                "ip": ([ (if is_ip($r.ip_address) then $r.ip_address else null end) ]
+                       | map(select(. != null)) | unique)
+              }
+            }
+          | walk(
+              if type == "object" then with_entries(select(
+                (.value != null) and (.value != "") and (.value != []) and (.value != {})
+              ))
+              else . end
+            )

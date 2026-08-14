@@ -1,0 +1,125 @@
+name: "AWS Config Resource Inventory to ECS v9.5.0"
+description: "Normalizes AWS Config configuration item records into Elastic Common Schema (ECS) v9.5.0 asset-inventory fields (event, cloud, host, related) plus the aws.config.* vendor namespace for resource type, status, tags, and relationships."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-config-inventory"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "config"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Config configuration item -> ECS v9.5.0
+          #
+          # A configuration item is an inventory/state snapshot of one AWS
+          # resource, so it maps to event.kind: asset with
+          # event.category: configuration + event.type: info.
+          #
+          #   .configurationItemCaptureTime -> @timestamp
+          #   .resourceType                 -> event.action / aws.config.resource_type
+          #   .arn                          -> cloud.instance.id (when instance)
+          #   .accountId                    -> cloud.account.id
+          #   .awsRegion                    -> cloud.region
+          #   .availabilityZone             -> cloud.availability_zone
+          #   .resourceId / .resourceName   -> host.id / host.name
+          #   .configuration.*IpAddress     -> host.ip / related.ip
+          # =================================================================
+
+          # An ES ip-mapped field rejects the whole document if handed a
+          # non-IP, so guard every ip assignment.
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # Deeply-nested vendor blobs are serialized to JSON strings to keep
+          # Elasticsearch from mapping-exploding on arbitrary resource configs.
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.configuration // {} ) as $cfg
+          | ( $r.configurationItemStatus // "" ) as $ci_status
+          | ( [ $cfg.privateIpAddress, $cfg.publicIpAddress ]
+              | map(select(is_ip(.))) | unique ) as $ips
+          | ( if ($ci_status | test("NotRecorded|DeletedNotRecorded"))
+              then "failure" else "success" end ) as $outcome
+
+          | {
+              "@timestamp": $r.configurationItemCaptureTime,
+
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "asset",
+                module: "aws",
+                dataset: "aws.config",
+                provider: "config.amazonaws.com",
+                action: ("inventory:" + ($r.resourceType // "resource")),
+                id: $r.configurationStateId,
+                category: ["configuration"],
+                type: ["info"],
+                outcome: $outcome
+              },
+
+              cloud: {
+                provider: "aws",
+                region: $r.awsRegion,
+                availability_zone: $r.availabilityZone,
+                account: { id: $r.accountId },
+                instance: (
+                  if ($r.resourceType // "") == "AWS::EC2::Instance"
+                  then { id: $r.resourceId, name: $r.resourceName }
+                  else null end
+                ),
+                service: { name: "config" }
+              },
+
+              host: {
+                id: $r.resourceId,
+                name: $r.resourceName,
+                ip: ( if ($ips | length) > 0 then $ips else null end )
+              },
+
+              related: {
+                ip: $ips,
+                hosts: ( [ $r.resourceName, $r.resourceId ]
+                         | map(select(. != null)) | unique )
+              },
+
+              # Vendor namespace — ECS permits an undefined top-level key for
+              # custom data; deep sub-objects are JSON strings (see json_str).
+              aws: {
+                config: {
+                  resource_type: $r.resourceType,
+                  resource_id: $r.resourceId,
+                  resource_name: $r.resourceName,
+                  resource_arn: $r.arn,
+                  capture_time: $r.configurationItemCaptureTime,
+                  item_status: $r.configurationItemStatus,
+                  configuration_state_id: $r.configurationStateId,
+                  md5_hash: $r.configurationItemMD5Hash,
+                  resource_creation_time: $r.resourceCreationTime,
+                  configuration: json_str($cfg),
+                  relationships: json_str($r.relationships),
+                  tags: json_str($r.tags)
+                }
+              }
+            }
+          | prune

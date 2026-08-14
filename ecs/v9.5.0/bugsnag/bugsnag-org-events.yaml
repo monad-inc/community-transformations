@@ -1,0 +1,133 @@
+name: "BugSnag Org Events to ECS v9.5.0"
+description: "Maps BugSnag organization error/crash events into Elastic Common Schema (ECS) v9.5.0 nested documents, covering the error, service, host, user, user_agent, url, http, and event field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bugsnag-org-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "bugsnag"
+  - "org-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # BugSnag org error event -> ECS v9.5.0 (nested).
+          # event.category=web / event.type=error / kind=event / outcome=failure
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.exceptions[0] // {}) as $ex
+          | ($r.app // {}) as $app
+          | ($r.device // {}) as $dev
+          | ($r.user // {}) as $usr
+          | ($r.request // {}) as $req
+
+          | def is_ip($s):
+              ($s | type) == "string"
+              and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") or ($s | test(":")));
+
+          # Build a compact stack_trace string from the frames.
+          ( ($ex.stacktrace // [])
+            | map( "\(.method // "?") (\(.file // "?"):\(.line_number // 0))" )
+            | join("\n") ) as $stack
+
+          | {
+              "@timestamp": $r.received_at,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["web"],
+                "type": ["error"],
+                "outcome": "failure",
+                "id": $r.id,
+                "provider": "bugsnag",
+                "module": "bugsnag",
+                "dataset": "bugsnag.org_events",
+                "severity": ( { "error": 4, "warning": 3, "info": 1 }[$r.severity] // 0 ),
+                "url": $r.url,
+                "reason": $r.severity_reason.type
+              },
+
+              "message": ($ex.message // $r.context),
+
+              "error": {
+                "id": $r.error_id,
+                "type": $ex.error_class,
+                "message": $ex.message,
+                "stack_trace": (if $stack == "" then null else $stack end)
+              },
+
+              "service": {
+                "name": $app.id,
+                "version": $app.version,
+                "type": $app.type,
+                "environment": $app.release_stage
+              },
+
+              "host": {
+                "id": $dev.id,
+                "hostname": $dev.hostname,
+                "name": $dev.hostname,
+                "os": {
+                  "name": $dev.os_name,
+                  "version": $dev.os_version
+                }
+              },
+
+              "user": {
+                "id": $usr.id,
+                "name": $usr.name,
+                "email": $usr.email
+              },
+
+              "user_agent": {
+                "original": $dev.user_agent,
+                "name": $dev.browser_name,
+                "version": $dev.browser_version
+              },
+
+              "url": { "full": $req.url },
+
+              "http": {
+                "request": {
+                  "method": $req.http_method,
+                  "referrer": $req.referer
+                }
+              },
+
+              "source": {
+                "ip": (if is_ip($req.client_ip) then $req.client_ip else null end)
+              },
+
+              "related": {
+                "ip": ( [ (if is_ip($req.client_ip) then $req.client_ip else null end) ]
+                        | map(select(. != null)) | unique ),
+                "user": ( [ $usr.id, $usr.name, $usr.email ]
+                          | map(select(. != null)) | unique ),
+                "hosts": ( [ $dev.hostname ] | map(select(. != null)) | unique )
+              },
+
+              # Vendor namespace (allowed) for fields with no ECS home.
+              "bugsnag": {
+                "unhandled": $r.unhandled,
+                "severity": $r.severity,
+                "context": $r.context,
+                "is_full_report": $r.is_full_report,
+                "app_duration": $app.duration,
+                "app_in_foreground": $app.in_foreground,
+                "project_url": $r.project_url,
+                "meta_data": (if ($r.meta_data // {}) == {} then null else ($r.meta_data | tojson) end)
+              }
+            }
+          # Single recursive prune pass (drop null / {} / []).
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

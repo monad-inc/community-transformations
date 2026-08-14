@@ -1,0 +1,103 @@
+name: "Cloudsmith Audit Logs to ECS v9.5.0"
+description: "Maps Cloudsmith audit log records into Elastic Common Schema (ECS) v9.5.0, populating event categorization, user, source (with geo), cloud, related, and labels field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudsmith-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudsmith"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudsmith audit log -> ECS v9.5.0 (nested document).
+          # One record per invocation. Single construction pass; one prune.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") or test(":"));
+
+          . as $r
+          | ($r.event // "")       as $ev
+          | ($ev | ascii_downcase) as $evl
+          | ($r.object_kind // "" | ascii_downcase) as $ok
+          | ($r.actor_location // {}) as $loc
+          # --- Event categorization (closed enums, valid category->type pairs) ---
+          | (if   ($evl | test("login|logout|authenticate|session|token"))               then "authentication"
+             elif ($ok == "package") or ($evl | test("package|artifact|version|distro")) then "package"
+             elif ($evl | test("member|team|user|group|role|org|entitlement|privilege|permission|invite|owner")) then "iam"
+             else "configuration" end) as $cat
+          | (if $cat == "authentication" then
+                (if   ($evl | test("logout|end")) then "end"
+                 elif ($evl | test("login|authenticate|start|create")) then "start"
+                 else "info" end)
+             elif $cat == "package" then
+                (if   ($evl | test("delet|remov")) then "deletion"
+                 elif ($evl | test("creat|publish|push|upload|add")) then "installation"
+                 elif ($evl | test("updat|chang|sync|promot|copy|move|resync")) then "change"
+                 elif ($evl | test("download|pull|read|view|access|list")) then "access"
+                 else "info" end)
+             elif $cat == "iam" then
+                (if   ($evl | test("delet|remov|revok")) then "deletion"
+                 elif ($evl | test("creat|add|invit|generat")) then "creation"
+                 elif ($evl | test("updat|chang|modif|set")) then "change"
+                 else "info" end)
+             else
+                (if   ($evl | test("delet|remov")) then "deletion"
+                 elif ($evl | test("creat|add")) then "creation"
+                 elif ($evl | test("updat|chang|modif|edit|set|renam")) then "change"
+                 elif ($evl | test("download|read|view|access|list|get")) then "access"
+                 else "info" end)
+             end) as $etype
+          | {
+              "@timestamp": ($r.event_at // (now | todateiso8601)),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: [ $cat ],
+                type: [ $etype ],
+                outcome: "success",
+                action: $ev,
+                id: $r.uuid,
+                provider: "cloudsmith",
+                module: "cloudsmith"
+              },
+              user: {
+                name: $r.actor,
+                id: $r.actor_slug_perm
+              },
+              source: ({}
+                + (if is_ip($r.actor_ip_address) then { ip: $r.actor_ip_address } else {} end)
+                + (if ($loc | length) > 0 then { geo: {
+                      city_name: $loc.city,
+                      country_iso_code: $loc.country_code,
+                      continent_name: $loc.continent,
+                      postal_code: $loc.postal_code
+                    } } else {} end)),
+              cloud: { provider: "cloudsmith" },
+              related: {
+                user: ([ $r.actor ] | map(select(. != null and . != "")) | unique),
+                ip: ([ (if is_ip($r.actor_ip_address) then $r.actor_ip_address else null end) ]
+                     | map(select(. != null)) | unique)
+              },
+              labels: {
+                context: $r.context,
+                actor_kind: $r.actor_kind,
+                object: $r.object,
+                object_kind: $r.object_kind,
+                object_slug_perm: $r.object_slug_perm,
+                target: $r.target,
+                target_kind: $r.target_kind
+              }
+            }
+          # Single recursive prune: ES rejects nulls; drop empties.
+          | walk(if type == "object"
+                 then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                 else . end)

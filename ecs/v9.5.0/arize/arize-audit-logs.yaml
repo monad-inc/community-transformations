@@ -1,0 +1,72 @@
+name: "Arize Audit Logs to ECS v9.5.0"
+description: "Maps Arize AX audit log records (authenticated GraphQL mutations / login attempts) into Elastic Common Schema (ECS) v9.5.0, populating the event categorization (api), user, source, service, and related field sets plus an arize.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "arize-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "arize"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Arize AX audit logs -> ECS v9.5.0 (nested).
+          # One record per invocation. event.category "api" covers CRUD
+          # GraphQL operations recorded in the Arize audit log.
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          . as $r
+          | ($r.user // {}) as $u
+          | (($r.operationName // $r.mutationName) // "") as $op
+          | ($op | ascii_downcase) as $opl
+          | (if   ($opl | startswith("delete")) or ($opl | startswith("remove")) then "deletion"
+             elif ($opl | startswith("create")) or ($opl | startswith("add")) or ($opl | startswith("new")) then "creation"
+             elif ($opl | startswith("update")) or ($opl | startswith("edit")) or ($opl | startswith("patch")) or ($opl | startswith("set")) then "change"
+             elif ($opl | startswith("get")) or ($opl | startswith("list")) or ($opl | startswith("query")) or ($opl | startswith("fetch")) or ($opl | startswith("export")) then "access"
+             else "info" end) as $etype
+          | ($r.success) as $ok
+          | {
+              "@timestamp": $r.loggedAt,
+              "ecs": { "version": "9.5.0" },
+              "message": $op,
+              "event": {
+                "kind": "event",
+                "category": ["api"],
+                "type": [$etype],
+                "action": $op,
+                "id": ($r.id // null),
+                "provider": "arize-ax",
+                "outcome": (if $ok == true then "success" elif $ok == false then "failure" else "unknown" end)
+              },
+              "user": {
+                "email": ($u.email // null),
+                "name": ($u.name // $u.email // null),
+                "id": ($u.id // null)
+              },
+              "source": (if is_ip($r.ip) then { "ip": $r.ip } else null end),
+              "service": { "name": "Arize AX" },
+              "organization": (if $r.accountName != null then { "name": $r.accountName } else null end),
+              "related": {
+                "ip": ([ (if is_ip($r.ip) then $r.ip else null end) ] | map(select(. != null)) | unique),
+                "user": ([ $u.email, $u.name ] | map(select(. != null)) | unique)
+              },
+              "arize": {
+                "space": ($r.spaceName // null),
+                "operation_name": $op,
+                "operation_text": ($r.operationText // null),
+                "variables": json_str($r.variables),
+                "success": $ok
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)

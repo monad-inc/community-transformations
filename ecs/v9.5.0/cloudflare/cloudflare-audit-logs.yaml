@@ -1,0 +1,112 @@
+name: "Cloudflare Audit Logs to ECS v9.5.0"
+description: "Normalizes Cloudflare account Audit Log records into the Elastic Common Schema (ECS) v9.5.0 core fields (event, user, source, cloud, organization, related), categorizing each administrative action as configuration or iam."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Cloudflare Audit Logs -> ECS v9.5.0 (core fields)
+          #
+          # Input: ONE Cloudflare (classic) audit-log record per invocation:
+          #   { id, action{type,result}, actor{id,email,ip,type}, interface,
+          #     metadata{...}, newValue, oldValue, owner{id},
+          #     resource{id,type}, when }
+          #
+          # Mappings:
+          #   .when               -> @timestamp
+          #   .action.type        -> event.action
+          #   .action.result      -> event.outcome
+          #   .id                 -> event.id
+          #   .actor.email/id     -> user.email / user.id / user.name
+          #   .actor.ip           -> source.ip / source.address
+          #   .owner.id           -> organization.id
+          #   .resource.type      -> drives event.category (configuration/iam)
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.action // {}) as $act
+          | ($r.actor // {}) as $ac
+          | ($r.resource // {}) as $res
+          | ($act.type // "") as $atype
+          | ($res.type // "") as $rtype
+
+          | ( ($act.result == true) or (($act.result | type) == "string" and ($act.result | ascii_downcase) == "true") ) as $ok
+          | ( if $ok then "success" else "failure" end ) as $outcome
+
+          # ---- event.category: identity/access changes vs plain config ----
+          | ( if (($atype + " " + $rtype) | test("(?i)(user|member|token|api_token|role|policy|invite|permission|organization|account_member|2fa|mfa|sso|saml)"))
+                then ["iam"] else ["configuration"] end ) as $category
+
+          # ---- event.type (legal for both configuration & iam) ------------
+          | ( if   ($atype | test("(?i)(^|_)(create|add|new|provision|register)")) then ["creation"]
+              elif ($atype | test("(?i)(^|_)(delete|remove|revoke|deregister|purge)")) then ["deletion"]
+              elif ($atype | test("(?i)(view|read|get|list|download|export)")) then ["access"]
+              elif ($atype | test("(?i)(change|update|set|edit|modify|rotate|enable|disable|patch)")) then ["change"]
+              else ["info"] end ) as $type
+
+          | ( {
+              "@timestamp": ( if ($r.when | type) == "number"
+                              then ($r.when | todateiso8601)
+                              else $r.when end ),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                module: "cloudflare",
+                dataset: "cloudflare.audit",
+                provider: "cloudflare",
+                action: $atype,
+                id: $r.id,
+                category: $category,
+                type: $type,
+                outcome: $outcome
+              },
+
+              user: {
+                id: $ac.id,
+                email: $ac.email,
+                name: ($ac.email // $ac.id)
+              },
+
+              source: {
+                address: $ac.ip,
+                ip: ( if is_ip($ac.ip) then $ac.ip else null end )
+              },
+
+              cloud: {
+                provider: "cloudflare"
+              },
+
+              organization: {
+                id: ($r.owner // {}).id
+              },
+
+              related: {
+                ip:   ( if is_ip($ac.ip) then [$ac.ip] else [] end ),
+                user: ( [ $ac.email, $ac.id ] | map(select(. != null)) | unique )
+              }
+            } | prune )

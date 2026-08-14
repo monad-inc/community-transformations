@@ -1,0 +1,91 @@
+name: "Bitwarden Event Logs to ECS v9.5.0"
+description: "Maps Bitwarden Events (organization audit log) records into Elastic Common Schema (ECS) v9.5.0 — event categorization (authentication), user, source, and related field sets, plus a bitwarden.* vendor namespace for the raw type/device codes."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bitwarden-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "bitwarden"
+  - "events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Bitwarden Events -> ECS v9.5.0 (nested).
+          # Input: one Bitwarden Public API /public/events record.
+          # event.category authentication -> allowed types start/end/info.
+          # Login-family (1000/1005/1006) => start; everything else => info.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string"
+            and (($s|test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) or ($s|index(":") != null));
+
+          def device_name($d):
+            {
+              "0":"Android","1":"iOS","2":"Chrome Extension","3":"Firefox Extension",
+              "4":"Opera Extension","5":"Edge Extension","6":"Windows Desktop",
+              "7":"macOS Desktop","8":"Linux Desktop","9":"Chrome Browser",
+              "10":"Firefox Browser","11":"Opera Browser","12":"Edge Browser",
+              "13":"IE Browser","14":"Unknown Browser","15":"Android (Amazon)",
+              "16":"UWP","17":"Safari Browser","18":"Vivaldi Browser",
+              "19":"Vivaldi Extension","20":"Safari Extension","21":"SDK"
+            }[$d | tostring];
+
+          def event_action($t):
+            {
+              "1000":"logged-in","1001":"changed-password","1002":"two-step-login-enabled",
+              "1003":"two-step-login-disabled","1004":"two-step-recovery-used",
+              "1005":"login-failed-bad-password","1006":"login-failed-bad-2fa",
+              "1007":"vault-exported","1008":"account-recovery-requested",
+              "1009":"account-recovery-key-migrated"
+            }[$t | tostring] // "bitwarden-event";
+
+          . as $r
+          | ($r.type) as $t
+          | (($t == 1005) or ($t == 1006)) as $failed
+          | ($r.actingUserId // $r.memberId) as $uid
+          | {
+              "@timestamp": $r.date,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["authentication"],
+                "type": (if ($t == 1000 or $failed) then ["start"] else ["info"] end),
+                "outcome": (if $t == 1000 then "success"
+                            elif $failed then "failure" else "unknown" end),
+                "action": event_action($t),
+                "code": ($t | tostring),
+                "provider": "bitwarden",
+                "module": "bitwarden",
+                "dataset": "bitwarden.events"
+              },
+
+              "user": ( if $uid != null then { "id": $uid } else null end ),
+
+              "source": ( if is_ip($r.ipAddress) then { "ip": $r.ipAddress } else null end ),
+
+              "related": {
+                "ip":   ( [ $r.ipAddress ] | map(select(is_ip(.))) | unique ),
+                "user": ( [ $uid ] | map(select(. != null)) | unique )
+              },
+
+              "bitwarden": {
+                "event": { "type": $t },
+                "device": { "code": $r.device, "name": device_name($r.device) },
+                "member_id": $r.memberId,
+                "item_id": $r.itemId,
+                "collection_id": $r.collectionId,
+                "group_id": $r.groupId,
+                "policy_id": $r.policyId,
+                "installation_id": $r.installationId
+              }
+            }
+          | walk( if type == "object"
+                  then with_entries(select(.value != null and .value != {} and .value != []))
+                  else . end )

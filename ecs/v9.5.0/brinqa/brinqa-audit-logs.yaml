@@ -1,0 +1,83 @@
+name: "Brinqa Audit Logs to ECS v9.5.0"
+description: "Maps Brinqa audit and security event log records into nested Elastic Common Schema (ECS) v9.5.0 documents, populating event categorization (configuration), user, log, observer, and error field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "brinqa-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "brinqa"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Brinqa audit logs -> ECS v9.5.0 (nested).
+          # event.kind=event, event.category=[configuration] (platform audit /
+          # compliance config trail), event.type derived from the action verb.
+          # Documented fields: category, user, createdBy, dateCreated,
+          # lastUpdated, timestamp, msg, detail, outcome, severity, stacktrace.
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then ($ts / 1000 | floor) else ($ts | floor) end | todateiso8601)
+            else $ts end;
+          def lc($s): ($s // "" | ascii_downcase);
+
+          . as $r
+          | lc(($r.detail // "") + " " + ($r.msg // "")) as $act
+          | lc($r.severity) as $sev
+          | lc($r.outcome) as $oc
+          | (if   ($act | test("delete|remove"))            then "deletion"
+             elif ($act | test("create|add"))               then "creation"
+             elif ($act | test("update|modif|change|edit")) then "change"
+             elif ($act | test("read|view|login|logout|access|export")) then "access"
+             else "info" end) as $etype
+          | (if   $oc == "success" then "success"
+             elif ($oc | test("fail|error|denied")) then "failure"
+             else "unknown" end) as $eoutcome
+          | (if   $sev == "info" or $sev == "informational" then 1
+             elif $sev == "low"                             then 2
+             elif $sev == "warn" or $sev == "warning" or $sev == "medium" then 4
+             elif $sev == "error" or $sev == "high"         then 6
+             elif $sev == "critical"                        then 8
+             elif $sev == "fatal"                           then 9
+             else 0 end) as $esev
+          | {
+              "@timestamp": to_iso($r.timestamp // $r.dateCreated),
+              ecs: { version: "9.5.0" },
+              message: $r.msg,
+              event: {
+                kind:     "event",
+                category: ["configuration"],
+                type:     [$etype],
+                outcome:  $eoutcome,
+                action:   $r.category,
+                severity: $esev,
+                created:  to_iso($r.dateCreated),
+                reason:   $r.detail,
+                module:   "brinqa",
+                provider: "brinqa"
+              },
+              log: { level: $r.severity },
+              user: (
+                {
+                  name:  ($r.user // $r.createdBy),
+                  email: (if ($r.createdBy // "" | test("@")) then $r.createdBy else null end)
+                } | with_entries(select(.value != null))
+              ),
+              related: { user: ([$r.user, $r.createdBy] | map(select(. != null)) | unique) },
+              observer: { vendor: "Brinqa", product: "Brinqa", type: "application" },
+              error: (if $r.stacktrace != null then { stack_trace: $r.stacktrace } else null end)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null and . != ""))
+              else . end
+            )

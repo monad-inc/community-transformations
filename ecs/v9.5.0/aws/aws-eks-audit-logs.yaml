@@ -1,0 +1,136 @@
+name: "AWS EKS Audit Logs to ECS v9.5.0"
+description: "Normalizes Amazon EKS (Kubernetes API server) audit.k8s.io/v1 audit records into Elastic Common Schema (ECS) v9.5.0 fields (event, cloud, user, source, user_agent, url, http, orchestrator, related), categorizing every Kubernetes API call by verb and RBAC authorization decision."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-eks-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "eks-audit"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Amazon EKS Kubernetes audit (audit.k8s.io/v1)  ->  ECS v9.5.0
+          #
+          # Input: ONE Kubernetes audit event per invocation, as delivered by
+          #   the Monad `aws-eks-audit-logs` connector (EKS control-plane
+          #   "audit" log stream shipped via CloudWatch Logs).
+          #
+          # Field mappings:
+          #   .requestReceivedTimestamp                 -> @timestamp
+          #   .verb                                     -> event.action / http.request.method
+          #   .auditID                                  -> event.id
+          #   .verb (mapped)                            -> event.type[]
+          #   .annotations["authorization.k8s.io/decision"] + responseStatus.code -> event.outcome
+          #   .user.username / .user.uid / .user.groups -> user.name / user.id / user.roles
+          #   .sourceIPs[0]                             -> source.ip / source.address
+          #   .userAgent                                -> user_agent.original
+          #   .requestURI                               -> url.path
+          #   .responseStatus.code                      -> http.response.status_code
+          #   .objectRef.*                              -> orchestrator.resource.* / orchestrator.namespace
+          # =================================================================
+
+          # A Kubernetes sourceIP is virtually always a real client IP, but an
+          # ES `ip`-mapped field rejects the whole document on a non-IP value,
+          # so guard it (v4 dotted-quad or a colon-bearing v6 literal).
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.user // {} )           as $u
+          | ( $r.objectRef // {} )      as $obj
+          | ( $r.responseStatus // {} ) as $rs
+          | ( $r.annotations // {} )    as $ann
+          | ( $r.verb // "" )           as $verb
+          | ( ($r.sourceIPs // []) | .[0] ) as $src_ip
+          | ( $rs.code // null )        as $code
+          | ( $ann["authorization.k8s.io/decision"] // null ) as $decision
+
+          # ---- outcome ----------------------------------------------------
+          | ( if ($decision == "forbid") or ($code != null and $code >= 400)
+              then "failure"
+              elif ($code != null) or ($decision == "allow")
+              then "success"
+              else "unknown" end ) as $outcome
+
+          # ---- event.type (all legal for category "api") ------------------
+          # verb -> lifecycle type, plus the RBAC allow/deny decision so
+          # detection content can key on denied API calls directly.
+          | ( ( { "create": ["creation"], "get": ["access"], "list": ["access"],
+                  "watch": ["access"], "update": ["change"], "patch": ["change"],
+                  "delete": ["deletion"], "deletecollection": ["deletion"] }[$verb] // ["info"] )
+              + ( if $decision == "allow" then ["allowed"]
+                  elif $decision == "forbid" then ["denied"]
+                  else [] end ) ) as $type
+
+          | ( {
+              "@timestamp": $r.requestReceivedTimestamp,
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                module: "aws",
+                dataset: "aws.eks_audit",
+                provider: "eks",
+                action: $verb,
+                id: $r.auditID,
+                category: ["api"],
+                type: $type,
+                outcome: $outcome
+              },
+
+              cloud: { provider: "aws", service: { name: "eks" } },
+
+              user: {
+                name: $u.username,
+                id:   $u.uid,
+                roles: ( ($u.groups // []) | map(select(. != null)) )
+              },
+
+              source: {
+                address: $src_ip,
+                ip: ( if is_ip($src_ip) then $src_ip else null end )
+              },
+
+              user_agent: { original: $r.userAgent },
+
+              url: { path: $r.requestURI },
+
+              http: {
+                request: { method: $verb },
+                response: { status_code: $code }
+              },
+
+              orchestrator: {
+                type: "kubernetes",
+                api_version: $obj.apiVersion,
+                namespace: $obj.namespace,
+                resource: {
+                  name: $obj.name,
+                  type: $obj.resource
+                }
+              },
+
+              related: {
+                ip:   ( if is_ip($src_ip) then [$src_ip] else [] end ),
+                user: ( [ $u.username ] | map(select(. != null)) | unique )
+              }
+            } | prune )

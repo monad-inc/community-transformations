@@ -1,0 +1,82 @@
+name: "Anthropic Projects to ECS v9.5.0"
+description: "Transforms Anthropic (Claude) Projects inventory records into a nested Elastic Common Schema (ECS) v9.5.0 document (event.kind asset / event.category configuration), populating event, user, organization, cloud, service, and related field sets plus the vendor anthropic.project namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-projects"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "ai"
+  - "projects"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic (Claude) Projects record -> nested ECS v9.5.0.
+          # An inventory/state snapshot of a SaaS project resource, so:
+          #   event.kind    = asset
+          #   event.category= [configuration]   event.type = [info]
+          #   event.outcome = success
+          # Rich vendor detail lives under the anthropic.project.* namespace.
+          # One jq pass; single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.details // {}) as $d
+          | ($r.user // $d.user // {}) as $u
+          | ($r.organization_id // $d.organization_id) as $org
+          | (if ($r.is_private != null) then $r.is_private else $d.is_private end) as $priv
+          | ($r.id // $d.id) as $pid
+
+          | {
+              "@timestamp": ($d.updated_at // $r.updated_at // $d.created_at // $r.created_at),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "asset",
+                category: ["configuration"],
+                type: ["info"],
+                outcome: "success",
+                id: $pid,
+                action: "project-inventory",
+                module: "anthropic",
+                dataset: "anthropic.projects",
+                provider: "anthropic-projects",
+                created: ($r.created_at // $d.created_at)
+              },
+              organization: (if $org != null then { id: $org } else null end),
+              user: (if (($u.id // $u.email_address) != null)
+                     then { id: $u.id, email: $u.email_address }
+                     else null end),
+              cloud: {
+                provider: "anthropic",
+                account: (if $org != null then { id: $org } else null end),
+                service: { name: "Claude Projects" }
+              },
+              service: { name: "claude", type: "genai" },
+              related: { user: ([ $u.email_address, $u.id ] | map(select(. != null)) | unique) },
+              anthropic: { project: {
+                id: $pid,
+                name: ($r.name // $d.name),
+                organization_id: $org,
+                is_private: $priv,
+                description: $d.description,
+                instructions: $d.instructions,
+                chats_count: $d.chats_count,
+                attachments_count: ($d.attachments_count // (($r.attachments // []) | length)),
+                created_at: ($r.created_at // $d.created_at),
+                updated_at: ($d.updated_at // $r.updated_at),
+                attachment_filenames: ([ ($r.attachments // [])[] | .filename ])
+              } }
+            }
+
+          # single recursive prune: drop null / "" / {} / []
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)

@@ -1,0 +1,102 @@
+name: "Glean Assistant Insights to ECS v9.5.0"
+description: "Maps Glean Assistant Insights interaction records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization, user/organization identity, source/user_agent, the gen_ai.* field set (model, provider, token usage), related.* aggregation, and a glean.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "glean-assistant-insights"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "glean"
+  - "ai"
+  - "assistant"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Glean Assistant Insights -> ECS v9.5.0 (nested).
+          # event.category=[api] / event.type=[access] (a user access of the
+          # Glean Assistant service); event.kind=event. AI semantics carried
+          # by the ECS gen_ai.* field set; Glean-specific fields under glean.*.
+          # One jq pass, bind-once, is_ip guard, related.* union, single prune.
+          # ---------------------------------------------------------------
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test("^[0-9a-fA-F:]+:[0-9a-fA-F:]+$"));
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          . as $r
+          | (truthy($r.hadError)) as $err
+          | ($r.userEmail // "") as $email
+          | (if ($email | contains("@")) then ($email | split("@")[1]) else null end) as $domain
+          | (if is_ip($r.sourceIp) then $r.sourceIp else null end) as $src_ip
+
+          | {
+              "@timestamp": $r.timestamp,
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: ["api"],
+                type: ["access"],
+                outcome: (if $err then "failure" else "success" end),
+                action: "glean.assistant.chat",
+                id: $r.insertId,
+                provider: "glean",
+                module: "glean",
+                dataset: "glean.assistant",
+                duration: (if ($r.totalResponseMillis | type) == "number" then ($r.totalResponseMillis * 1000000) else null end)
+              },
+              message: $r.userQuery,
+              user: {
+                id: $r.userId,
+                name: ($email | if . == "" then null else . end),
+                email: ($email | if . == "" then null else . end),
+                domain: $domain
+              },
+              organization: { name: $r.orgName, id: $r.orgId },
+              service: { name: "Glean Assistant", type: "glean", version: $r.clientVersion },
+              source: { address: $src_ip, ip: $src_ip },
+              user_agent: { original: $r.userAgent },
+              gen_ai: {
+                operation: { name: "chat" },
+                provider: { name: "glean" },
+                request: { model: $r.modelName },
+                response: { id: $r.responseMessageId, model: $r.modelName },
+                usage: { input_tokens: $r.inputTokens, output_tokens: $r.outputTokens }
+              },
+              related: {
+                user: ([$email, $r.userId] | map(select(. != null and . != "")) | unique),
+                ip: ([$src_ip] | map(select(. != null)) | unique)
+              },
+              glean: {
+                platform: $r.platform,
+                initiator: $r.initiator,
+                feature: $r.feature,
+                chat_session_id: $r.chatSessionId,
+                session_tracking_token: $r.sessionTrackingToken,
+                qtt: $r.qtt,
+                response_message_id: $r.responseMessageId,
+                department: $r.department,
+                department_id: $r.departmentId,
+                datasources: $r.datasources,
+                followup_questions: $r.followupQuestions,
+                citation_count: $r.citationCount,
+                feedback: $r.feedback,
+                first_response_token_millis: $r.firstResponseTokenMillis,
+                had_error: $r.hadError,
+                instance: $r.instance,
+                last_updated_ts: $r.lastUpdatedTs
+              }
+            }
+
+          # single end-of-pipeline prune: drop null / "" / {} / [] leaves.
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and (((.value | type) == "array") and ((.value | length) == 0) | not)
+                        and (((.value | type) == "object") and ((.value | length) == 0) | not)))
+                 else . end)

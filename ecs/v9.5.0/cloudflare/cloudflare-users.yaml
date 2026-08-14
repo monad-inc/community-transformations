@@ -1,0 +1,74 @@
+name: "Cloudflare Account Members to ECS v9.5.0"
+description: "Maps Cloudflare account member (user) inventory records into Elastic Common Schema (ECS) v9.5.0, populating user.*, related.*, cloud.*, and the event.* categorization for IAM asset inventory."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare account members -> ECS v9.5.0
+          # event.kind: asset (inventory/state snapshot of an IAM principal)
+          # event.category: [iam] ; event.type: [user, info]
+          # One nested document per member record. Single prune at the end.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.user // {}) as $u
+          | ($r.account // {}) as $acct
+          | ($r.email // $u.email) as $mail
+          | (([$u.first_name, $u.last_name] | map(select(. != null and . != "")) | join(" "))) as $full
+          | (($r.roles // []) | map(.name) | map(select(. != null))) as $roles
+          | {
+              "@timestamp": (now | todateiso8601),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "asset",
+                "category": ["iam"],
+                "type": ["user", "info"],
+                "outcome": (if $r.status == "accepted" then "success"
+                            elif $r.status == "pending" then "unknown"
+                            else "unknown" end),
+                "provider": "cloudflare",
+                "module": "cloudflare",
+                "dataset": "cloudflare.users",
+                "action": "account-member-inventory"
+              },
+              "user": {
+                "id":        ($u.id // $r.id),
+                "email":     $mail,
+                "name":      ($mail // $r.id),
+                "full_name": (if $full == "" then null else $full end),
+                "roles":     (if ($roles | length) > 0 then $roles else null end)
+              },
+              "cloud": {
+                "provider":     "cloudflare",
+                "account": {
+                  "id":   $acct.id,
+                  "name": $acct.name
+                }
+              },
+              "organization": {
+                "id":   $acct.id,
+                "name": $acct.name
+              },
+              "related": {
+                "user": ([ $mail, ($u.id // $r.id), $r.id ] | map(select(. != null)) | unique)
+              },
+              "labels": {
+                "membership_id":    $r.id,
+                "membership_status": $r.status,
+                "mfa_enabled":      ($u.two_factor_authentication_enabled | tostring)
+              }
+            }
+          # Single recursive prune: ES rejects nulls; drop null/{}/[] .
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

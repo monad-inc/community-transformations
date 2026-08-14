@@ -1,0 +1,90 @@
+name: "Cloudflare Page Shield Connections to ECS v9.5.0"
+description: "Maps Cloudflare Page Shield connection records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization (threat/indicator), the threat.indicator.* and url.* field sets, related.* aggregation, and the cloudflare_page_shield.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-page-shield-connections"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "page-shield-connections"
+  - "threat"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Page Shield connection -> ECS v9.5.0 (nested).
+          # A Page Shield connection is a third-party outbound connection
+          # observed on a customer page. When the domain/URL is reported
+          # malicious it is a threat indicator; otherwise an observed
+          # indicator. event.kind=alert, category=threat, type=indicator.
+          # ---------------------------------------------------------------
+          def truthy($v): ($v == true) or (($v|type) == "string" and ($v|ascii_downcase) == "true");
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          . as $r
+          | (truthy($r.domain_reported_malicious) or truthy($r.url_reported_malicious)) as $mal
+          | {
+              "@timestamp": ($r.last_seen_at // $r.added_at // $r.first_seen_at),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": ["threat"],
+                "type": ["indicator"],
+                "outcome": "unknown",
+                "id": $r.id,
+                "created": $r.added_at,
+                "provider": "page_shield",
+                "module": "cloudflare",
+                "dataset": "cloudflare.page_shield_connections",
+                "risk_score": (if $mal then 100 else null end),
+                "original": ($r | tojson)
+              },
+
+              "url": {
+                "full": $r.url,
+                "original": $r.url,
+                "domain": $r.host
+              },
+
+              "threat": {
+                "feed": { "name": "Cloudflare Page Shield" },
+                "indicator": {
+                  "type": "url",
+                  "first_seen": $r.first_seen_at,
+                  "last_seen": $r.last_seen_at,
+                  "url": {
+                    "full": $r.url,
+                    "original": $r.url,
+                    "domain": $r.host
+                  }
+                }
+              },
+
+              "related": {
+                "hosts": ( [ $r.host ] | map(select(. != null)) | unique )
+              },
+
+              "cloudflare_page_shield": {
+                "connection_id": $r.id,
+                "host": $r.host,
+                "url": $r.url,
+                "first_page_url": $r.first_page_url,
+                "page_urls": $r.page_urls,
+                "added_at": $r.added_at,
+                "first_seen_at": $r.first_seen_at,
+                "last_seen_at": $r.last_seen_at,
+                "url_contains_cdn_cgi_path": $r.url_contains_cdn_cgi_path,
+                "domain_reported_malicious": $r.domain_reported_malicious,
+                "url_reported_malicious": $r.url_reported_malicious,
+                "malicious_domain_categories": json_str($r.malicious_domain_categories),
+                "malicious_url_categories": json_str($r.malicious_url_categories)
+              }
+            }
+          | walk( if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) else . end )

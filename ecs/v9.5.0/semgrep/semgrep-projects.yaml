@@ -1,0 +1,74 @@
+name: "Semgrep Projects to ECS v9.5.0"
+description: "Maps Semgrep project (scanned-repository) inventory records from the Semgrep ListProjects API into an Elastic Common Schema (ECS) v9.5.0 nested document (event categorization, service, url, organization, tags, and the semgrep.* vendor namespace)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-projects"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "semgrep"
+  - "projects"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep project inventory -> ECS v9.5.0 (nested).
+          # A Semgrep "project" is a scanned code repository. Modeled as an
+          # asset/configuration inventory snapshot:
+          #   event.kind: asset ; category: [configuration] ; type: [info].
+          # One jq pass, bind-once, single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          def iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else ($ts | sub(" "; "T") | sub("\\.[0-9]+"; "")
+                  | sub("([+-][0-9][0-9]:[0-9][0-9]|Z)$"; "") + "Z")
+            end;
+
+          . as $r
+          | ($r.tags // []) as $tags
+          | ($r.name // "") as $name
+          | (if ($name | contains("/")) then ($name | split("/")[0]) else null end) as $owner
+          | {
+              "@timestamp": (iso($r.created_at) // iso($r.latest_scan_at) // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "asset",
+                "category": ["configuration"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "provider": "semgrep",
+                "module": "semgrep-projects",
+                "id": ($r.id | tostring),
+                "created": iso($r.created_at)
+              },
+              "service": {
+                "name": $name,
+                "type": "semgrep"
+              },
+              "url": {
+                "full": $r.url
+              },
+              "organization": {
+                "name": $owner
+              },
+              "tags": (if ($tags | length) > 0 then $tags else null end),
+              "semgrep": {
+                "project": {
+                  "id": $r.id,
+                  "name": $name,
+                  "url": $r.url,
+                  "primary_branch": $r.primary_branch,
+                  "default_branch": $r.default_branch,
+                  "tags": (if ($tags | length) > 0 then $tags else null end),
+                  "created_at": iso($r.created_at),
+                  "latest_scan_at": iso($r.latest_scan_at)
+                }
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [] and .value != "")) else . end)

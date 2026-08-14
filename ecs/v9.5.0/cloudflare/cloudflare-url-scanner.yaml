@@ -1,0 +1,105 @@
+name: "Cloudflare URL Scanner to ECS v9.5.0"
+description: "Maps Cloudflare URL Scanner scan-result records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization (threat/indicator), url.*, server.*, threat.indicator.*, tls.*, http.*, and related.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-url-scanner"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "url-scanner"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare URL Scanner -> ECS v9.5.0 (nested).
+          # A scan verdict for a submitted URL is threat intelligence about
+          # that URL: event.category=threat, event.type=indicator.
+          # event.kind=alert when the verdict is malicious, else event.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string" and ($s|test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+
+          . as $r
+          | ($r.task // {}) as $t
+          | ($r.page // {}) as $p
+          | (($r.verdicts // {}).overall // {}) as $v
+          | (($v.malicious) == true) as $bad
+          | {
+              "@timestamp": $t.time,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": (if $bad then "alert" else "event" end),
+                "category": ["threat"],
+                "type": ["indicator"],
+                "outcome": (if $t.success == true then "success" else "unknown" end),
+                "id": $t.uuid,
+                "provider": "cloudflare",
+                "module": "url_scanner",
+                "dataset": "cloudflare.url_scanner",
+                "reference": $t.reportURL,
+                "severity": (if $bad then 8 else 1 end)
+              },
+
+              "url": ({
+                "full": $p.url,
+                "domain": $p.domain,
+                "registered_domain": $p.apexDomain,
+                "scheme": (if ($p.url // "") | startswith("https") then "https" else "http" end)
+              } | with_entries(select(.value != null))),
+
+              "server": ({
+                "ip": (if is_ip($p.ip) then $p.ip else null end),
+                "domain": $p.domain,
+                "as": ({
+                  "number": (if ($p.asn // "") | test("^AS?[0-9]+$") then ($p.asn | ltrimstr("AS") | tonumber) else null end),
+                  "organization": { "name": $p.asnname }
+                } | with_entries(select(.value != null))),
+                "geo": { "country_iso_code": $p.country }
+              } | with_entries(select(.value != null))),
+
+              "http": { "response": { "status_code": $p.status } },
+
+              "tls": { "server": { "issuer": $p.tlsIssuer } },
+
+              "threat": {
+                "feed": { "name": "Cloudflare URL Scanner" },
+                "indicator": ({
+                  "type": "url",
+                  "url": { "full": $t.url },
+                  "provider": "Cloudflare",
+                  "confidence": (if $bad then "High" else "None" end)
+                } | with_entries(select(.value != null)))
+              },
+
+              "related": ({
+                "hosts": ([ $t.domain, $p.domain ] | map(select(. != null)) | unique),
+                "ip":    ([ $p.ip ] | map(select(is_ip(.))) | unique)
+              } | with_entries(select((.value | length) > 0))),
+
+              # Vendor namespace (custom, allowed by ECS) for scanner-specific detail.
+              "cloudflare": ({
+                "url_scanner": ({
+                  "scan_id": $t.uuid,
+                  "malicious": $v.malicious,
+                  "categories": $v.categories,
+                  "tags": $v.tags,
+                  "report_url": $t.reportURL,
+                  "screenshot_url": $t.screenshotURL,
+                  "page_title": $p.title,
+                  "page_country": $p.country,
+                  "processors": ($r.meta.processors | if . == null then null else (. | tojson) end)
+                } | with_entries(select(.value != null)))
+              })
+            }
+          # Single end-of-pipeline prune: drop null / {} / [] leaves.
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

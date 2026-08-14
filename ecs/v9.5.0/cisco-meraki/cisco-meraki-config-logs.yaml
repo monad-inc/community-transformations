@@ -1,0 +1,87 @@
+name: "Cisco Meraki Configuration Changes to ECS v9.5.0"
+description: "Transforms Cisco Meraki Dashboard configuration change (audit) records into Elastic Common Schema (ECS) v9.5.0 documents, covering event categorization (configuration/change), user, organization, and the meraki.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cisco-meraki-config-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cisco-meraki"
+  - "config-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cisco Meraki Dashboard configurationChanges -> ECS v9.5.0.
+          # One nested ECS document per record. Single construction pass;
+          # one trailing walk-based prune (the only recursive pass).
+          # ---------------------------------------------------------------
+          def nonempty($v): ($v != null) and (($v | type) != "string" or ($v | length) > 0);
+          def prune: walk(
+            if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+            elif type == "array" then map(select(. != null))
+            else . end);
+
+          . as $r
+          | (if (nonempty($r.oldValue) | not) and nonempty($r.newValue) then "creation"
+             elif nonempty($r.oldValue) and (nonempty($r.newValue) | not) then "deletion"
+             else "change" end) as $etype
+          | {
+              "@timestamp": $r.ts,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["configuration"],
+                "type": [$etype],
+                "outcome": "success",
+                "action": ($r.page // "configuration-change"),
+                "provider": "meraki",
+                "module": "meraki"
+              },
+
+              "message": ($r.label // $r.page),
+
+              "user": ( {
+                "name":  $r.adminName,
+                "email": $r.adminEmail,
+                "id":    $r.adminId
+              } | with_entries(select(.value != null and .value != "")) ),
+
+              "organization": ( {
+                "name": $r.networkName,
+                "id":   $r.networkId
+              } | with_entries(select(.value != null and .value != "")) ),
+
+              "related": {
+                "user": ( [$r.adminName, $r.adminEmail] | map(select(. != null and . != "")) | unique )
+              },
+
+              "meraki": {
+                "network": ( {
+                  "id":   $r.networkId,
+                  "name": $r.networkName,
+                  "url":  $r.networkUrl
+                } | with_entries(select(.value != null and .value != "")) ),
+                "ssid": ( {
+                  "name":   $r.ssidName,
+                  "number": $r.ssidNumber
+                } | with_entries(select(.value != null and .value != "")) ),
+                "change": ( {
+                  "page":      $r.page,
+                  "label":     $r.label,
+                  "old_value": $r.oldValue,
+                  "new_value": $r.newValue
+                } | with_entries(select(.value != null and .value != "")) ),
+                "client": ( {
+                  "id":   $r.client.id,
+                  "type": $r.client.type
+                } | with_entries(select(.value != null and .value != "")) )
+              }
+            }
+          | prune

@@ -1,0 +1,63 @@
+name: "Anthropic Claude Enterprise Groups to ECS v9.5.0"
+description: "Maps Anthropic Claude Enterprise RBAC/SCIM group directory records (Admin/Compliance API groups endpoint) into Elastic Common Schema (ECS) v9.5.0, covering the event categorization (iam), group.* field set, and the anthropic.* vendor namespace for source_type, roles, and timestamps."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-groups"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "groups"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Enterprise group directory record -> ECS v9.5.0
+          # Input: one group record per invocation:
+          #   { id, name, description, source_type("direct"|"scim"),
+          #     roles[], created_at, updated_at }
+          # A polled group directory snapshot -> event.kind "asset",
+          # event.category ["iam"], event.type ["group","info"].
+          # ---------------------------------------------------------------
+          . as $r
+          | {
+              "@timestamp": ($r.updated_at // $r.created_at),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "asset",
+                category: ["iam"],
+                type: ["group", "info"],
+                outcome: "success",
+                action: "group-directory-snapshot",
+                id: $r.id,
+                created: $r.created_at,
+                provider: "anthropic-compliance-api",
+                module: "anthropic",
+                dataset: "anthropic.groups"
+              },
+              group: {
+                id: $r.id,
+                name: $r.name
+              },
+              anthropic: {
+                group: {
+                  source_type: $r.source_type,
+                  description: $r.description,
+                  roles: ($r.roles // [] | map(select(. != null and . != ""))),
+                  created_at: $r.created_at,
+                  updated_at: $r.updated_at
+                }
+              }
+            }
+          # single end-of-pipeline prune: drop null, "", {}, []
+          | walk(if type == "object"
+                 then with_entries(select(
+                        (.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)

@@ -1,0 +1,85 @@
+name: "Cloudflare Access Login Events to ECS v9.5.0"
+description: "Maps Cloudflare Access authentication (login) records into Elastic Common Schema (ECS) v9.5.0, covering event categorization, user, source, url, cloud, and related field sets plus the cloudflare.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-access-login-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "access-login-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Access authentication log -> ECS v9.5.0 (nested).
+          # event.category: authentication; type start (login) / end (logout).
+          # ---------------------------------------------------------------
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$|:"));
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          . as $r
+          | ($r.action // "" | ascii_downcase) as $act
+          | (truthy($r.allowed)) as $ok
+          | ($r.app_domain // "" | split("/")[0]) as $app_host
+          | ($r.ip_address) as $ip
+          | {
+              "@timestamp": $r.created_at,
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                category: [ "authentication" ],
+                type: [ (if $act == "logout" or $act == "logoff" then "end" else "start" end) ],
+                outcome: (if $ok then "success" else "failure" end),
+                action: $r.action,
+                id: $r.ray_id,
+                provider: "access",
+                module: "cloudflare"
+              },
+
+              user: {
+                email: $r.user_email,
+                name: $r.user_email
+              },
+
+              source: {
+                ip: (if is_ip($ip) then $ip else null end),
+                geo: { country_iso_code: $r.country }
+              },
+
+              url: {
+                domain: (if $app_host == "" then null else $app_host end),
+                full: (if ($r.app_domain // "") == "" then null else ("https://" + $r.app_domain) end)
+              },
+
+              cloud: { provider: "cloudflare" },
+
+              cloudflare: {
+                app_uid: $r.app_uid,
+                app_domain: $r.app_domain,
+                connection: $r.connection,
+                ray_id: $r.ray_id,
+                allowed: $r.allowed
+              },
+
+              related: {
+                ip: ( [ (if is_ip($ip) then $ip else null end) ] | map(select(. != null)) | unique ),
+                user: ( [ $r.user_email ] | map(select(. != null)) | unique )
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != {} and . != []))
+              else . end
+            )

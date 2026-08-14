@@ -1,0 +1,80 @@
+name: "Coda Audit Events to ECS v9.5.0"
+description: "Maps Coda Admin Audit API events into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization, user, source, user_agent, organization, and related.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "coda-audit-events"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "coda"
+  - "audit-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Coda Admin Audit API event -> ECS v9.5.0 (nested document).
+          # One record per invocation; single construction pass; one prune.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s | type) == "string"
+              and ($s | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+          . as $r
+          | ($r.action // "") as $action
+          | ($r.result // "") as $result
+          # authentication category allows types start/end/info
+          | (if   $action == "LogInUser"  then ["start"]
+             elif $action == "LogOutUser" then ["end"]
+             else ["info"] end) as $etype
+          | (if ($result | ascii_downcase) == "allowed" then "success"
+             elif $result == "" then "unknown"
+             else "failure" end) as $outcome
+          | {
+              "@timestamp": (
+                if ($r.timestamp | type) == "number"
+                then ($r.timestamp | todate)
+                else $r.timestamp end
+              ),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "event",
+                "category": ["authentication"],
+                "type": $etype,
+                "outcome": $outcome,
+                "action": $action,
+                "provider": ($r.eventDetails.providerName // null),
+                "module": "coda"
+              },
+              "user": {
+                "email": $r.user.email,
+                "id": (if $r.user.id != null then ($r.user.id | tostring) else null end),
+                "name": ($r.user.email // null)
+              },
+              "source": {
+                "ip": (if is_ip($r.userContext.ipAddress) then $r.userContext.ipAddress else null end),
+                "address": $r.userContext.ipAddress
+              },
+              "user_agent": {
+                "original": $r.userContext.browser.ua
+              },
+              "organization": {
+                "id": $r.organizationId
+              },
+              "session": {
+                "id": $r.userContext.sessionId
+              },
+              "related": {
+                "user": ([$r.user.email] | map(select(. != null)) | unique),
+                "ip": ([$r.userContext.ipAddress]
+                        | map(select(is_ip(.))) | unique)
+              }
+            }
+          | walk(
+              if type == "object" then with_entries(select(
+                  .value != null and .value != {} and .value != [] and .value != ""))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

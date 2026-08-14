@@ -1,0 +1,119 @@
+name: "Aiven Service Logs to ECS v9.5.0"
+description: "Normalizes Aiven managed-service journald log records (HOSTNAME, SYSTEMD_UNIT, MESSAGE, PRIORITY, timestamp) into a nested Elastic Common Schema (ECS) v9.5.0 document, populating event, log.syslog, host, service, process, source/user, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aiven-service-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aiven"
+  - "system"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Aiven Service Logs -> ECS v9.5.0
+          #
+          # Input: ONE Aiven service-log record per invocation (a systemd
+          # journal entry from any Aiven managed service). Documented fields:
+          #   .HOSTNAME      -> host.name / host.hostname   (service+node)
+          #   .SYSTEMD_UNIT  -> process.name, service.type
+          #   .MESSAGE       -> message
+          #   .PRIORITY      -> log.syslog.severity.code / .name, log.level
+          #   .timestamp     -> @timestamp
+          #   .SESSION_ID    -> aiven.session_id
+          #
+          # event.category/type/outcome are derived from the log content when
+          # a high-confidence signal is present (authentication / datastore),
+          # otherwise only event.kind is set (generic log event).
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prio: ((.PRIORITY // "") | if type == "number" then tostring else . end);
+          def sev_name:
+            { "0": "emergency", "1": "alert", "2": "critical", "3": "error",
+              "4": "warning", "5": "notice", "6": "informational", "7": "debug" }[prio];
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.MESSAGE // "" ) as $msg
+          | ( $r.SYSTEMD_UNIT // "" ) as $unit
+          # service.type: strip a trailing "-<version>" and the ".service"
+          # suffix from the unit ("postgresql-15.service" -> "postgresql").
+          | ( if $unit != "" then ($unit | sub("\\.service$"; "") | sub("-[0-9].*$"; "")) else null end ) as $svc
+          | ( ($msg | capture("user=(?<user>[^,]*),db=(?<db>[^,]*),app=(?<app>[^,]*),client=(?<client>[^ ]*)") ? ) // {} ) as $pg
+          | ( if ($pg.user // "") != "" then $pg.user else null end ) as $puser
+          | ( if is_ip($pg.client // "") then $pg.client else null end ) as $pclient
+          | ( ($msg | test("authentication|password"; "i")) ) as $is_auth
+          | ( ($msg | test("fatal|fail|denied|error"; "i")) or (prio == "0" or prio == "1" or prio == "2" or prio == "3") ) as $is_fail
+
+          | {
+              "@timestamp": ( ($r.timestamp // null)
+                              | if . == null then null else (gsub("\\.[0-9]+Z?$"; "Z")) end ),
+              "ecs": { "version": "9.5.0" },
+
+              "message": ( if $msg != "" then $msg else null end ),
+
+              "event": ( {
+                "kind": "event",
+                "module": "aiven",
+                "dataset": "aiven.service_logs",
+                "provider": ( if $unit != "" then $unit else null end ),
+                "category": ( if $is_auth then ["authentication"]
+                              elif ($svc != null and ($svc|test("postgresql|mysql|redis|valkey|opensearch|elasticsearch|cassandra|clickhouse|m3db"))) then ["database"]
+                              else null end ),
+                "type": ( if $is_auth then ["start"]
+                          elif ($svc != null and ($svc|test("postgresql|mysql|redis|valkey|opensearch|elasticsearch|cassandra|clickhouse|m3db"))) then ["info"]
+                          else null end ),
+                "outcome": ( if $is_auth then (if $is_fail then "failure" else "success" end) else null end )
+              } ),
+
+              "log": {
+                "level": sev_name,
+                "syslog": {
+                  "severity": ( { "code": ( if $r.PRIORITY != null then ($r.PRIORITY|tonumber) else null end ),
+                                  "name": sev_name }
+                                | with_entries(select(.value != null)) )
+                }
+              },
+
+              "host": ( { "name": $r.HOSTNAME, "hostname": $r.HOSTNAME }
+                        | with_entries(select(.value != null)) ),
+
+              "service": ( { "type": $svc } | with_entries(select(.value != null)) ),
+
+              "process": ( { "name": ( if $unit != "" then $unit else null end ) }
+                           | with_entries(select(.value != null)) ),
+
+              "user": ( if $puser != null then { "name": $puser } else null end ),
+
+              "source": ( if $pclient != null then { "ip": $pclient, "address": $pclient } else null end ),
+
+              "related": ( {
+                "hosts": ( [ $r.HOSTNAME ] | map(select(. != null)) | unique ),
+                "user":  ( [ $puser ] | map(select(. != null)) | unique ),
+                "ip":    ( [ $pclient ] | map(select(. != null)) | unique )
+              } ),
+
+              "aiven": ( {
+                "session_id": $r.SESSION_ID,
+                "systemd_unit": ( if $unit != "" then $unit else null end ),
+                "database": ( if ($pg.db // "") != "" then $pg.db else null end )
+              } | with_entries(select(.value != null)) )
+            }
+          | prune

@@ -1,0 +1,90 @@
+name: "Clumio Consolidated Alerts to ECS v9.5.0"
+description: "Maps Clumio consolidated alert records into Elastic Common Schema (ECS) v9.5.0, covering event.*, rule.*, cloud.*, host.*, and related.* field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-consolidated-alerts"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "clumio"
+  - "consolidated-alerts"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Clumio consolidated alert -> ECS v9.5.0 (nested document).
+          # event.kind=alert; category=configuration; type=change.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.parent_entity // {}) as $pe
+          | ($r.details // {}) as $d
+          | def to_iso($ts):
+              if $ts == null or $ts == "" then null
+              elif ($ts | type) == "number" then ($ts | todateiso8601)
+              else $ts
+              end;
+          ($r.updated_timestamp // $r.raised_timestamp) as $ts
+          # Clumio severity "error"/"warning" -> ECS numeric severity + log.level
+          | ( { "error": 73, "warning": 37 }[($r.severity // "" | ascii_downcase)] // 0 ) as $sevnum
+          | ( { "active": "unknown", "cleared": "success" }[($r.status // "" | ascii_downcase)] // "unknown" ) as $outcome
+          | {
+              "@timestamp": to_iso($ts),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "alert",
+                "category": [ "configuration" ],
+                "type": [ "change" ],
+                "outcome": $outcome,
+                "id": ($r.id // null),
+                "action": ($r.type // null),
+                "reason": ($d.cause // $r.cause // null),
+                "severity": $sevnum,
+                "provider": "clumio",
+                "module": "consolidated-alerts",
+                "dataset": "clumio.consolidated_alerts",
+                "created": to_iso($r.raised_timestamp),
+                "start": to_iso($r.raised_timestamp),
+                "end": to_iso($r.cleared_timestamp)
+              },
+              "log": {
+                "level": (({ "error": "error", "warning": "warning" }[($r.severity // "" | ascii_downcase)]) // null)
+              },
+              "message": ($d.cause // $r.cause // $r.type // null),
+              "rule": {
+                "id": ($r.type // null),
+                "name": ($r.type // null),
+                "category": ($r.cause // null),
+                "description": ($d.cause // null)
+              },
+              "cloud": {
+                "provider": "aws"
+              },
+              "host": {
+                "id": ($pe.id // null),
+                "name": ($pe.value // null),
+                "type": ($pe.type // null)
+              },
+              "related": {
+                "hosts": ([ $pe.value ] | map(select(. != null and . != "")) | unique)
+              },
+              "clumio": {
+                "alert_id": ($r.id // null),
+                "status": ($r.status // null),
+                "type": ($r.type // null),
+                "cause": ($r.cause // null),
+                "details_type": ($d.type // null),
+                "active_entity_count": ($r.active_entity_count // null),
+                "cleared_entity_count": ($r.cleared_entity_count // null),
+                "notes": ($r.notes // null),
+                "parent_entity_type": ($pe.type // null),
+                "raised_timestamp": ($r.raised_timestamp // null),
+                "cleared_timestamp": (if ($r.cleared_timestamp // "") == "" then null else $r.cleared_timestamp end),
+                "updated_timestamp": ($r.updated_timestamp // null)
+              }
+            }
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

@@ -1,0 +1,131 @@
+name: "AWS Inspector Findings to ECS v9.5.0"
+description: "Normalizes AWS Inspector (Inspector2) finding records into the Elastic Common Schema (ECS) v9.5.0 field sets (event, vulnerability, package, cloud, host, related), modeling each finding as an alert carrying its CVE, CVSS score, affected package, and impacted AWS resource."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-inspector"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "inspector"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Inspector (Inspector2)  ->  ECS v9.5.0
+          # Input: ONE Inspector Finding record per invocation.
+          #
+          #   .findingArn                 -> event.id
+          #   .type                       -> event.category is always
+          #                                  ["vulnerability"] (type ["info"])
+          #   .severity                   -> vulnerability.severity / event.severity
+          #   .packageVulnerabilityDetails.vulnerabilityId -> vulnerability.id
+          #   .inspectorScore / cvss      -> vulnerability.score.base/.version
+          #   .resources[0]               -> cloud.* / host.* / related.ip
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor | todateiso8601)
+            else $ts end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.packageVulnerabilityDetails // {} ) as $pvd
+          | ( $r.resources // [] ) as $res
+          | ( $res[0] // {} ) as $r0
+          | ( $r0.details.awsEc2Instance // {} ) as $ec2
+          | ( ($pvd.cvss // []) | (.[0] // {}) ) as $cvss0
+
+          # Inspector severity -> ECS numeric event.severity (mirrors OCSF order)
+          | ( { "INFORMATIONAL": 1, "LOW": 2, "MEDIUM": 3,
+                "HIGH": 4, "CRITICAL": 5, "UNTRIAGED": 0 }[$r.severity] // 0 ) as $sevnum
+
+          # Collect every IP the resource exposes for related.ip
+          | ( ( ($ec2.ipV4Addresses // []) + ($ec2.ipV6Addresses // []) )
+              | map(select(is_ip(.))) | unique ) as $ips
+
+          | {
+              "@timestamp": to_iso($r.updatedAt // $r.lastObservedAt // $r.firstObservedAt),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "alert",
+                module: "aws",
+                dataset: "aws.inspector",
+                provider: "inspector",
+                id: $r.findingArn,
+                category: ["vulnerability"],
+                type: ["info"],
+                outcome: "unknown",
+                severity: $sevnum,
+                created: to_iso($r.firstObservedAt),
+                start: to_iso($r.firstObservedAt),
+                end: to_iso($r.lastObservedAt),
+                reason: $r.title,
+                url: ($pvd.sourceUrl // null)
+              },
+
+              message: $r.description,
+
+              vulnerability: {
+                id: $pvd.vulnerabilityId,
+                description: ($r.description // $r.title),
+                severity: $r.severity,
+                reference: ($pvd.sourceUrl // ($pvd.referenceUrls // [])[0]),
+                enumeration: ( if ($pvd.vulnerabilityId // "") | startswith("CVE")
+                               then "CVE" else null end ),
+                scanner: { vendor: "Amazon Inspector" },
+                score: {
+                  base: ($cvss0.baseScore // $r.inspectorScore),
+                  version: $cvss0.version
+                }
+              },
+
+              package: ( ($pvd.vulnerablePackages // []) | (.[0] // {})
+                | { name: .name,
+                    version: .version,
+                    architecture: .arch,
+                    type: .packageManager,
+                    path: .filePath }
+                | with_entries(select(.value != null)) ),
+
+              cloud: {
+                provider: "aws",
+                region: $r0.region,
+                account: { id: $r.awsAccountId },
+                instance: { id: ( if ($r0.type // "") == "AWS_EC2_INSTANCE"
+                                  then $r0.id else null end ) },
+                machine: { type: $ec2.type }
+              },
+
+              host: {
+                id: ( if ($r0.type // "") == "AWS_EC2_INSTANCE" then $r0.id else null end ),
+                type: $ec2.type,
+                ip: $ips,
+                os: { platform: $ec2.platform }
+              },
+
+              related: {
+                ip: $ips,
+                hosts: ( [ $r0.id ] | map(select(. != null)) )
+              }
+            }
+          | prune

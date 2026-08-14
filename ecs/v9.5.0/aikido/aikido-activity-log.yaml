@@ -1,0 +1,84 @@
+name: "Aikido Activity Log to ECS v9.5.0"
+description: "Maps Aikido Security activity log records (finding lifecycle / triage actions) into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization (configuration/change), user, and the aikido.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-activity-log"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aikido"
+  - "application-security"
+  - "activity-log"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Aikido Security activity log -> ECS v9.5.0 (nested).
+          # A record is a user action on a security finding. Categorized as
+          # configuration/change (creation for autofix_pr_created & *_push).
+          # One jq pass, bind-once, single end-of-pipeline walk prune.
+          # ---------------------------------------------------------------
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null and . != {} and . != []))
+              else . end
+            );
+
+          . as $r
+          | ($r.action // "") as $action
+          | ($r.metadata.location // {}) as $loc
+          | ( if ($action == "autofix_pr_created" or ($action | endswith("_push")))
+              then ["creation"] else ["change"] end ) as $etype
+          | {
+              "@timestamp": ( if ($r.timestamp | type) == "number"
+                              then ($r.timestamp | todate)
+                              else $r.timestamp end ),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": ["configuration"],
+                "type": $etype,
+                "outcome": "success",
+                "action": $action,
+                "id": ($r.id | tostring),
+                "provider": "aikido",
+                "module": "activity_log",
+                "reason": $r.comment
+              },
+
+              "user": {
+                "name": $r.user_name,
+                "id": ($r.user_id | tostring)
+              },
+
+              "message": $r.comment,
+
+              "related": {
+                "user": [ $r.user_name ] | map(select(. != null)) | unique
+              },
+
+              # --- Aikido vendor namespace (custom, allowed by ECS) ---
+              "aikido": {
+                "activity_id": $r.id,
+                "source": $r.source,
+                "action": $action,
+                "issue_id": $r.issue_id,
+                "grouped_issue_id": $r.grouped_issue_id,
+                "code_repo_id": $loc.code_repo_id,
+                "code_repo_name": $loc.code_repo_name,
+                "container_repo_id": $loc.container_repo_id,
+                "container_repo_name": $loc.container_repo_name,
+                "cloud_id": $loc.cloud_id,
+                "cloud_name": $loc.cloud_name,
+                "domain_id": $loc.domain_id,
+                "domain_name": $loc.domain_name
+              }
+            }
+          | prune

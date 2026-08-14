@@ -1,0 +1,122 @@
+name: "Clumio Individual Alerts to ECS v9.5.0"
+description: "Maps Clumio Individual Alert records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event.*, rule.*, cloud.*, related.* and a clumio.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-individual-alerts"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "clumio"
+  - "individual-alerts"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Clumio Individual Alert -> ECS v9.5.0 (nested).
+          # event.kind=alert; category=configuration/type=info (data-protection
+          # health alert). One jq pass, bind-once, single end-of-pipeline prune.
+          # ---------------------------------------------------------------
+          def json_str($v): if $v == null then null else ($v | tojson) end;
+
+          . as $r
+          | ($r.primary_entity // {}) as $pe
+          | ($r.parent_entity // {}) as $pae
+          | ($r.details // {}) as $d
+          | (($pe.type // "") | ascii_downcase) as $petype
+          | (if ($petype | startswith("aws")) then "aws"
+             elif ($petype | startswith("azure")) then "azure"
+             elif ($petype | startswith("microsoft365")) or ($petype | startswith("m365")) then "microsoft365"
+             elif ($petype | startswith("vmware")) then "vmware"
+             else null end) as $provider
+          # Alert severity -> outcome. error => failure; else unknown.
+          | (if ($r.severity // "") == "error" then "failure" else "unknown" end) as $outcome
+          | (if ($r.severity // "") == "error" then 7
+             elif ($r.severity // "") == "warning" then 4
+             else 0 end) as $sevnum
+          | {
+              "@timestamp": ($r.raised_timestamp // $r.updated_timestamp),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": [ "configuration" ],
+                "type": [ "info" ],
+                "outcome": $outcome,
+                "id": ($r.id // null),
+                "action": ($r.type // null),
+                "reason": ($r.cause // null),
+                "severity": $sevnum,
+                "provider": "clumio",
+                "module": "clumio",
+                "dataset": "clumio.individual_alerts",
+                "created": ($r.raised_timestamp // null),
+                "start": ($r.raised_timestamp // null),
+                "end": ($r.cleared_timestamp // null),
+                "original": ($r | tojson)
+              },
+
+              "message": ($d.description // $r.cause // null),
+
+              "rule": {
+                "name": ($r.type // null),
+                "description": ($r.cause // $d.cause // null)
+              },
+
+              "cloud": (
+                {
+                  "provider": $provider,
+                  "account": (
+                    if ($d.variables.account_native_id // null) != null
+                    then { "id": ($d.variables.account_native_id | tostring) }
+                    else null end
+                  )
+                } | with_entries(select(.value != null))
+              ),
+
+              "tags": (
+                ( $r.tags // [] ) | map(.value // empty) | if length > 0 then . else null end
+              ),
+
+              "clumio": {
+                "alert": {
+                  "id": ($r.id // null),
+                  "consolidated_id": ($r.consolidated_alert_id // null),
+                  "type": ($r.type // null),
+                  "cause": ($r.cause // null),
+                  "severity": ($r.severity // null),
+                  "status": ($r.status // null),
+                  "notes": (if ($r.notes // "") == "" then null else $r.notes end),
+                  "raised_count": ($r.raised_count // null),
+                  "raised_timestamp": ($r.raised_timestamp // null),
+                  "updated_timestamp": ($r.updated_timestamp // null),
+                  "cleared_timestamp": ($r.cleared_timestamp // null)
+                },
+                "details": {
+                  "type": ($d.type // null),
+                  "description": ($d.description // null),
+                  "variables": json_str($d.variables)
+                },
+                "primary_entity": {
+                  "id": ($pe.id // null),
+                  "type": ($pe.type // null),
+                  "value": ($pe.value // null)
+                },
+                "parent_entity": {
+                  "id": ($pae.id // null),
+                  "type": ($pae.type // null),
+                  "value": ($pae.value // null)
+                }
+              }
+            }
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

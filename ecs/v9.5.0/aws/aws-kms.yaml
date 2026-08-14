@@ -1,0 +1,109 @@
+name: "AWS KMS Keys to ECS v9.5.0"
+description: "Normalizes AWS Key Management Service (KMS) key inventory records from the aws-kms connector into Elastic Common Schema (ECS) v9.5.0, populating the event categorization (event.kind=asset, category=configuration), cloud.*, and the aws.kms.* vendor namespace for key state, usage, rotation, aliases, and grants."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-kms"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "kms"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS KMS key inventory  ->  ECS v9.5.0
+          #
+          # Input: ONE aws-kms record per invocation (DescribeKey
+          #   KeyMetadata joined with rotation status, aliases, grants,
+          #   tags). This is a configuration/asset snapshot, not an event,
+          #   so:
+          #     event.kind     = asset       (inventory snapshot)
+          #     event.category = configuration
+          #     event.type     = info        (legal for `configuration`)
+          #     event.outcome  = success     (collection succeeded)
+          #
+          # ECS has no native cryptographic-key field set, so the KMS
+          # specifics live under the allowed `aws.kms.*` vendor namespace;
+          # deeply-nested sub-objects (aliases, grants, rotation) are
+          # serialized to JSON strings to avoid ES mapping explosion.
+          # =================================================================
+
+          # Serialize a nested value to a compact JSON string (or drop it if
+          # null/empty) so the aws.* namespace stays mapping-safe.
+          def json_str: if (. == null or . == [] or . == {}) then null else (. | tojson) end;
+
+          # Single end-of-pipeline recursive prune (the one permitted
+          # recursive pass): ES rejects nulls and the doc is deeply nested.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.KeyMetadata // {} ) as $km
+          | ( $r.KeyRotationStatus // {} ) as $rot
+          | ( $r.Aliases // [] ) as $aliases
+          | ( $r.Tags // [] ) as $tags
+
+          | {
+              ecs: { version: "9.5.0" },
+
+              "@timestamp": $km.CreationDate,
+
+              event: {
+                kind: "asset",
+                module: "aws",
+                dataset: "aws.kms",
+                provider: "kms.amazonaws.com",
+                action: "kms-key-inventory",
+                id: $km.KeyId,
+                category: ["configuration"],
+                type: ["info"],
+                outcome: "success"
+              },
+
+              cloud: {
+                provider: "aws",
+                region: ($r.Region // null),
+                account: { id: $km.AWSAccountId }
+              },
+
+              # ECS `labels` is a flattened key/value object — a natural home
+              # for AWS resource tags.
+              labels: ( $tags
+                        | map({ key: .TagKey, value: .TagValue })
+                        | from_entries ),
+
+              # KMS-specific detail under the allowed vendor namespace.
+              aws: {
+                kms: {
+                  key_id:            $km.KeyId,
+                  key_arn:           $km.Arn,
+                  key_state:         $km.KeyState,
+                  key_usage:         $km.KeyUsage,
+                  key_spec:          ($km.KeySpec // $km.CustomerMasterKeySpec),
+                  key_manager:       $km.KeyManager,
+                  origin:            $km.Origin,
+                  description:       $km.Description,
+                  enabled:           $km.Enabled,
+                  multi_region:      $km.MultiRegion,
+                  rotation_enabled:  $rot.KeyRotationEnabled,
+                  rotation_period_days: $rot.RotationPeriodInDays,
+                  next_rotation_date: $rot.NextRotationDate,
+                  encryption_algorithms: $km.EncryptionAlgorithms,
+                  aliases: ($aliases | json_str),
+                  grants:  (($r.Grants // []) | json_str)
+                }
+              }
+            }
+          | prune

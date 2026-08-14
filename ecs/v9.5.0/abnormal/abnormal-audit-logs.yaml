@@ -1,0 +1,82 @@
+name: "Abnormal Security Audit Logs to ECS v9.5.0"
+description: "Normalizes individual Abnormal Security portal/API audit-log records into the Elastic Common Schema (ECS) v9.5.0 core fields (event, user, source, url, organization, related), categorized as api activity."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "abnormal"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Abnormal Security Audit Logs -> ECS v9.5.0
+          # Input: ONE audit-log record per invocation from the
+          # `abnormal-audit-logs` connector. Records wrap an abx_metadata
+          # envelope and an abx_body carrying the audited action.
+          # event.category: api ; type derived from the action verb.
+          # =================================================================
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          . as $r
+          | ($r.abx_metadata // {}) as $m
+          | ($r.abx_body // {}) as $b
+          | ($b.action_details // {}) as $ad
+          | ($b.user // {}) as $u
+          | (($b.action // $b.category // "") | ascii_downcase) as $act
+          | (if   ($act | test("delete|purge|remove"))          then "deletion"
+             elif ($act | test("create|add|new"))               then "creation"
+             elif ($act | test("update|change|modif|set|remediat|status")) then "change"
+             elif ($act | test("login"))                        then "start"
+             elif ($act | test("read|get|list|search|view|export|access")) then "access"
+             else "info" end) as $etype
+          | {
+              "@timestamp": ($b.timestamp // $m.timestamp),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "event",
+                "category": ["api"],
+                "type": [$etype],
+                "action": ($b.action // $b.category),
+                "outcome": (if   (($b.status // "") | ascii_upcase) == "SUCCESS" then "success"
+                            elif (($b.status // "") | ascii_upcase) == "FAILURE" then "failure"
+                            else "unknown" end),
+                "id": $m.trace_id,
+                "provider": "abnormal-security",
+                "module": "abnormal_security",
+                "reason": $ad.provided_reason
+              },
+              "user": {
+                "email": $u.email,
+                "name":  $u.email
+              },
+              "source": {
+                "ip":      (if is_ip($b.source_ip) then $b.source_ip else null end),
+                "address": $b.source_ip
+              },
+              "url": {
+                "path":     $ad.request_url,
+                "original": $ad.request_url
+              },
+              "organization": {
+                "name": $b.tenant_name
+              },
+              "related": {
+                "user": ([$u.email] | map(select(. != null)) | unique),
+                "ip":   ([ (if is_ip($b.source_ip) then $b.source_ip else null end) ] | map(select(. != null)) | unique)
+              }
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

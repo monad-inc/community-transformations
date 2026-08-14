@@ -1,0 +1,101 @@
+name: "Atlassian Confluence Audit Logs to ECS v9.5.0"
+description: "Normalizes Atlassian Confluence audit log records into Elastic Common Schema (ECS) v9.5.0 fields (event, user, source, related, and the confluence.* namespace), categorizing each record as a configuration change/creation/deletion on the affected Confluence object."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-confluence-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "atlassian"
+  - "confluence"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Atlassian Confluence Audit Logs  ->  ECS v9.5.0
+          # Input: ONE Confluence audit record per invocation.
+          #   .creationDate (epoch-ms)  -> @timestamp
+          #   .summary                  -> event.action
+          #   .category                 -> event.type derivation + confluence.category
+          #   .author.*                 -> user.*
+          #   .remoteAddress            -> source.ip / source.address
+          #   .affectedObject.*         -> confluence.affected_object.*
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (($ts / (if $ts > 1e12 then 1000 else 1 end)) | floor | todateiso8601)
+            else $ts end;
+
+          def lc($s): ($s // "") | ascii_downcase;
+
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.author // {}) as $au
+          | (lc($r.summary) + " " + lc($r.description) + " " + lc($r.category)) as $txt
+          | ( if   ($txt | test("creat|add|grant|enabl")) then "creation"
+              elif ($txt | test("delet|remov|revok|disabl")) then "deletion"
+              elif ($txt | test("view|read|access|export|download")) then "access"
+              elif ($txt | test("updat|chang|modif|edit|renam|move|permission")) then "change"
+              else "info" end ) as $etype
+
+          | {
+              "@timestamp": to_iso($r.creationDate),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                category: ["configuration"],
+                type: [$etype],
+                outcome: "success",
+                action: $r.summary,
+                provider: "confluence",
+                module: "confluence",
+                original: ($r | tojson)
+              },
+
+              user: {
+                name: ($au.displayName // $au.publicName),
+                id: $au.accountId
+              },
+
+              source: (if is_ip($r.remoteAddress)
+                       then { ip: $r.remoteAddress, address: $r.remoteAddress }
+                       else null end),
+
+              message: ($r.description // $r.summary),
+
+              related: {
+                user: ([$au.displayName, $au.publicName] | map(select(. != null)) | unique),
+                ip: ([ (if is_ip($r.remoteAddress) then $r.remoteAddress else null end) ] | map(select(. != null)) | unique)
+              },
+
+              confluence: {
+                category: $r.category,
+                sys_admin: $r.sysAdmin,
+                super_admin: $r.superAdmin,
+                affected_object: {
+                  name: $r.affectedObject.name,
+                  type: $r.affectedObject.objectType
+                },
+                changed_values: ($r.changedValues | if . == null then null else tojson end),
+                associated_objects: ($r.associatedObjects | if . == null then null else tojson end)
+              }
+            }
+          | prune

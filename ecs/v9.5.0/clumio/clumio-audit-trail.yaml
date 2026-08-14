@@ -1,0 +1,135 @@
+name: "Clumio Audit Trail to ECS v9.5.0"
+description: "Normalizes Clumio Audit Trail records into the Elastic Common Schema (ECS) v9.5.0 (event, user, source, cloud, related field sets), classifying each administrative action as an authentication, iam, or configuration event, and preserving Clumio-specific detail under the clumio.* namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-audit-trail"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "clumio"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Clumio Audit Trail  ->  ECS v9.5.0
+          #
+          # Input: ONE Clumio Audit Trail record per invocation (GET
+          # /audit-trails, the clumio-audit-trail input connector).
+          #
+          #   .timestamp        -> @timestamp
+          #   .action           -> event.action  (+ drives category/type)
+          #   .status           -> event.outcome
+          #   .id               -> event.id
+          #   .user_email       -> user.email / user.name / related.user
+          #   .ip_address       -> source.ip / source.address / related.ip
+          #   .category, .interface, .primary_entity, .parent_entity, .details
+          #                     -> clumio.audit.* (vendor namespace)
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.action // "" | ascii_downcase) as $act
+          | ($r.status // "" | ascii_downcase) as $st
+          | ($r.category // "" | ascii_downcase) as $cat
+          | ($r.primary_entity // {}) as $pe
+          | ($r.parent_entity // {}) as $par
+
+          # ---- outcome ----------------------------------------------------
+          | ( if $st == "success" then "success"
+              elif $st == "failure" then "failure"
+              else "unknown" end ) as $outcome
+
+          # ---- ECS event.category (array) ---------------------------------
+          | ( if ($act | test("^(login|logout)$")) then ["authentication"]
+              elif ($cat | test("user|sso|mfa|role|auto_user_provisioning|organizational_unit|api_token|ip_allowlist")) then ["iam"]
+              else ["configuration"] end ) as $ecat
+
+          # ---- ECS event.type (array), legal for the chosen category ------
+          | ( if $ecat == ["authentication"] then
+                ( if $act == "login" then ["start"]
+                  elif $act == "logout" then ["end"]
+                  else ["info"] end )
+              elif $ecat == ["iam"] then
+                ( if ($act | test("^(create|register)$")) then ["creation"]
+                  elif ($act | test("^(delete|unregister)$")) then ["deletion"]
+                  elif ($act | test("^(update|enable|disable|apply|remove)$")) then ["change"]
+                  else ["info"] end )
+              else
+                ( if ($act | test("^(create|register)$")) then ["creation"]
+                  elif ($act | test("^(delete|unregister)$")) then ["deletion"]
+                  elif ($act | test("^(update|enable|disable|apply|remove)$")) then ["change"]
+                  elif ($act | test("^(browse|search)$")) then ["access"]
+                  else ["info"] end )
+              end ) as $etype
+
+          # ---- cloud provider inferred from the affected asset type -------
+          | (($pe.type // "") | ascii_downcase) as $petype
+          | ( if ($petype | startswith("aws")) then "aws"
+              elif ($petype | startswith("azure")) then "azure"
+              elif ($petype | startswith("gcp")) then "gcp"
+              else null end ) as $provider
+
+          | {
+              "@timestamp": ($r.timestamp // null),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "event",
+                "category": $ecat,
+                "type": $etype,
+                "outcome": $outcome,
+                "action": ($r.action // null),
+                "id": ($r.id // null),
+                "provider": "clumio",
+                "module": "clumio",
+                "dataset": "clumio.audit",
+                "original": ($r | tojson)
+              },
+
+              "user": ( if ($r.user_email // null) != null
+                        then { "email": $r.user_email, "name": $r.user_email }
+                        else null end ),
+
+              "source": ( if is_ip($r.ip_address)
+                          then { "ip": $r.ip_address, "address": $r.ip_address }
+                          else null end ),
+
+              "cloud": ( if $provider != null
+                         then { "provider": $provider, "service": { "name": "Clumio" } }
+                         else { "service": { "name": "Clumio" } } end ),
+
+              "related": {
+                "user": ( [ $r.user_email ] | map(select(. != null)) | unique ),
+                "ip":   ( [ (if is_ip($r.ip_address) then $r.ip_address else null end) ] | map(select(. != null)) | unique )
+              },
+
+              "clumio": {
+                "audit": {
+                  "id": ($r.id // null),
+                  "action": ($r.action // null),
+                  "category": ($r.category // null),
+                  "status": ($r.status // null),
+                  "interface": ($r.interface // null),
+                  "primary_entity": ($pe | if . == {} then null else . end),
+                  "parent_entity": ($par | if . == {} then null else . end),
+                  "details": ($r.details // null)
+                }
+              }
+            }
+          | prune

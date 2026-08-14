@@ -1,0 +1,141 @@
+name: "MLflow GenAI Traces to ECS v9.5.0"
+description: "Normalizes one MLflow GenAI trace into an Elastic Common Schema (ECS) v9.5.0 event, using the native gen_ai.* field set (operation, provider, request/response model, token usage, agent) plus event categorization (kind=event, category=[api]), user, service, and related field groups."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "mlflow-genai-traces"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "mlflow"
+  - "genai"
+  - "ai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # MLflow GenAI Trace  ->  ECS v9.5.0
+          #
+          # Input: ONE MLflow Trace per invocation, shape { info, data.spans[] }.
+          # ECS 9.5.0 ships the OTel GenAI convention as first-class gen_ai.*
+          # fields, so the trace maps natively:
+          #   event.kind=event, event.category=[api] (a GenAI application call),
+          #   event.type=[info], event.outcome from info.state.
+          #   gen_ai.request.model / response.model / provider.name / operation
+          #   .name / usage.input_tokens / usage.output_tokens / agent.name.
+          # MLflow-specific detail with no ECS home (previews, ids, span count)
+          # goes under the custom mlflow.* namespace (allowed for vendor data).
+          #
+          # MLflow serializes attribute VALUES as JSON strings, so every read
+          # goes through pj() (parse-json-string-or-passthrough).
+          # One trace in -> one nested ECS document out.
+          # =================================================================
+
+          def pj($v):
+            if $v == null then null
+            elif ($v | type) == "string" then ($v | fromjson? // $v)
+            else $v end;
+          def sattr($sp; $k): (($sp.attributes // {})[$k]) | pj(.);
+          def mattr($i; $k):  (($i.trace_metadata // {})[$k]) | pj(.);
+
+          # Recursively drop null / {} / [] so the emitted document stays compact
+          # (Elasticsearch rejects nulls; the doc is deeply nested).
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $t
+          | ($t.info // {}) as $i
+          | ($t.data.spans // []) as $spans
+          | ( $spans | map(select(((.span_type // "") | ascii_upcase) as $st
+                          | $st == "LLM" or $st == "CHAT_MODEL")) | (.[0] // null) ) as $llm
+          | ( $spans | map(select(((.span_type // "") | ascii_upcase) == "AGENT")) | (.[0] // null) ) as $agent
+          | ( $spans | map(select(.parent_span_id == null)) | (.[0] // null) ) as $root
+
+          | ( mattr($i; "mlflow.trace.tokenUsage") ) as $ttok
+          | ( if $llm != null then sattr($llm; "mlflow.chat.tokenUsage") else null end ) as $stok
+          | ( (if ($ttok | type) == "object" then $ttok.input_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.input_tokens else null end) ) as $in_tok
+          | ( (if ($ttok | type) == "object" then $ttok.output_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.output_tokens else null end) ) as $out_tok
+
+          | ( if $llm != null then (sattr($llm; "gen_ai.request.model") // sattr($llm; "mlflow.chat.model")) else null end ) as $req_model
+          | ( if $llm != null then sattr($llm; "gen_ai.response.model") else null end ) as $resp_model
+          | ( if $llm != null then sattr($llm; "gen_ai.response.id") else null end ) as $resp_id
+          | ( if $llm != null then (sattr($llm; "gen_ai.system") // sattr($llm; "gen_ai.provider.name")) else null end ) as $provider
+          | ( if $agent != null then sattr($agent; "gen_ai.agent.name") else null end ) as $agent_name
+
+          | ( $i.state // "STATE_UNSPECIFIED" ) as $state
+          | ( if $state == "OK" then "success" elif $state == "ERROR" then "failure" else "unknown" end ) as $outcome
+          | ( $i.request_time ) as $rt
+          | ( mattr($i; "mlflow.trace.user") ) as $user_id
+          | ( mattr($i; "mlflow.trace.session") ) as $sess
+          | ( mattr($i; "mlflow.source.name") ) as $src_name
+          | ( $i.trace_location // {} ) as $loc
+          | ( $root.name // ($i.tags."mlflow.traceName") // "genai.trace" ) as $op
+
+          | {
+              ecs: { version: "9.5.0" },
+              "@timestamp": (if $rt != null then ($rt / 1000 | todateiso8601) else null end),
+
+              event: {
+                kind: "event",
+                category: [ "api" ],
+                type: [ "info" ],
+                outcome: $outcome,
+                action: $op,
+                id: $i.trace_id,
+                module: "mlflow",
+                dataset: "mlflow.genai_traces",
+                provider: "mlflow",
+                reason: (if $state == "ERROR" then ($root.status.message // "trace errored") else null end),
+                duration: (if $i.execution_duration != null then ($i.execution_duration * 1000000) else null end),
+                start: (if $rt != null then ($rt / 1000 | todateiso8601) else null end),
+                end: (if ($rt != null and $i.execution_duration != null)
+                      then (($rt + $i.execution_duration) / 1000 | todateiso8601) else null end)
+              },
+
+              gen_ai: {
+                operation: { name: ($op // "chat") },
+                provider: { name: $provider },
+                request: { model: $req_model },
+                response: { model: $resp_model, id: $resp_id },
+                usage: { input_tokens: $in_tok, output_tokens: $out_tok },
+                agent: { name: $agent_name }
+              },
+
+              user: (if $user_id != null then {
+                  id: $user_id,
+                  name: ($user_id | if test("@") then split("@")[0] else . end),
+                  email: (if ($user_id | test("@")) then $user_id else null end)
+                } else null end),
+
+              service: { name: ($src_name // "mlflow"), type: "mlflow" },
+
+              related: { user: (if $user_id != null then [ $user_id ] else [] end) },
+
+              # MLflow-specific detail with no ECS field home.
+              mlflow: {
+                trace_id: $i.trace_id,
+                state: $state,
+                experiment_id: $loc.mlflow_experiment.experiment_id,
+                session_id: $sess,
+                client_request_id: $i.client_request_id,
+                span_count: ($spans | length),
+                request_preview: $i.request_preview,
+                response_preview: $i.response_preview
+              },
+
+              labels: {
+                environment: $i.tags.environment,
+                trace_name: ($i.tags."mlflow.traceName")
+              }
+            }
+          | prune

@@ -1,0 +1,113 @@
+name: "Cloudflare DDoS Attack Analytics to ECS v9.5.0"
+description: "Maps Cloudflare DDoS Attack Analytics (dosdAttackAnalyticsGroups GraphQL) records into nested Elastic Common Schema (ECS) v9.5.0, covering event categorization, destination, network, rule, threat, cloud/observer, and related field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-ddos-attack-analytics"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "ddos-attack-analytics"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare DDoS Attack Analytics -> ECS v9.5.0 (nested).
+          # One dosdAttackAnalyticsGroups row (dimensions{} + sum{}) per
+          # invocation. A detected+mitigated DDoS attack ->
+          #   event.kind=alert, category=[network,intrusion_detection],
+          #   type=[denied,info], outcome=success (mitigation applied).
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string"
+            and (($s|test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) or ($s|test(":")));
+
+          . as $r
+          | ($r.dimensions // {}) as $d
+          | ($r.sum // {}) as $s
+          | ($d.destinationIP) as $dip
+          | ($d.direction) as $dir
+          | {
+            "@timestamp": $d.datetime,
+            "ecs": { "version": "9.5.0" },
+
+            "event": {
+              "kind": "alert",
+              "category": ["network", "intrusion_detection"],
+              "type": ["denied", "info"],
+              "outcome": "success",
+              "action": $d.action,
+              "start": $d.startDatetime,
+              "end": $d.endDatetime,
+              "provider": "dosd",
+              "module": "cloudflare_ddos"
+            },
+
+            "destination": {
+              "ip": (if is_ip($dip) then $dip else null end),
+              "address": $dip,
+              "port": $d.destinationPort
+            },
+            "source": {
+              "port": $d.sourcePort
+            },
+
+            "network": {
+              "transport": ($d.attackProtocol // $d.attackProtocolName
+                            | if . == null then null else ascii_downcase end),
+              "direction": (if $dir == "ingress" then "inbound"
+                            elif $dir == "egress" then "outbound"
+                            else $dir end),
+              "bytes": (if $s.bits == null then null else ($s.bits / 8 | floor) end),
+              "packets": $s.packets
+            },
+
+            "rule": {
+              "name": $d.attackType,
+              "category": $d.attackVector,
+              "ruleset": "Cloudflare L3/4 DDoS Managed Ruleset"
+            },
+
+            "threat": {
+              "tactic": { "name": "Impact" },
+              "technique": { "name": "Network Denial of Service", "id": "T1498" }
+            },
+
+            "cloud": {
+              "provider": "cloudflare",
+              "region": $d.coloCountry,
+              "service": { "name": "DDoS Protection" }
+            },
+
+            "observer": {
+              "vendor": "Cloudflare",
+              "product": "DDoS Protection",
+              "type": "ddos",
+              "geo": { "city_name": $d.coloCity, "country_iso_code": $d.coloCountry }
+            },
+
+            "cloudflare": {
+              "attack_id": $d.attackId,
+              "mitigation_type": $d.mitigationType,
+              "colo_city": $d.coloCity,
+              "dropped_packets": $s.droppedPackets,
+              "dropped_bits": $s.droppedBits,
+              "sample_interval": ($r.avg.sampleInterval),
+              "count": $r.count
+            },
+
+            "related": {
+              "ip": ([$dip] | map(select(is_ip(.))) | unique)
+            },
+
+            "message": ([ "Cloudflare mitigated ", ($d.attackType // "DDoS attack"),
+                          " (", ($d.attackVector // "unknown vector"), ") targeting ",
+                          ($dip // "target") ] | add)
+          }
+          # Single end-of-pipeline prune (ES rejects nulls/empties).
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                  elif type == "array" then map(select(. != null)) else . end )

@@ -1,0 +1,131 @@
+name: "AWS RDS Audit Logs to ECS v9.5.0"
+description: "Normalizes AWS RDS (MySQL / MariaDB) audit log records — the MariaDB Audit Plugin CSV line carried in the connector's message field — into Elastic Common Schema (ECS) v9.5.0 event, user, source, server, cloud, log and related fields, with the raw audit fields under the aws.rds.* namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-rds-audit-logs"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "rds"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS RDS Audit Logs -> ECS v9.5.0
+          # Input: one aws-rds-audit-logs record per invocation. The envelope
+          #   { engine, instance_id, log_file_name, message, region, source }
+          # carries the raw MariaDB Audit Plugin CSV line in `message`:
+          #   ts,serverhost,username,host,connectionid,queryid,
+          #     operation,database,object,retcode
+          # `object` may contain commas and is single-quoted, so it is grabbed
+          # greedily up to the final comma (retcode is always last).
+          # ---------------------------------------------------------------
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def as_num($s):
+            if ($s | type) == "string" and ($s | test("^-?[0-9]+$")) then ($s | tonumber) else null end;
+
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.message
+              | capture("^(?<ts>[^,]*),(?<serverhost>[^,]*),(?<username>[^,]*),(?<host>[^,]*),(?<connectionid>[^,]*),(?<queryid>[^,]*),(?<operation>[^,]*),(?<database>[^,]*),(?<object>.*),(?<retcode>[^,]*)$")
+            ) as $m
+          | ( ($m.object // "") | sub("^'"; "") | sub("'$"; "") | gsub("''"; "'") ) as $obj
+          | ( ($m.operation // "") | ascii_upcase ) as $op
+          | ( $m.retcode // "" ) as $ret
+
+          # ---- outcome ----------------------------------------------------
+          | ( if $ret == "0" then "success"
+              elif $ret == "" then "unknown"
+              else "failure" end ) as $outcome
+
+          # ---- event.category (ECS closed enum) --------------------------
+          #   CONNECT / FAILED_CONNECT -> authentication
+          #   DISCONNECT               -> session
+          #   everything else          -> database
+          | ( if ($op | test("^(CONNECT|FAILED_CONNECT)$")) then ["authentication"]
+              elif $op == "DISCONNECT" then ["session"]
+              else ["database"] end ) as $category
+
+          # ---- event.type (must be legal for the chosen category) --------
+          # database allows only: access, change, info, error. A generic
+          # QUERY is refined by its leading SQL verb; DML/DDL is a `change`,
+          # a read is `access`.
+          | ( if $category == ["authentication"] then ["start"]
+              elif $category == ["session"] then ["end"]
+              elif $outcome == "failure" then ["error"]
+              elif ($op | test("^(WRITE|CREATE|ALTER|RENAME|DROP|UPDATE)$")) then ["change"]
+              elif $op == "QUERY" and ($obj | test("^\\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|SET)"; "i")) then ["change"]
+              elif ($op | test("^(READ|QUERY)$")) then ["access"]
+              else ["info"] end ) as $type
+
+          | {
+              "@timestamp": ( try ($m.ts | strptime("%Y%m%d %H:%M:%S") | mktime | todateiso8601) catch null ),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "event",
+                module: "aws",
+                dataset: "aws.rds_audit",
+                provider: $r.engine,
+                action: ($op | ascii_downcase),
+                category: $category,
+                type: $type,
+                outcome: $outcome,
+                code: $ret
+              },
+
+              user: { name: $m.username },
+
+              source: {
+                address: $m.host,
+                ip: ( if is_ip($m.host) then $m.host else null end ),
+                domain: ( if is_ip($m.host) then null else $m.host end )
+              },
+
+              server: { address: $m.serverhost },
+
+              cloud: {
+                provider: "aws",
+                region: $r.region,
+                instance: { id: $r.instance_id }
+              },
+
+              log: { file: { path: $r.log_file_name } },
+
+              # Vendor namespace for the raw audit fields ECS has no home for.
+              aws: {
+                rds: {
+                  engine: $r.engine,
+                  instance_id: $r.instance_id,
+                  operation: $op,
+                  database: (if ($m.database // "") == "" then null else $m.database end),
+                  connection_id: as_num($m.connectionid),
+                  query_id: as_num($m.queryid),
+                  return_code: as_num($ret),
+                  query: (if $obj == "" then null else $obj end)
+                }
+              },
+
+              related: {
+                user: ( [ $m.username ] | map(select(. != null and . != "")) | unique ),
+                ip:   ( if is_ip($m.host) then [$m.host] else [] end )
+              }
+            }
+          | prune

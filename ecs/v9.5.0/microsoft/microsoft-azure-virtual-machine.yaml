@@ -1,0 +1,123 @@
+name: "Microsoft Azure Virtual Machine to ECS v9.5.0"
+description: "Normalizes Microsoft Azure Compute Virtual Machine (Get/List) inventory records into Elastic Common Schema (ECS) v9.5.0 asset-inventory fields (event, host, host.os, cloud, observer, related), modeling each record as a host asset snapshot."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-azure-virtual-machine"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "microsoft"
+  - "azure"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Microsoft Azure Virtual Machine -> ECS v9.5.0
+          #
+          # One VM record per invocation (Microsoft.Compute/virtualMachines
+          # Get or List item). A VM inventory record is an ASSET state
+          # report, so:
+          #   event.kind     = asset
+          #   event.category = [host]
+          #   event.type     = [info]   (host allows access/change/end/info/start)
+          #   event.outcome  = success  (provisioningState Succeeded) else unknown
+          # The VM Get/List body carries no IP (only NIC id references), so
+          # host.ip / related.ip stay empty.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$")
+                 or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.properties // {}) as $p
+          | (($r.id // "") | split("/")) as $idp
+          | ($p.storageProfile // {}) as $sp
+          | ($sp.imageReference // {}) as $img
+          | ($p.osProfile // {}) as $osp
+          | (($sp.osDisk.osType // "") | ascii_downcase) as $ostype
+          | ( $osp.computerName // $r.name ) as $host
+          | {
+              "@timestamp": ( $p.timeCreated // now ),
+
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "asset",
+                module: "azure",
+                dataset: "azure.vm",
+                category: ["host"],
+                type: ["info"],
+                outcome: ( if $p.provisioningState == "Succeeded" then "success"
+                           elif $p.provisioningState == "Failed" then "failure"
+                           else "unknown" end )
+              },
+
+              host: {
+                id: $p.vmId,
+                name: $host,
+                hostname: $host,
+                type: "vm",
+                os: {
+                  type: ( if $ostype == "" then null else $ostype end ),
+                  name: (
+                    [ $img.publisher, $img.offer, $img.sku ]
+                    | map(select(. != null and . != "")) | join(" ")
+                    | if . == "" then null else . end
+                  ),
+                  version: $img.exactVersion,
+                  full: (
+                    [ $img.publisher, $img.offer, $img.sku, $img.exactVersion ]
+                    | map(select(. != null and . != "")) | join(" ")
+                    | if . == "" then null else . end
+                  ),
+                  family: ( if $ostype == "" then null else $ostype end ),
+                  platform: ( if $ostype == "" then null else $ostype end )
+                }
+              },
+
+              cloud: {
+                provider: "azure",
+                region: $r.location,
+                availability_zone: ( $r.zones[0]? ),
+                account: { id: ( $idp[2]? ) },
+                instance: { id: $p.vmId, name: $r.name },
+                service: { name: "Azure Virtual Machines" }
+              },
+
+              observer: {
+                vendor: "Microsoft",
+                product: "Azure Virtual Machines",
+                type: "cloud"
+              },
+
+              related: {
+                hosts: ( [ $host, $r.name ] | map(select(. != null)) | unique ),
+                user:  ( [ $osp.adminUsername ] | map(select(. != null)) | unique )
+              },
+
+              labels: {
+                vm_size:            $p.hardwareProfile.vmSize,
+                provisioning_state: $p.provisioningState,
+                resource_group:     ( $idp[4]? ),
+                security_type:      $p.securityProfile.securityType
+              }
+            }
+          | prune

@@ -1,0 +1,69 @@
+name: "Snyk Project Metadata to ECS v9.5.0"
+description: "Transforms Snyk Project Metadata into Elastic Common Schema (ECS) v9.5.0 documents, populating event categorization (asset/package), the package.* field set, labels, and the snyk.* custom namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-projects"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "snyk"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk /projects record -> ECS v9.5.0 (nested). One record per call.
+          # event.kind: asset ; event.category: [package] ; type: [info]
+          # A Snyk project is an inventoried software asset (a scanned
+          # manifest), so it maps to an asset/package inventory document.
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else $ts end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | {
+              "@timestamp": (to_iso($a.created) // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "asset",
+                "category": [ "package" ],
+                "type": [ "info" ],
+                "id": $r.id,
+                "created": to_iso($a.created),
+                "provider": "snyk",
+                "module": "snyk",
+                "dataset": "snyk.projects"
+              },
+              "package": {
+                "name": $a.name,
+                "type": $a.type,
+                "reference": $a.target_file
+              },
+              "message": $a.name,
+              "labels": (
+                ( [ $a.tags[]? | select(.key != null) | { key: .key, value: (.value // "") } ]
+                  | from_entries )
+                // null
+              ),
+              "snyk": {
+                "project": {
+                  "origin": $a.origin,
+                  "status": $a.status,
+                  "target_file": $a.target_file,
+                  "target_reference": $a.target_reference,
+                  "business_criticality": $a.business_criticality,
+                  "environment": $a.environment,
+                  "lifecycle": $a.lifecycle,
+                  "read_only": $a.read_only
+                }
+              }
+            }
+            | walk( if type == "object" then with_entries(select(.value != null and .value != [] and .value != {} and .value != "")) else . end )

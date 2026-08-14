@@ -1,0 +1,112 @@
+name: "AWS Security Groups to ECS v9.5.0"
+description: "Normalizes AWS EC2 Security Group inventory records (from the aws-security-groups input connector) into Elastic Common Schema (ECS) v9.5.0 asset fields — event categorization, cloud.*, rule.* (the firewall ruleset), labels, and the aws.security_group.* vendor namespace with the ingress/egress rule sets serialized to JSON strings."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-groups"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "aws"
+  - "security-groups"
+  - "cloud-security"
+  - "asset"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # AWS Security Groups  ->  ECS v9.5.0  (asset inventory)
+          #
+          # Input: ONE EC2 SecurityGroup record per invocation (SDK/JSON
+          #   PascalCase): { GroupId, GroupName, Description, VpcId, OwnerId,
+          #   SecurityGroupArn, IpPermissions[], IpPermissionsEgress[], Tags[] }.
+          #
+          # A security group is a firewall RULESET, so it maps to ECS rule.*;
+          # the record is an inventory snapshot, so event.kind=asset,
+          # event.category=[configuration], event.type=[info]. It carries no
+          # event time of its own, so @timestamp is stamped at collection.
+          #
+          # The nested ingress/egress rule arrays are serialized to JSON
+          # STRINGS under aws.security_group.* (json_str) to keep Elasticsearch
+          # from mapping-exploding on the variable rule structure.
+          # =================================================================
+
+          # Serialize a nested value to a JSON string (mapping-explosion guard).
+          def json_str: if . == null then null else (. | tojson) end;
+
+          # Recursively drop null / {} / [] so the document stays compact. This
+          # is the single permitted recursive pass.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( ($r.SecurityGroupArn // "") | split(":") ) as $arn
+          | ( if ($arn | length) > 3 and ($arn[3] != "") then $arn[3] else null end ) as $region
+          | ( ($r.Tags // []) | map({ (.Key): .Value }) | add ) as $labels
+          | ( ($r.IpPermissions // [])
+              | map( ( (.IpRanges   // []) | map(.CidrIp   == "0.0.0.0/0") | any )
+                     or ( (.Ipv6Ranges // []) | map(.CidrIpv6 == "::/0")     | any ) )
+              | map(select(.)) | length ) as $world_open_ingress
+
+          | {
+              "@timestamp": (now | todateiso8601),
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: "asset",
+                category: ["configuration"],
+                type: ["info"],
+                module: "aws",
+                dataset: "aws.security_group",
+                provider: "ec2.amazonaws.com",
+                id: $r.GroupId,
+                action: "security-group-inventory"
+              },
+
+              cloud: {
+                provider: "aws",
+                region: $region,
+                account: { id: $r.OwnerId }
+              },
+
+              # A security group IS a firewall ruleset — the ECS rule.* set is
+              # its natural home.
+              rule: {
+                id: $r.GroupId,
+                name: $r.GroupName,
+                description: $r.Description,
+                ruleset: "AWS EC2 Security Groups",
+                category: "Network Security Group"
+              },
+
+              # AWS resource tags -> ECS labels (custom key/value object).
+              labels: $labels,
+
+              # Vendor namespace: the full detail, with the variable-shape rule
+              # arrays serialized to JSON strings.
+              aws: {
+                security_group: {
+                  arn: $r.SecurityGroupArn,
+                  group_id: $r.GroupId,
+                  group_name: $r.GroupName,
+                  vpc_id: $r.VpcId,
+                  owner_id: $r.OwnerId,
+                  ingress_rule_count: (($r.IpPermissions // []) | length),
+                  egress_rule_count: (($r.IpPermissionsEgress // []) | length),
+                  world_open_ingress_rule_count: $world_open_ingress,
+                  ip_permissions: ($r.IpPermissions | json_str),
+                  ip_permissions_egress: ($r.IpPermissionsEgress | json_str)
+                }
+              }
+            }
+          | prune

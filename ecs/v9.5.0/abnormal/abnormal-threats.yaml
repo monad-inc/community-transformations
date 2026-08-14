@@ -1,0 +1,111 @@
+name: "Abnormal Security Threats to ECS v9.5.0"
+description: "Maps Abnormal Security threat (malicious email) records into Elastic Common Schema (ECS) v9.5.0, covering the email.*, event.*, source.*, related.*, threat.* and rule.* field sets."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-threats"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "abnormal"
+  - "threats"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Abnormal Security threat -> ECS v9.5.0 (nested).
+          # event.kind=alert (a detected malicious email); categories
+          # email + intrusion_detection, type info (valid for both).
+          # One construction pass; single walk-prune at the end.
+          # ---------------------------------------------------------------
+          def is_ip($s): ($s|type)=="string"
+            and ($s|test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$|:"));
+
+          . as $r
+          | ($r.senderIpAddress // null) as $sip
+          | {
+              "@timestamp": $r.receivedTime,
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "alert",
+                "category": ["email", "intrusion_detection"],
+                "type": ["info"],
+                "outcome": "success",
+                "id": $r.threatId,
+                "provider": "abnormal-security",
+                "module": "abnormal",
+                "dataset": "abnormal.threats",
+                "action": $r.remediationStatus,
+                "severity": 73,
+                "reference": $r.abxPortalUrl,
+                "original": ($r | tostring)
+              },
+
+              "email": {
+                "message_id":          $r.internetMessageId,
+                "subject":             $r.subject,
+                "direction":           "inbound",
+                "local_id":            $r.threatId,
+                "origination_timestamp": $r.sentTime,
+                "delivery_timestamp":  $r.receivedTime,
+                "from":    { "address": (if ($r.fromAddress // "") != "" then [$r.fromAddress] else null end) },
+                "sender":  { "address": $r.fromAddress },
+                "to":      { "address": ($r.toAddresses // null) },
+                "cc":      { "address": ($r.ccEmails // null) },
+                "reply_to":{ "address": ($r.replyToEmails // null) },
+                "attachments": (
+                  [ ($r.attachmentNames // [])[] | select(. != null and . != "")
+                    | { "file": { "name": . } } ]
+                )
+              },
+
+              "source": (if is_ip($sip) then { "ip": $sip, "address": $sip } else null end),
+
+              "threat": {
+                "indicator": {
+                  "type": "email-addr",
+                  "email": { "address": $r.fromAddress }
+                },
+                "tactic": { "name": $r.attackStrategy },
+                "software": { "type": $r.attackType }
+              },
+
+              "rule": {
+                "name": $r.attackType,
+                "category": $r.attackVector,
+                "ruleset": "Abnormal Inbound Email Security"
+              },
+
+              "related": {
+                "user": (
+                  [ $r.recipientAddress, $r.fromAddress ]
+                  + ($r.toAddresses // []) + ($r.ccEmails // [])
+                  | map(select(. != null and . != "")) | unique
+                ),
+                "ip": ( [ $sip ] | map(select(is_ip(.))) | unique ),
+                "hosts": ( [ ($r.fromAddress // "" | split("@")[1]) ] | map(select(. != null and . != "")) | unique )
+              },
+
+              "abnormal": {
+                "threat_id":        $r.threatId,
+                "abx_message_id":   $r.abxMessageIdStr,
+                "attack_type":      $r.attackType,
+                "attack_strategy":  $r.attackStrategy,
+                "attack_vector":    $r.attackVector,
+                "attacked_party":   $r.attackedParty,
+                "impersonated_party": $r.impersonatedParty,
+                "remediation_status": $r.remediationStatus,
+                "auto_remediated":  $r.autoRemediated,
+                "post_remediated":  $r.postRemediated,
+                "url_count":        $r.urlCount,
+                "attachment_count": $r.attachmentCount,
+                "summary_insights": $r.summaryInsights,
+                "urls":             $r.urls
+              }
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)

@@ -1,0 +1,70 @@
+name: "Anthropic Compliance Users to ECS v9.5.0"
+description: "Maps Anthropic Compliance API organization-user directory records into an Elastic Common Schema (ECS) v9.5.0 document (event, user, organization, related field sets) as an IAM user asset snapshot."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-users"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "ai"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Compliance API — organization users -> ECS v9.5.0
+          # Source: GET /v1/compliance/organizations/{org_uuid}/users
+          # One user directory record -> one nested ECS document.
+          #
+          # This is a directory/inventory snapshot, so:
+          #   event.kind     = asset
+          #   event.category = [iam]
+          #   event.type     = [user, info]   (both legal iam types)
+          #   event.outcome  = success
+          # Documented fields: id, full_name, email, organization_role,
+          # created_at (+ organization_uuid from the same API).
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.full_name // $r.email // $r.id) as $uname
+          | { "@timestamp": ($r.created_at // (now | todateiso8601)),
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "asset",
+                category: ["iam"],
+                type: ["user", "info"],
+                outcome: "success",
+                action: "organization-user-listed",
+                provider: "anthropic-compliance",
+                module: "anthropic",
+                dataset: "anthropic.compliance_users",
+                id: $r.id,
+                created: $r.created_at
+              },
+              user: {
+                id: $r.id,
+                name: ($r.email // $r.id),
+                full_name: $r.full_name,
+                email: $r.email,
+                roles: (if ($r.organization_role // "") != "" then [$r.organization_role] else null end)
+              },
+              organization: {
+                id: $r.organization_uuid
+              },
+              related: {
+                user: ([$r.email, $r.id, $r.full_name] | map(select(. != null and . != "")) | unique)
+              }
+            }
+          # single end-of-pipeline prune: drop null / {} / [] (ES rejects nulls)
+          | walk(if type == "object"
+                 then with_entries(select(
+                        (.value != null) and (.value != "")
+                        and ((((.value|type)=="array") and ((.value|length)==0))|not)
+                        and ((((.value|type)=="object") and ((.value|length)==0))|not)))
+                 else . end)

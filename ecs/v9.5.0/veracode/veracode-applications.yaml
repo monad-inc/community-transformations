@@ -1,0 +1,103 @@
+name: "Veracode Applications to ECS v9.5.0"
+description: "Maps Veracode Applications API records (application inventory and policy-compliance posture) into a nested Elastic Common Schema (ECS) v9.5.0 document, covering event categorization (configuration/info state), service.*, organization.*, related.*, and vendor labels."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "veracode-applications"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "veracode"
+  - "applications"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Veracode Applications -> ECS v9.5.0 (nested).
+          # Application posture snapshot: event.kind=state,
+          # event.category=[configuration], event.type=[info],
+          # event.outcome from policy compliance. One jq pass, single prune.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.profile // {}) as $p
+          | (($p.policies // []) | .[0]) as $pol
+          | ($pol.policy_compliance_status // null) as $pcs
+          | (($p.business_owners // []) | .[0]) as $owner
+          | ( { "PASSED": "success", "DID_NOT_PASS": "failure",
+                "CONDITIONAL_PASS": "success", "VENDOR_REVIEW": "unknown",
+                "NOT_ASSESSED": "unknown", "DETERMINE_FROM_APPLICATION": "unknown"
+              }[$pcs // ""] // "unknown" ) as $outcome
+          | ( ($p.tags // "") | if . == "" then [] else (split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))) end ) as $taglist
+          | {
+              "@timestamp": ( $r.modified // $r.last_completed_scan_date // $r.created ),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "state",
+                "category": [ "configuration" ],
+                "type": [ "info" ],
+                "outcome": $outcome,
+                "id": $r.guid,
+                "url": $r.app_profile_url,
+                "reference": $r.results_url,
+                "created": $r.created,
+                "module": "veracode",
+                "dataset": "veracode.applications",
+                "provider": "Veracode Application Security",
+                "severity": ( { "VERY_HIGH": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "VERY_LOW": 1 }[$p.business_criticality // ""] // 0 )
+              },
+
+              "service": {
+                "name": $p.name,
+                "id":   $r.guid,
+                "type": "veracode-application",
+                "state": $pcs
+              },
+
+              "organization": {
+                "id":   ( $r.oid // $r.organization_id | tostring ),
+                "name": ( ($p.business_unit // {}).name )
+              },
+
+              "user": ( if $owner != null then {
+                  "name":      $owner.name,
+                  "full_name": $owner.name,
+                  "email":     $owner.email
+                } else null end ),
+
+              "message": ( "Application \"" + ($p.name // "unknown")
+                           + "\" (" + ($p.business_criticality // "UNKNOWN")
+                           + " criticality) policy compliance: "
+                           + ($pcs // "UNKNOWN") ),
+
+              "tags": ( if ($taglist | length) > 0 then $taglist else null end ),
+
+              "labels": {
+                "business_criticality":   $p.business_criticality,
+                "policy_name":            $pol.name,
+                "policy_compliance_status": $pcs,
+                "business_unit":          ( ($p.business_unit // {}).name ),
+                "archer_app_name":        $p.archer_app_name,
+                "sca_enabled":            ( $p.sca_enabled | tostring )
+              },
+
+              "related": {
+                "user": ( [ $owner.name, $owner.email ] | map(select(. != null)) | unique )
+              },
+
+              "veracode": {
+                "application_id": ( $r.id | tostring ),
+                "last_completed_scan_date": $r.last_completed_scan_date,
+                "scans": ( ($r.scans // []) | tojson )
+              }
+            }
+          # Single end-of-pipeline prune: ES rejects nulls; drop empties.
+          | walk( if type == "object" then
+                    with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                  elif type == "array" then
+                    map(select(. != null))
+                  else . end )

@@ -1,0 +1,153 @@
+name: "Anthropic Claude Code (OTLP) to ECS v9.5.0"
+description: "Normalizes one OTLP log record from Claude Code into the Elastic Common Schema (ECS) v9.5.0, populating the event categorization (event.kind/category/type/outcome), the native gen_ai.* field set (provider, request/response model, token usage), and user, organization, service, host, and related fields. LLM api_request/api_error map to event.category api; tool_result, auth, and MCP connections map to their ECS homes."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-claude-code"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "ai"
+  - "gen_ai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Anthropic Claude Code RAW OTLP logs -> ECS v9.5.0
+          # One OTLP envelope in -> one nested ECS document per logRecord.
+          # (This sample carries a single logRecord; .[0] is validated.)
+          #
+          # Categorization:
+          #   api_request/api_error/api_refusal -> event.category ["api"],
+          #        type ["info"] (+ "start" on request), gen_ai.* usage block
+          #   tool_result                       -> event.category ["process"]
+          #   auth                              -> event.category ["authentication"]
+          #   mcp_server_connection             -> event.category ["network"]
+          #   (other)                           -> event.kind "event", no category
+          # =================================================================
+
+          def to_iso($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else $ts end;
+          def nano2iso($n):
+            if $n == null or $n == "" then null
+            else ((($n | tonumber) / 1000000000 | floor) | todateiso8601) end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+          def is_ip($s): ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test(":"));
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+
+          [ (.resourceLogs // [])[] as $rl
+            | kv($rl.resource.attributes) as $res
+            | ($rl.scopeLogs // [])[] as $sl
+            | ($sl.logRecords // [])[] as $lr
+            | ($res + kv($lr.attributes)) as $r
+            | ( ($lr.body.stringValue) as $b
+                | if ($b != null and ($b | startswith("claude_code."))) then $b
+                  elif (($r["event.name"]) // "") != "" then ("claude_code." + $r["event.name"])
+                  else ($b // "claude_code.unknown") end ) as $en
+            | ($en | ltrimstr("claude_code.")) as $short
+            | (if (($r["event.timestamp"]) // "") != "" then to_iso($r["event.timestamp"])
+               else nano2iso($lr.timeUnixNano) end) as $ts
+
+            # ---- categorization by event ----
+            | (if ($en == "claude_code.api_request" or $en == "claude_code.api_error"
+                   or $en == "claude_code.api_refusal" or $en == "claude_code.api_retries_exhausted"
+                   or $en == "claude_code.user_prompt") then
+                 { kind: "event", category: ["api"],
+                   type: (if $en == "claude_code.api_request" then ["start","info"] else ["info"] end) }
+               elif $en == "claude_code.tool_result" then
+                 { kind: "event", category: ["process"], type: ["info"] }
+               elif $en == "claude_code.tool_decision" then
+                 { kind: "event", category: ["process"], type: ["info"] }
+               elif $en == "claude_code.auth" then
+                 { kind: "event", category: ["authentication"], type: ["info"] }
+               elif $en == "claude_code.mcp_server_connection" then
+                 { kind: "event", category: ["network"], type: ["connection","info"] }
+               elif ($en == "claude_code.plugin_installed" or $en == "claude_code.plugin_loaded") then
+                 { kind: "event", category: ["package"], type: ["installation","info"] }
+               elif $en == "claude_code.internal_error" then
+                 { kind: "event", category: ["process"], type: ["error"] }
+               else { kind: "event" } end) as $cat
+
+            | ( if $en == "claude_code.api_error" or $en == "claude_code.api_refusal"
+                     or $en == "claude_code.internal_error" then "failure"
+                elif ($r["success"] != null) then (if truthy($r["success"]) then "success" else "failure" end)
+                elif ($r["status"] == "failed") then "failure"
+                else "success" end ) as $outcome
+
+            | (($r["input_tokens"] // 0) + ($r["output_tokens"] // 0)
+               + ($r["cache_read_tokens"] // 0) + ($r["cache_creation_tokens"] // 0)) as $total_tokens
+
+            | { "@timestamp": $ts,
+                ecs: { version: "9.5.0" },
+                event: {
+                  kind: $cat.kind,
+                  category: $cat.category,
+                  type: $cat.type,
+                  outcome: $outcome,
+                  action: $short,
+                  module: "claude_code",
+                  provider: "anthropic",
+                  sequence: $r["event.sequence"],
+                  id: ($r["request_id"] // $r["prompt.id"] // $r["session.id"]),
+                  duration: (if $r["duration_ms"] != null then (($r["duration_ms"] | tonumber) * 1000000) else null end)
+                },
+                gen_ai: (if ($r["model"] // "") != "" or $r["input_tokens"] != null then
+                  { provider: { name: "anthropic" },
+                    operation: { name: $short },
+                    request: { model: $r["model"] },
+                    response: { model: $r["model"], id: $r["request_id"] },
+                    usage: { input_tokens: $r["input_tokens"], output_tokens: $r["output_tokens"] } }
+                  else null end),
+                user: (if ($r["user.email"] // $r["user.id"] // $r["user.account_uuid"]) != null then
+                  { email: $r["user.email"], id: ($r["user.account_uuid"] // $r["user.id"]),
+                    name: $r["user.email"] } else null end),
+                organization: (if ($r["organization.id"] // "") != "" then { id: $r["organization.id"] } else null end),
+                service: { name: ($r["service.name"] // "claude-code"),
+                           version: ($r["app.version"] // $r["service.version"]),
+                           type: "ai_assistant" },
+                host: (if ($r["terminal.type"] // "") != "" then { name: $r["terminal.type"] } else null end),
+                session: (if ($r["session.id"] // "") != "" then { id: $r["session.id"] } else null end),
+                error: (if ($r["error"] // $r["error_type"] // $r["error_name"]) != null then
+                  { message: $r["error"], type: ($r["error_type"] // $r["error_name"]),
+                    code: (if $r["status_code"] != null then ($r["status_code"] | tostring) else $r["error_code"] end) }
+                  else null end),
+                file: (if ($en == "claude_code.tool_result") and (($r["tool_name"] // "") != "") then
+                  { name: $r["tool_name"] } else null end),
+                labels: ( { model: $r["model"],
+                            query_source: $r["query_source"],
+                            terminal_type: $r["terminal.type"],
+                            total_tokens: (if $total_tokens > 0 then ($total_tokens | tostring) else null end),
+                            cost_usd: (if $r["cost_usd"] != null then ($r["cost_usd"] | tostring) else null end),
+                            tool_name: $r["tool_name"] }
+                          | with_entries(select(.value != null and .value != "")) ),
+                related: { user: ([ $r["user.email"], $r["user.id"], $r["user.account_uuid"] ]
+                                  | map(select(. != null and . != "")) | unique) }
+              }
+          ][0]
+
+          # single end-of-pipeline prune: drop null / {} / [] leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value|type)=="array") and ((.value|length)==0))|not)
+                        and ((((.value|type)=="object") and ((.value|length)==0))|not)))
+                 elif type == "array" then map(select(. != null))
+                 else . end)

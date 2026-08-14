@@ -1,0 +1,94 @@
+name: "Cloudflare Rulesets to ECS v9.5.0"
+description: "Maps Cloudflare Rulesets inventory records into Elastic Common Schema (ECS) v9.5.0 nested documents, covering event categorization (asset/configuration), the rule.* field set, cloud.*, and a cloudflare.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-rulesets"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "rulesets"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Rulesets -> ECS v9.5.0 (nested).
+          # An inventory snapshot of a WAF/firewall ruleset:
+          #   event.kind=asset, category=configuration, type=info.
+          # One jq pass, bind-once, single trailing prune.
+          # ---------------------------------------------------------------
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.rules // []) as $rules
+          | {
+              "@timestamp": ($r.last_updated // (now | todateiso8601)),
+              "ecs": { "version": "9.5.0" },
+
+              "event": {
+                "kind": "asset",
+                "category": ["configuration"],
+                "type": ["info"],
+                "outcome": "unknown",
+                "id": $r.id,
+                "action": "ruleset-inventory",
+                "provider": "cloudflare",
+                "module": "cloudflare",
+                "dataset": "cloudflare.rulesets"
+              },
+
+              "message": ($r.description // $r.name),
+
+              # The ruleset mapped onto the ECS rule.* field set.
+              "rule": {
+                "id": $r.id,
+                "name": $r.name,
+                "description": $r.description,
+                "ruleset": $r.name,
+                "category": $r.phase,
+                "version": $r.version
+              },
+
+              "cloud": {
+                "provider": "cloudflare",
+                "account": { "id": ($r.account_id // $r.zone_id) }
+              },
+
+              "labels": {
+                "ruleset_kind": $r.kind,
+                "ruleset_phase": $r.phase
+              },
+
+              # Vendor namespace (ECS allows unknown top-level namespaces for
+              # custom data). Nested rules serialized to a JSON string to avoid
+              # Elasticsearch mapping explosion.
+              "cloudflare": {
+                "ruleset": {
+                  "id": $r.id,
+                  "name": $r.name,
+                  "kind": $r.kind,
+                  "phase": $r.phase,
+                  "version": $r.version,
+                  "source": $r.source,
+                  "zone_id": $r.zone_id,
+                  "account_id": $r.account_id,
+                  "rule_count": ($rules | length),
+                  "rules": ($rules | tojson)
+                }
+              },
+
+              "tags": (["cloudflare", "ruleset", $r.kind] | map(select(. != null)))
+            }
+          | prune

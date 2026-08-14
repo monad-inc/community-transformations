@@ -1,0 +1,90 @@
+name: "Snyk Scan Targets to ECS v9.5.0"
+description: "Transforms Snyk Scan Target (source/repo inventory) records into Elastic Common Schema (ECS) v9.5.0 documents, populating event categorization (asset/configuration), the url.* and organization.* field sets, related.* aggregation, and a snyk.target.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-targets"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "snyk"
+  - "targets"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk /orgs/{org_id}/targets record -> ECS v9.5.0 (nested).
+          # One record per invocation. A "target" is a scanned source
+          # (repo / container registry / etc.) inventoried by Snyk.
+          # event.kind: asset ; event.category: [configuration] ; type: [info]
+          # ---------------------------------------------------------------
+          def to_iso($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | todateiso8601)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601 | todateiso8601)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($r.relationships // {}) as $rel
+          | ($rel.integration.data.attributes.integration_type) as $itype
+          | ($rel.organization.data.id) as $org_id
+          | ($a.url // "") as $url
+          | ( ($url | ltrimstr("https://") | ltrimstr("http://") | split("/") | .[0]) // "" ) as $host
+          | ( ($itype // ($host | ascii_downcase
+                | if contains("github") then "github"
+                  elif contains("gitlab") then "gitlab"
+                  elif contains("bitbucket") then "bitbucket"
+                  elif (contains("azure") or contains("visualstudio")) then "azure-repos"
+                  else . end)) ) as $provider0
+          | ( if ($provider0 // "") == "" then null else $provider0 end ) as $provider
+          | ( if $host == "" then null else ($url | ltrimstr("https://") | ltrimstr("http://") | ltrimstr($host)) end ) as $path
+          | {
+              "@timestamp": ( to_iso($a.created_at) // (now | todateiso8601) ),
+              "ecs": { "version": "9.5.0" },
+              "event": {
+                "kind": "asset",
+                "category": [ "configuration" ],
+                "type": [ "info" ],
+                "outcome": "unknown",
+                "id": $r.id,
+                "created": to_iso($a.created_at),
+                "action": "scan-target-inventory",
+                "provider": "snyk",
+                "module": "snyk",
+                "dataset": "snyk.targets"
+              },
+              "url": {
+                "full": ( if $url == "" then null else $url end ),
+                "original": ( if $url == "" then null else $url end ),
+                "domain": ( if $host == "" then null else $host end ),
+                "path": ( if ($path // "") == "" then null else $path end )
+              },
+              "organization": {
+                "id": $org_id
+              },
+              "message": $a.display_name,
+              "tags": (
+                [ $provider, ( if $a.is_private == true then "private" elif $a.is_private == false then "public" else null end ) ]
+                | map(select(. != null))
+              ),
+              "related": {
+                "hosts": ( [ $host ] | map(select(. != null and . != "")) | unique )
+              },
+              "snyk": {
+                "target": {
+                  "id": $r.id,
+                  "display_name": $a.display_name,
+                  "is_private": $a.is_private,
+                  "source_type": $provider,
+                  "url": ( if $url == "" then null else $url end ),
+                  "integration_id": $rel.integration.data.id,
+                  "created_at": $a.created_at
+                }
+              }
+            }
+            | walk( if type == "object" then with_entries(select(.value != null and .value != [] and .value != {} and .value != "")) else . end )

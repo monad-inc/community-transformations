@@ -1,0 +1,167 @@
+name: "Cloudflare HTTP Requests to ECS v9.5.0"
+description: "Normalizes Cloudflare HTTP Requests (Logpush http_requests) records into Elastic Common Schema (ECS) v9.5.0 fields (event, source, destination, url, http, user_agent, network, tls, rule, related) plus a cloudflare.* namespace for edge/WAF/bot signals."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-http-requests"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "cloudflare"
+  - "http-requests"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # Cloudflare HTTP Requests  ->  ECS v9.5.0
+          # Input: ONE Cloudflare Logpush `http_requests` record per invocation.
+          #
+          #   .EdgeStartTimestamp     -> @timestamp
+          #   .ClientRequestMethod    -> http.request.method / event.action
+          #   .ClientRequest*         -> url.* / http.request.*
+          #   .EdgeResponseStatus     -> http.response.status_code / event.outcome
+          #   .ClientIP               -> source.ip (+ geo/as)
+          #   .OriginIP               -> destination.ip
+          #   .SecurityAction/Rule*   -> event.kind(alert) + rule.*
+          # One jq construction pass; single end-of-pipeline prune.
+          # =================================================================
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( ($r.EdgeResponseStatus // 0) | if type == "string" then tonumber else . end ) as $status
+          | ( ($r.SecurityAction // "") | ascii_downcase ) as $sec_action
+          | ( ($sec_action | test("block|challenge|drop|jschallenge|managed_challenge")) ) as $is_security
+          | ( if $is_security then "alert" else "event" end ) as $kind
+          | ( if $is_security or $status >= 400 then "failure"
+              elif $status > 0 then "success"
+              else "unknown" end ) as $outcome
+          | ( if $status >= 400 then ["error"] else ["access"] end ) as $etype
+
+          | {
+              "@timestamp": $r.EdgeStartTimestamp,
+              ecs: { version: "9.5.0" },
+
+              event: {
+                kind: $kind,
+                module: "cloudflare",
+                dataset: "cloudflare.http_requests",
+                provider: "cloudflare",
+                id: $r.RayID,
+                action: ( if $sec_action != "" then $sec_action else "http_request" end ),
+                category: ["web"],
+                type: $etype,
+                outcome: $outcome
+              },
+
+              source: {
+                ip: ( if is_ip($r.ClientIP) then $r.ClientIP else null end ),
+                address: $r.ClientIP,
+                port: $r.ClientSrcPort,
+                bytes: $r.ClientRequestBytes,
+                as: { number: $r.ClientASN },
+                geo: {
+                  country_iso_code: ( $r.ClientCountry | if . == null then null else ascii_upcase end ),
+                  city_name: $r.ClientCity,
+                  region_iso_code: ( if $r.ClientCountry != null and $r.ClientRegionCode != null
+                                     then (($r.ClientCountry | ascii_upcase) + "-" + $r.ClientRegionCode)
+                                     else null end )
+                }
+              },
+
+              destination: {
+                ip: ( if is_ip($r.OriginIP) then $r.OriginIP else null end ),
+                address: $r.OriginIP,
+                bytes: $r.EdgeResponseBytes
+              },
+
+              url: {
+                domain: $r.ClientRequestHost,
+                path: $r.ClientRequestPath,
+                scheme: $r.ClientRequestScheme,
+                original: $r.ClientRequestURI,
+                query: ( if ($r.ClientRequestURI // "") | test("\\?")
+                         then ($r.ClientRequestURI | sub("^[^?]*\\?"; "")) else null end ),
+                full: ( if $r.ClientRequestScheme != null and $r.ClientRequestHost != null and $r.ClientRequestURI != null
+                        then ($r.ClientRequestScheme + "://" + $r.ClientRequestHost + $r.ClientRequestURI)
+                        else null end )
+              },
+
+              http: {
+                version: ( $r.ClientRequestProtocol | if . == null then null else sub("^HTTP/"; "") end ),
+                request: {
+                  method: $r.ClientRequestMethod,
+                  bytes: $r.ClientRequestBytes,
+                  referrer: $r.ClientRequestReferer
+                },
+                response: {
+                  status_code: ( if $status > 0 then $status else null end ),
+                  bytes: $r.EdgeResponseBytes,
+                  mime_type: $r.EdgeResponseContentType,
+                  body: { bytes: $r.EdgeResponseBodyBytes }
+                }
+              },
+
+              user_agent: { original: $r.ClientRequestUserAgent },
+
+              network: {
+                protocol: $r.ClientRequestScheme,
+                transport: "tcp"
+              },
+
+              tls: {
+                client: { ja3: $r.JA3Hash }
+              },
+
+              rule: {
+                id: $r.SecurityRuleID,
+                description: $r.SecurityRuleDescription,
+                ruleset: ( $r.SecuritySources // [] | join(",") | if . == "" then null else . end )
+              },
+
+              observer: {
+                vendor: "Cloudflare",
+                product: "Cloudflare",
+                type: "waf"
+              },
+
+              cloud: { provider: "cloudflare" },
+
+              related: {
+                ip: ( [ ( if is_ip($r.ClientIP) then $r.ClientIP else null end ),
+                        ( if is_ip($r.OriginIP) then $r.OriginIP else null end ) ]
+                      | map(select(. != null)) | unique )
+              },
+
+              cloudflare: {
+                ray_id: $r.RayID,
+                zone_name: $r.ZoneName,
+                edge_colo_code: $r.EdgeColoCode,
+                cache_status: $r.CacheCacheStatus,
+                client_device_type: $r.ClientDeviceType,
+                security_action: $r.SecurityAction,
+                waf_attack_score: $r.WAFAttackScore,
+                waf_sqli_score: $r.WAFSQLiAttackScore,
+                waf_xss_score: $r.WAFXSSAttackScore,
+                waf_rce_score: $r.WAFRCEAttackScore,
+                bot_score: $r.BotScore,
+                bot_score_src: $r.BotScoreSrc,
+                ja4: $r.JA4
+              }
+            }
+          | prune

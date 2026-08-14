@@ -1,0 +1,102 @@
+name: "Anthropic Claude.ai Chat Messages to ECS v9.5.0"
+description: "Transforms Anthropic Compliance API chat message records (anthropic-chat-messages) into a nested Elastic Common Schema (ECS) v9.5.0 document, populating event categorization (api), the gen_ai.* field set, user.*, organization.*, related.*, and an anthropic.* vendor namespace."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-chat-messages"
+tags:
+  - "v9.5.0"
+  - "ecs"
+  - "anthropic"
+  - "ai"
+  - "gen_ai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # Anthropic Compliance API chat message -> ECS v9.5.0 (nested).
+          # One message record in -> one nested ECS document out.
+          #
+          # Categorization: event.kind=event, event.category=[api],
+          # event.type=[info], event.outcome=success. The gen_ai.* field set
+          # carries the AI-native details; content is serialized to JSON
+          # strings (flattened fields) so nested objects never masquerade as
+          # unknown ECS fields. Conversation/org metadata that has no ECS home
+          # lives under the anthropic.* vendor namespace.
+          # -----------------------------------------------------------------
+          . as $r
+          | ($r.chat_user // {}) as $cu
+          | ($r.role // "unknown") as $role
+          | ($cu.email_address // "") as $email
+          | (if ($email | index("@")) != null then ($email | split("@")[0]) else null end) as $uname
+          | (if ($email | index("@")) != null then ($email | split("@")[1]) else null end) as $udomain
+          | ([ ($r.content // [])[]? | .type ] | map(select(. != null)) | unique) as $ctypes
+          | ([ ($r.content // [])[]? | select(.type == "text") | .text ]
+             | map(select(. != null)) | join("\n")) as $text
+          | (($r.content // []) | if length > 0 then tojson else null end) as $content_json
+
+          | {
+              "@timestamp": $r.created_at,
+              ecs: { version: "9.5.0" },
+              event: {
+                kind: "event",
+                category: ["api"],
+                type: ["info"],
+                outcome: "success",
+                action: "chat-message",
+                id: $r.id,
+                provider: "anthropic",
+                module: "anthropic",
+                dataset: "anthropic.chat_messages",
+                created: $r.created_at
+              },
+              user: {
+                id: $cu.id,
+                name: (if ($uname // "") != "" then $uname else null end),
+                email: (if $email != "" then $email else null end),
+                domain: $udomain
+              },
+              organization: {
+                id: $r.organization_id
+              },
+              message: (if ($text | length) > 1024 then ($text[0:1024]) else (if $text == "" then null else $text end) end),
+              gen_ai: {
+                provider: { name: "anthropic" },
+                operation: { name: "chat" },
+                response: { id: $r.id },
+                output: { type: ($ctypes | if length > 0 then .[0] else null end) },
+                input: { messages: (if $role == "human" then $content_json else null end) },
+                agent: (if $role == "assistant" then { name: "Claude" } else null end)
+              },
+              related: {
+                user: ([ (if ($uname // "") != "" then $uname else null end),
+                         (if $email != "" then $email else null end) ]
+                       | map(select(. != null)) | unique)
+              },
+              anthropic: {
+                message: { id: $r.id, role: $role },
+                chat: { id: $r.chat_id, name: $r.chat_name },
+                project: { id: $r.project_id },
+                organization: { uuid: $r.organization_uuid },
+                content: {
+                  types: ($ctypes | join(",")),
+                  char_count: (if ($text | length) > 0 then ($text | length) else null end)
+                },
+                file_count: (($r.files // []) | length),
+                artifact_count: (($r.artifacts // []) | length),
+                output_messages: (if $role == "assistant" then $content_json else null end)
+              }
+            }
+
+          # single end-of-pipeline recursive prune: drop null / {} / [] leaves
+          | walk(if type == "object"
+                 then with_entries(select(
+                        (.value != null)
+                        and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)
