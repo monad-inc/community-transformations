@@ -1,0 +1,91 @@
+name: "Anthropic Compliance Organizations to OCSF v1.9.0"
+description: "Transforms Anthropic Compliance API organization directory records (List organizations endpoint) into OCSF v1.9.0 Entity Management (3004) events. Each organization snapshot maps to a Read activity on a managed Organization entity."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-organizations"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "iam"
+  - "compliance"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # Anthropic Compliance API - List organizations -> OCSF v1.9.0
+          # One organization record in -> one Entity Management (3004) event.
+          #
+          # The connector polls a complete snapshot of every linked
+          # organization on each sync run; each record is a read of an
+          # existing managed entity, so:
+          #   category_uid 3 (IAM) / class_uid 3004 / activity_id 2 (Read)
+          #   type_uid = 3004 * 100 + 2 = 300402
+          # The entity is a managed Organization (managed_entity.type_id 4),
+          # so the org attribute is populated per the OCSF managed_entity spec.
+          #
+          # Source fields (all documented): uuid, name, created_at.
+          # created_at (org creation, ISO-8601) -> time.
+          # -----------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+
+          . as $r
+          | (to_epoch($r.created_at)) as $time
+          | ({ name: $r.name, uid: $r.uuid }) as $org
+          | ({
+              time: ($time // 0),
+              category_uid: 3,
+              class_uid: 3004,
+              activity_id: 2,
+              type_uid: 300402,
+              severity_id: 1,
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Anthropic",
+                  name: "Claude Compliance API",
+                  feature: { name: "compliance/organizations" }
+                },
+                log_name: "compliance.organizations",
+                tenant_uid: $r.uuid,
+                # cloud + osint are required on every IAM/Discovery class in the
+                # OCSF 1.9.0 schema; declare both profiles so the populated
+                # cloud/osint attributes are recognized by the OCSF validator.
+                profiles: [ "cloud", "osint" ]
+              },
+              entity: {
+                type_id: 4,
+                type: "Organization",
+                name: $r.name,
+                uid: $r.uuid,
+                org: $org
+              },
+              # cloud is required on this class in OCSF 1.9.0; Anthropic is the
+              # SaaS/cloud provider the organization is hosted under.
+              cloud: { provider: "Anthropic" },
+              # osint is required on this class in OCSF 1.9.0; the source carries
+              # no OSINT indicators, so the org UUID is surfaced as an Other-type
+              # reference value to satisfy the required-array invariant.
+              osint: [ { type_id: 99, value: $r.uuid } ],
+              status_id: 1,
+              status: "Success",
+              observables: [
+                (if ($r.uuid // "") != "" then { name: "entity.uid", type_id: 10, value: $r.uuid } else empty end),
+                (if ($r.name // "") != "" then { name: "entity.name", type_id: 99, value: $r.name } else empty end)
+              ],
+              message: ("Organization snapshot: " + ($r.name // $r.uuid // "unknown")),
+              raw_data: ($r | tostring)
+            })
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)

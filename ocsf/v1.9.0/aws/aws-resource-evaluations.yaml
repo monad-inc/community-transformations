@@ -1,0 +1,134 @@
+name: "AWS Config Resource Evaluations to OCSF v1.9.0"
+description: "Transforms AWS Config resource compliance evaluation results (EvaluationResult) into the OCSF v1.9.0 Compliance Finding (2003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-resource-evaluations"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Compliance Finding (class_uid=2003) — v1.9.0
+          # Input: one AWS Config EvaluationResult record per invocation
+          #   (as returned by GetComplianceDetailsByConfigRule /
+          #   the aws-resource-evaluations connector).
+          #
+          # Field mappings:
+          #   .ComplianceType                    -> compliance.status / severity_id / status_id
+          #   qualifier.ConfigRuleName           -> compliance.control / finding_info.title
+          #   qualifier.ResourceType/ResourceId  -> resource.type / resource.uid+name
+          #   .ResultRecordedTime                -> time
+          #   .Annotation                        -> message / finding_info.desc / status_detail
+          #   identifier.ResourceEvaluationId    -> finding_info.uid
+          #   .AwsAccountId / .AwsRegion         -> cloud.account.uid / cloud.region
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.EvaluationResultIdentifier // {} ) as $id
+          | ( $id.EvaluationResultQualifier // {} ) as $q
+          | ( $r.ComplianceType // "" ) as $ct
+
+          # Compliance status_id: 1=Pass, 2=Warning, 3=Fail, 99=Other, 0=Unknown.
+          | ( { "COMPLIANT": 1, "NON_COMPLIANT": 3,
+                "NOT_APPLICABLE": 99, "INSUFFICIENT_DATA": 0 }[$ct] // 0 ) as $comp_status_id
+
+          # Finding severity: a NON_COMPLIANT result is a High finding; a
+          # passing / N/A result carries no urgency (Informational).
+          | ( { "NON_COMPLIANT": 4, "COMPLIANT": 1,
+                "NOT_APPLICABLE": 1, "INSUFFICIENT_DATA": 0 }[$ct] // 0 ) as $sev
+
+          # Finding lifecycle status: a compliant resource is Resolved, a
+          # non-compliant one is New (open), the rest Unknown.
+          | ( { "COMPLIANT": 4, "NON_COMPLIANT": 1 }[$ct] // 0 ) as $status_id
+
+          | {
+              category_uid: 2,
+              class_uid:    2003,
+              type_uid:     200301,
+              activity_id:  1,
+              severity_id:  $sev,
+
+              time: to_epoch($r.ResultRecordedTime // $id.OrderingTimestamp),
+
+              status_id: $status_id,
+              status_detail: $r.Annotation,
+              message: $r.Annotation,
+
+              metadata: {
+                "profiles": ["cloud", "osint"],
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "AWS Config"
+                },
+                original_time: ($r.ResultRecordedTime // $id.OrderingTimestamp),
+                log_name: "aws-resource-evaluations"
+              },
+
+              compliance: {
+                control:   $q.ConfigRuleName,
+                status:    (if $ct != "" then $ct else null end),
+                status_id: $comp_status_id,
+                standards: ["AWS Config Managed Rules"],
+                status_detail: $r.Annotation
+              },
+
+              cloud: {
+                provider: "aws",
+                region:   $r.AwsRegion,
+                account:  { uid: $r.AwsAccountId }
+              },
+
+              finding_info: {
+                uid:   ($id.ResourceEvaluationId // $r.ResultToken),
+                title: ( ($q.ConfigRuleName // "AWS Config rule")
+                         + " — " + (if $ct != "" then $ct else "UNKNOWN" end) ),
+                desc:  $r.Annotation,
+                created_time: to_epoch($id.OrderingTimestamp),
+                modified_time: to_epoch($r.ResultRecordedTime)
+              },
+
+              resource: {
+                uid:  $q.ResourceId,
+                name: $q.ResourceId,
+                type: $q.ResourceType
+              },
+
+              # No threat-intel enrichment on a Config evaluation; the class
+              # marks osint required, so emit an explicit empty array.
+              osint: [],
+
+              unmapped: {
+                EvaluationMode: $q.EvaluationMode,
+                ConfigRuleInvokedTime: $r.ConfigRuleInvokedTime,
+                ResultToken: $r.ResultToken
+              },
+
+              raw_data: ($r | tostring)
+            }
+          | prune
+          | .osint = (.osint // [])

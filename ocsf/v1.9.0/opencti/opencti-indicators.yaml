@@ -1,0 +1,153 @@
+name: "OpenCTI Indicators to OCSF v1.9.0"
+description: "Transforms OpenCTI (STIX 2.1) threat-intelligence Indicator records into the OCSF v1.9.0 Detection Finding (2004) class, carrying the indicator as an OSINT object."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "opencti-indicators"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "opencti"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004, category_uid=2) — v1.9.0
+          # Input: one OpenCTI (STIX 2.1) Indicator record per invocation.
+          # An OpenCTI indicator is threat intelligence, so it maps to a
+          # Detection Finding whose osint object carries the indicator value.
+          # ---------------------------------------------------------------
+          . as $r
+
+          | def to_epoch($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then $ts
+              else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              end;
+
+          # OpenCTI x_opencti_score (0-100) -> OCSF severity_id
+          def sev($s):
+              if $s == null then 0
+              elif $s >= 90 then 5
+              elif $s >= 70 then 4
+              elif $s >= 40 then 3
+              elif $s >= 1  then 2
+              else 1 end;
+
+          # main observable type / pattern -> OSINT type_id
+          ($r.x_opencti_main_observable_type // "") as $mot
+          | (if   ($mot | test("Domain";"i"))        then 2
+             elif ($mot | test("IPv4|IPv6|Addr";"i")) then 1
+             elif ($mot | test("Url";"i"))            then 5
+             elif ($mot | test("Hostname";"i"))       then 3
+             elif ($mot | test("File|Hash|StixFile";"i")) then 4
+             elif ($mot | test("Email-Addr";"i"))     then 9
+             elif ($mot | test("Email";"i"))          then 8
+             elif ($mot | test("Certificate|X509";"i")) then 7
+             elif ($mot | test("User-Agent";"i"))     then 6
+             elif ($mot == "") then 0
+             else 99 end) as $osint_type
+
+          # revoked indicators are a Close, otherwise Create
+          | (if ($r.revoked == true) then 3 else 1 end) as $act
+
+          # OpenCTI confidence (0-100) -> normalized confidence_id; the OCSF
+          # `confidence` string is the caption sibling, not the raw number
+          # (the numeric score is preserved in unmapped).
+          | (if $r.confidence == null then 0
+             elif $r.confidence >= 70 then 3
+             elif $r.confidence >= 40 then 2
+             elif $r.confidence >= 1  then 1
+             else 0 end) as $conf_id
+          | ({"0":"Unknown","1":"Low","2":"Medium","3":"High","99":"Other"}[$conf_id|tostring]) as $conf_cap
+
+          | {
+              "category_uid": 2,
+              "class_uid":    2004,
+              "type_uid":     (2004 * 100 + $act),
+              "activity_id":  $act,
+              "severity_id":  sev($r.x_opencti_score),
+
+              "time": to_epoch($r.valid_from // $r.created // $r.created_at),
+              "start_time": to_epoch($r.valid_from),
+              "end_time":   to_epoch($r.valid_until),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "OpenCTI",
+                  "name": "OpenCTI"
+                },
+                "uid": $r.id,
+                "labels": ($r.labels // null)
+              },
+
+              # Cloud is a base-required attribute on Detection Finding in the
+              # OCSF v1.9.0 schema; a threat feed has no cloud context, so the
+              # provider names the intelligence platform of record.
+              "cloud": {
+                "provider": (($r.createdBy.name) // "OpenCTI")
+              },
+
+              # OSINT object — the natural home for a threat-intel indicator.
+              "osint": [
+                {
+                  "value": ($r.name // $r.pattern // $r.id),
+                  "type_id": $osint_type,
+                  "confidence_id": $conf_id,
+                  "confidence": $conf_cap,
+                  "detection_pattern": ($r.pattern // null),
+                  "detection_pattern_type_id": (if $r.pattern_type == "yara" then 2
+                                                elif $r.pattern_type == "sigma" then 5
+                                                elif $r.pattern_type == "snort" then 3
+                                                elif $r.pattern_type == "suricata" then 4
+                                                elif $r.pattern_type == "stix" then 1
+                                                else 99 end),
+                  "comment": ($r.description // null),
+                  "labels": ($r.labels // null),
+                  "src_url": ($r.externalReferences[0].url // null),
+                  "vendor_name": (($r.createdBy.name) // null)
+                }
+              ],
+
+              "finding_info": {
+                "uid": $r.id,
+                "title": ($r.name // "OpenCTI Indicator"),
+                "desc": ($r.description // null),
+                "types": ($r.indicator_types // null),
+                "src_url": ($r.externalReferences[0].url // null)
+              },
+
+              "is_alert": ($r.x_opencti_detection // false),
+
+              "confidence_id": $conf_id,
+              "confidence": $conf_cap,
+
+              "status_id": (if ($r.revoked == true) then 4 else 1 end),
+              "message": ($r.name // ""),
+
+              "unmapped": {
+                "confidence": $r.confidence,
+                "x_opencti_score": $r.x_opencti_score,
+                "x_opencti_detection": $r.x_opencti_detection,
+                "kill_chain_phases": $r.killChainPhases,
+                "object_marking": $r.objectMarking
+              },
+
+              "raw_data": ($r | tostring)
+            }
+
+          # prune null / empty leaves while keeping required objects present
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

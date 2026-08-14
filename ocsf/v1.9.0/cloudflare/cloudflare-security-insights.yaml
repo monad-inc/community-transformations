@@ -1,0 +1,132 @@
+name: "Cloudflare Security Insights to OCSF v1.9.0"
+description: "Transforms Cloudflare Security Center Insights (security posture / misconfiguration findings) records into the OCSF v1.9.0 Compliance Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-security-insights"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Compliance Finding (class_uid=2003) — v1.9.0
+          # Input: one Cloudflare Security Center Insight record per
+          # invocation, as emitted by the `cloudflare-security-insights`
+          # input connector (the Security Center Insights list endpoint's
+          # issue/insight instance object).
+          #
+          # A Security Center Insight is a security-posture evaluation of a
+          # zone/resource (insecure configuration, weak authentication,
+          # exposed infrastructure, compliance violation, ...), which maps
+          # onto the OCSF Compliance Finding class.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Recursively drop nulls / empty objects / empty arrays so the
+          # emitted event stays compact. Required objects always retain at
+          # least one populated child, so they survive the prune.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.payload ) as $p
+          # Cloudflare severities: Low / Moderate / Critical.
+          | ( { "Low": 2, "Moderate": 3, "Critical": 5 }[$r.severity] // 0 ) as $sev
+          # A newly-surfaced insight is a Create; a resolved or dismissed
+          # one is a Close.
+          | ( if ($r.dismissed == true) or ($r.status == "resolved")
+              then 3 else 1 end ) as $act
+          | {
+              # --- Classification (REQUIRED) ---
+              category_uid: 2,
+              class_uid:    2003,
+              type_uid:     (2003 * 100 + $act),
+              activity_id:  $act,
+              severity_id:  $sev,
+
+              # --- Time (REQUIRED) ---
+              time: to_epoch($r.timestamp),
+
+              # --- Metadata (REQUIRED). The cloud + osint objects below are
+              #     OCSF profile attributes, so the profiles MUST be declared
+              #     here or the event fails validation with "attribute_unknown". ---
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Cloudflare",
+                  name: "Cloudflare Security Center"
+                },
+                profiles: ["cloud", "osint"],
+                uid: $r.id
+              },
+
+              # --- Finding information (REQUIRED: uid) ---
+              finding_info: {
+                uid:             $r.id,
+                title:           ($r.resolve_text // $r.issue_type),
+                desc:            $r.issue_type,
+                types:           ( if $r.issue_type != null then [ $r.issue_type ] else null end ),
+                src_url:         $r.resolve_link,
+                first_seen_time: to_epoch($r.since),
+                modified_time:   to_epoch($r.timestamp)
+              },
+
+              # --- Compliance (REQUIRED) ---
+              compliance: {
+                control:    $r.issue_type,
+                standards:  ( if $r.issue_class != null then [ $r.issue_class ] else null end ),
+                status:     ( if $r.status == "resolved" then "Pass" else "Fail" end ),
+                status_id:  ( if $r.status == "resolved" then 1 else 3 end )
+              },
+
+              # --- OSINT (REQUIRED for this class): the affected subject
+              #     is a domain / FQDN (osint type_id 2 = Domain). ---
+              osint: ( if $r.subject != null
+                then [ { value: $r.subject, type_id: 2 } ]
+                else [ { value: ($r.id // "unknown"), type_id: 0 } ] end ),
+
+              # --- Cloud (REQUIRED for this class) ---
+              cloud: {
+                provider: "Cloudflare",
+                zone: ( if ($p | type) == "object" then $p.zone_tag else null end )
+              },
+
+              # --- Affected resource ---
+              resources: ( if $r.subject != null
+                then [ { name: $r.subject, type: "Cloudflare Zone" } ]
+                else null end ),
+
+              status: $r.status,
+              message: ($r.resolve_text // $r.issue_type),
+
+              # --- Fields with no clean OCSF home ---
+              unmapped: {
+                severity:             $r.severity,
+                dismissed:            $r.dismissed,
+                user_classification:  $r.user_classification,
+                has_extended_context: $r.has_extended_context,
+                detection_method:     ( if ($p | type) == "object" then $p.detection_method else null end )
+              },
+
+              raw_data: ($r | tostring)
+            }
+          | prune

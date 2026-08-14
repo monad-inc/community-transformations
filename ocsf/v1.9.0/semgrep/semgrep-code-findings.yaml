@@ -1,0 +1,105 @@
+name: "Semgrep Code Vulnerability Findings to OCSF v1.9.0"
+description: "Transforms Semgrep Code Vulnerability Findings into the OCSF v1.9.0 Vulnerability Finding (2002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-code-findings"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "semgrep"
+  - "code"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          . as $r
+          | (.severity // "" | ascii_downcase) as $sev
+          | (if $sev == "critical" then 5
+             elif $sev == "high" then 4
+             elif $sev == "medium" then 3
+             elif $sev == "low" then 2
+             elif $sev == "info" then 1
+             else 0 end) as $sev_id
+          | (($r.rule.cwe_names // []) | map(select(. != null))) as $cwes
+          | ($cwes | map(split(":")[0] | ascii_upcase) | map(select(startswith("CWE")))) as $cwe_ids
+          | (($r.created_at // $r.state_updated_at) | if . then (sub("\\.[0-9]+"; "") | sub("Z$"; "Z") | fromdateiso8601) else null end) as $t
+          | (($r.relevant_since) | if . then (sub("\\.[0-9]+"; "") | fromdateiso8601) else null end) as $first_t
+          | {
+              "class_uid": 2002,
+              "category_uid": 2,
+              "type_uid": 200201,
+              "activity_id": 1,
+              "severity_id": $sev_id,
+              "time": $t,
+              "message": ($r.rule_message // $r.rule_name),
+              "status": ($r.status // $r.state),
+              "cloud": {
+                "provider": "Other",
+                "account": { "name": $r.repository.name }
+              },
+              "osint": [
+                {
+                  "type_id": 10,
+                  "value": ($cwe_ids[0] // $r.rule_name // "unknown")
+                }
+              ],
+              "finding_info": {
+                "uid": ($r.id | tostring),
+                "title": $r.rule_name,
+                "desc": $r.rule_message,
+                "src_url": $r.line_of_code_url,
+                "first_seen_time": $first_t,
+                "types": ($r.categories // []),
+                "created_time": $t
+              },
+              "vulnerabilities": [
+                {
+                  "title": $r.rule_name,
+                  "desc": $r.rule_message,
+                  "severity": $r.severity,
+                  "vendor_name": "Semgrep",
+                  "first_seen_time": $first_t,
+                  "last_seen_time": $t,
+                  "cwe": (if ($cwe_ids | length) > 0 then {
+                    "uid": $cwe_ids[0],
+                    "caption": ($cwes[0] | split(":")[1] // null | if . then ltrimstr(" ") else null end),
+                    "src_url": ("https://cwe.mitre.org/data/definitions/" + ($cwe_ids[0] | ltrimstr("CWE-")) + ".html")
+                  } else null end),
+                  "affected_code": [
+                    {
+                      "file": {
+                        "path": $r.location.file_path,
+                        "name": (if $r.location.file_path then ($r.location.file_path | split("/")[-1]) else null end),
+                        "type_id": 0
+                      },
+                      "start_line": $r.location.line,
+                      "end_line": $r.location.end_line
+                    }
+                  ],
+                  "references": (($r.rule.owasp_names // []) + ($r.rule.vulnerability_classes // []))
+                }
+              ],
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Semgrep",
+                  "name": "Semgrep"
+                }
+              },
+              "observables": [
+                {
+                  "name": "finding_info.uid",
+                  "type_id": 0,
+                  "value": ($r.id | tostring)
+                }
+              ],
+              "raw_data": ($r | tostring)
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)

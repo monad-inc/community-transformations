@@ -1,0 +1,145 @@
+name: "AWS Config Resource Inventory to OCSF v1.9.0"
+description: "Transforms AWS Config configuration item records into the OCSF v1.9.0 Cloud Resources Inventory Info class (class_uid 5023)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-config-inventory"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one AWS Config configuration item per invocation, as
+          # delivered to S3/SNS by the AWS Config recorder.
+          #
+          # Field mappings:
+          #   .configurationItemCaptureTime -> time
+          #   .configurationItemStatus      -> status / status_id
+          #   .awsRegion                    -> region / cloud.region
+          #   .accountId                    -> cloud.account.uid
+          #   .arn / .resourceId            -> osint.value / resources[].uid
+          #   .resourceType                 -> resources[].type
+          #   .resourceName                 -> resources[].name
+          #   .configuration.privateIpAddress/publicIpAddress -> resources[].ip
+          #   .tags                         -> resources[].tags
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.configuration // {} ) as $cfg
+          | ( $r.configurationItemStatus // "" ) as $ci_status
+          # AWS Config CI status -> OCSF status_id (1 Success / 2 Failure).
+          # A recorded/discovered resource is a Success; a "NotRecorded"
+          # state means Config could not capture it.
+          | ( if ($ci_status | test("NotRecorded")) then 2
+              elif $ci_status == "" then 0
+              else 1 end ) as $status_id
+          # Tags arrive as an object map; render to the OCSF key_value list.
+          | ( if ($r.tags | type) == "object"
+              then ( $r.tags | to_entries | map({ name: .key, value: (.value | tostring) }) )
+              else null end ) as $tag_list
+          | ( [ $cfg.privateIpAddress, $cfg.publicIpAddress ]
+              | map(select(. != null)) ) as $ips
+
+          | {
+              category_uid: 5,
+              class_uid:    5023,
+              type_uid:     502302,
+              activity_id:  2,
+              activity_name: "Collect",
+              severity_id:  1,
+              status_id:    $status_id,
+              status:       ( if $ci_status != "" then $ci_status else null end ),
+
+              time: to_epoch($r.configurationItemCaptureTime),
+              region: $r.awsRegion,
+              message: ( "AWS Config inventory: " + ($r.resourceType // "resource") + " " + ($r.resourceId // "") ),
+
+              metadata: {
+                "profiles": ["cloud", "osint", "host"],
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "AWS Config",
+                  feature: { name: "Configuration Recorder" }
+                },
+                uid: $r.configurationItemMD5Hash,
+                log_provider: "AWS Config"
+              },
+
+              # The class requires an osint object; the resource ARN is the
+              # stable indicator for the inventoried asset.
+              osint: [{
+                value: ( $r.arn // $r.resourceId // "unknown" ),
+                type_id: 99,
+                type: "AWS Resource ARN"
+              }],
+
+              cloud: {
+                provider: "aws",
+                region: $r.awsRegion,
+                zone: $r.availabilityZone,
+                account: { uid: $r.accountId }
+              },
+
+              device: {
+                type_id: 0,
+                uid: $r.resourceId,
+                name: $r.resourceName,
+                region: $r.awsRegion,
+                hostname: $r.resourceName,
+                ip: ( $ips | if length > 0 then .[0] else null end )
+              },
+
+              resources: [
+                ( {
+                    uid: ( $r.arn // $r.resourceId ),
+                    name: $r.resourceName,
+                    type: $r.resourceType,
+                    region: $r.awsRegion,
+                    zone: $r.availabilityZone,
+                    namespace: $r.accountId,
+                    ip: ( $ips | if length > 0 then .[0] else null end ),
+                    created_time: to_epoch($r.resourceCreationTime),
+                    tags: $tag_list,
+                    labels: ( $tag_list | if . == null then null else map(.name + ":" + .value) end )
+                  } | with_entries(select(.value != null)) )
+              ],
+
+              observables: [
+                ( { name: "device.uid", type_id: 10, value: $r.resourceId }
+                  | select(.value != null) )
+              ],
+
+              unmapped: {
+                configurationStateId: $r.configurationStateId,
+                relationships: $r.relationships,
+                version: $r.version
+              },
+
+              raw_data: ($r | tostring)
+            }
+          | prune

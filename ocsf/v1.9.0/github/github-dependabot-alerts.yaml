@@ -1,0 +1,138 @@
+name: "GitHub Dependabot Alerts to OCSF v1.9.0"
+description: "Transforms GitHub Dependabot vulnerability alert records into the OCSF v1.9.0 Vulnerability Finding (class_uid 2002) class, populating finding_info, the vulnerabilities array (CVE/CWE/CVSS, affected package, fix availability), osint, cloud, and severity."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-dependabot-alerts"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "github"
+  - "findings"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one GitHub Dependabot alert record per invocation
+          #   (org/enterprise list shape; `repository` present).
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.security_advisory // {}) as $adv
+          | ($r.security_vulnerability // {}) as $sv
+          | ($r.dependency // {}) as $dep
+          | (($dep.package // $sv.package // $adv.vulnerabilities[0].package) // {}) as $pkg
+          | ($adv.severity // $sv.severity // "") as $sev
+
+          # Dependabot state -> OCSF finding activity + status
+          | (if $r.state == "open" then 1                       # Create
+             elif ($r.state == "fixed" or $r.state == "dismissed" or $r.state == "auto_dismissed") then 3  # Close
+             else 2 end) as $activity                            # Update (fallback)
+          | (if $r.state == "open" then 1                        # New
+             elif $r.state == "fixed" then 4                     # Resolved
+             elif ($r.state == "dismissed" or $r.state == "auto_dismissed") then 3  # Suppressed
+             else 0 end) as $status
+
+          # GitHub severity string -> OCSF severity_id
+          | ({ "low": 2, "medium": 3, "high": 4, "critical": 5 }[$sev] // 0) as $sevid
+
+          | {
+              "category_uid": 2,
+              "class_uid":    2002,
+              "activity_id":  $activity,
+              "type_uid":     (2002 * 100 + $activity),
+              "severity_id":  $sevid,
+              "status_id":    $status,
+
+              "time": to_epoch($r.updated_at // $r.created_at),
+              "start_time": to_epoch($r.created_at),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "GitHub",
+                  "name": "Dependabot",
+                  "feature": { "name": "Dependabot Alerts" }
+                },
+                "profiles": ["cloud"]
+              },
+
+              # Cloud is required on Vulnerability Finding in 1.9.0.
+              "cloud": { "provider": "GitHub" },
+
+              "finding_info": {
+                "uid": ($adv.ghsa_id // ($r.url // ("dependabot-alert-" + ($r.number | tostring)))),
+                "title": ($adv.summary // ("Dependabot alert " + ($r.number | tostring))),
+                "desc": $adv.description,
+                "src_url": $r.html_url,
+                "first_seen_time": to_epoch($r.created_at),
+                "modified_time": to_epoch($r.updated_at),
+                "types": ["Software Composition Analysis"]
+              },
+
+              # OSINT is required on Vulnerability Finding in 1.9.0.
+              # type_id 10 = Vulnerability.
+              "osint": [ {
+                "value": ($adv.cve_id // $adv.ghsa_id // "unknown"),
+                "type_id": 10,
+                "type": (if $adv.cve_id then "CVE" else "GHSA" end)
+              } ],
+
+              "vulnerabilities": [ {
+                "title": ($adv.summary // $adv.ghsa_id),
+                "desc": $adv.description,
+                "severity": (if $sev != "" then ($sev | ascii_upcase) else null end),
+                "references": [ ($adv.references // [])[] | .url ],
+                "is_fix_available": (($sv.first_patched_version.identifier // null) != null),
+                "fix_available": (($sv.first_patched_version.identifier // null) != null),
+                "cve": {
+                  "uid": ($adv.cve_id // $adv.ghsa_id),
+                  "desc": $adv.summary,
+                  "created_time": to_epoch($adv.published_at),
+                  "modified_time": to_epoch($adv.updated_at),
+                  "references": [ ($adv.references // [])[] | .url ],
+                  "cvss": ( if ($adv.cvss.vector_string // null) != null then [ {
+                      "version": ( ($adv.cvss.vector_string | capture("^CVSS:(?<v>[0-9.]+)").v) // "3.1" ),
+                      "base_score": $adv.cvss.score,
+                      "vector_string": $adv.cvss.vector_string
+                  } ] else null end )
+                },
+                "cwe": ( ($adv.cwes // [])[0] | if . then {
+                    "uid": .cwe_id,
+                    "caption": .name
+                } else null end ),
+                "affected_packages": [ {
+                  "name": $pkg.name,
+                  "package_manager": $pkg.ecosystem,
+                  "path": $dep.manifest_path,
+                  "vulnerable_version_range": $sv.vulnerable_version_range,
+                  "fixed_in_version": $sv.first_patched_version.identifier,
+                  "remediation": ( if ($sv.first_patched_version.identifier // null) != null
+                                   then { "desc": ("Upgrade " + ($pkg.name // "package") + " to " + $sv.first_patched_version.identifier + " or later.") }
+                                   else null end )
+                } ]
+              } ],
+
+              # Repository context in the vendor namespace.
+              "resource": {
+                "name": ($r.repository.full_name // $r.repository.name),
+                "type": "Repository",
+                "uid": ($r.repository.id | tostring),
+                "cloud_partition": null
+              },
+
+              "message": ($adv.summary // ("Dependabot alert " + ($r.number | tostring))),
+              "raw_data": ($r | tostring)
+            }
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

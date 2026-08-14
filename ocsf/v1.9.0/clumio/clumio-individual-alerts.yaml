@@ -1,0 +1,129 @@
+name: "Clumio Individual Alerts to OCSF v1.9.0"
+description: "Transforms Clumio Individual Alert records into the OCSF v1.9.0 Detection Finding (class_uid 2004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-individual-alerts"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "clumio"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: one Clumio Individual Alert record per invocation.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.primary_entity // {}) as $pe
+          | ($r.details // {}) as $d
+          # Activity: active alert -> Create(1); cleared -> Close(3).
+          | (if ($r.status // "") == "cleared" then 3
+             elif ($r.status // "") == "active" then 1
+             else 0 end) as $activity
+          # Severity: Clumio error -> High(4); warning -> Medium(3).
+          | (if ($r.severity // "") == "error" then 4
+             elif ($r.severity // "") == "warning" then 3
+             else 0 end) as $sev
+          # Cloud provider inferred from the primary entity's asset type.
+          | (($pe.type // "") | ascii_downcase) as $petype
+          | (if ($petype | startswith("aws")) then "AWS"
+             elif ($petype | startswith("azure")) then "Azure"
+             elif ($petype | startswith("microsoft365")) or ($petype | startswith("m365")) then "Microsoft 365"
+             elif ($petype | startswith("vmware")) then "VMware"
+             else "Clumio" end) as $provider
+          | {
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  $activity,
+              "type_uid":     (2004 * 100 + $activity),
+              "severity_id":  $sev,
+
+              "time": to_epoch($r.raised_timestamp),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Clumio",
+                  "name": "Clumio"
+                }
+              },
+
+              # Required for Detection Finding; not threat-intel derived.
+              "osint": [],
+
+              # Required (cloud profile object); provider inferred from asset.
+              "cloud": {
+                "provider": $provider,
+                "account": (
+                  if ($d.variables.account_native_id // null) != null
+                  then { "uid": ($d.variables.account_native_id | tostring) }
+                  else null end
+                )
+              },
+
+              "finding_info": {
+                "uid":   ($r.id // "unknown"),
+                "title": ($r.cause // $d.cause // "Clumio Alert"),
+                "desc":  ($d.description // null),
+                "types": ( [ $r.type ] | map(select(. != null)) ),
+                "src_url": null,
+                "product_uid": ($r.consolidated_alert_id // null)
+              },
+
+              # Recommended fields.
+              "status": ($r.status // null),
+              "status_id": (
+                if ($r.status // "") == "active" then 1
+                elif ($r.status // "") == "cleared" then 4
+                else 0 end
+              ),
+              "message": ($d.description // $r.cause // null),
+              "count": ($r.raised_count // null),
+              "is_alert": true,
+              "start_time": to_epoch($r.raised_timestamp),
+              "end_time": to_epoch($r.cleared_timestamp),
+
+              # Affected data-protection asset as a resource.
+              "resources": (
+                if ($pe.id // $pe.value // null) != null then
+                  [ {
+                      "uid":  ($pe.id // null),
+                      "name": ($pe.value // null),
+                      "type": ($pe.type // null),
+                      "cloud_partition": null
+                  } | with_entries(select(.value != null)) ]
+                else null end
+              ),
+
+              "unmapped": (
+                {
+                  "notes": ($r.notes // null),
+                  "parent_entity": ($r.parent_entity // null),
+                  "tags": ($r.tags // null),
+                  "detail_type": ($d.type // null),
+                  "detail_variables": ($d.variables // null)
+                } | with_entries(select(.value != null and .value != ""))
+              ),
+
+              "raw_data": ($r | tostring)
+            }
+          # Prune null/""/{} but KEEP empty arrays so the required osint:[] survives.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {}))
+              else . end
+            )

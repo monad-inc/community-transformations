@@ -1,0 +1,114 @@
+name: "Aikido Activity Log to OCSF v1.9.0"
+description: "Transforms Aikido Security activity log records (finding lifecycle / triage actions) into the OCSF v1.9.0 API Activity class (class_uid 6003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-activity-log"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aikido"
+  - "application-security"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003) — v1.9.0
+          # Input: one Aikido Security activity-log record per invocation.
+          # An Aikido activity-log entry records a user action taken on a
+          # security finding (closed / snoozed / re_open / adjust_severity /
+          # autofix_pr_created / *_push). Modelled as an API Activity CRUD
+          # event: the actor performs an operation on a finding resource.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.action // "") as $action
+          | ( { "closed": 3, "re_open": 3, "snoozed": 3, "unsnoozed": 3,
+                "ignored": 3, "auto_ignored": 3, "adjust_severity": 3,
+                "autofix_pr_created": 1, "drata_push": 1,
+                "sprinto_push": 1, "thoropass_push": 1 }[$action] // 99 ) as $act
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $act,
+              "type_uid":     (6003 * 100 + $act),
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.timestamp),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Aikido Security",
+                  "name": "Aikido"
+                }
+              },
+
+              # --- Actor (REQUIRED): the user who took the action ---
+              "actor": {
+                "user": {
+                  "name": $r.user_name,
+                  "uid": ($r.user_id | tostring),
+                  "type_id": 1
+                }
+              },
+
+              # --- API details (REQUIRED): operation performed ---
+              "api": {
+                "operation": $action,
+                "service": { "name": "Aikido Security" }
+              },
+
+              # --- Cloud (REQUIRED by class) ---
+              "cloud": {
+                "provider": ($r.metadata.location.cloud_name // "Other")
+              },
+
+              # --- Source endpoint (REQUIRED by class); Aikido carries no
+              #     network address for governance actions, so only the
+              #     originating service name is populated ---
+              "src_endpoint": {
+                "svc_name": "Aikido Security"
+              },
+
+              # --- OSINT (REQUIRED array by class); none applies to a
+              #     governance action ---
+              "osint": [],
+
+              # --- Recommended fields ---
+              "status_id": 1,
+              "status": "Success",
+              "message": $r.comment,
+              "resources": [
+                {
+                  "type": "Security Finding",
+                  "uid": ($r.issue_id | tostring),
+                  "name": $r.comment
+                }
+              ],
+
+              # --- Fields with no clean OCSF home ---
+              "unmapped": {
+                "source": $r.source,
+                "grouped_issue_id": $r.grouped_issue_id,
+                "code_repo_name": $r.metadata.location.code_repo_name,
+                "container_repo_name": $r.metadata.location.container_repo_name,
+                "domain_name": $r.metadata.location.domain_name
+              },
+
+              "raw_data": ($r | tostring)
+            }

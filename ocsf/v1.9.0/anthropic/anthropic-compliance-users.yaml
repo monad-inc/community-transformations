@@ -1,0 +1,97 @@
+name: "Anthropic Compliance Users to OCSF v1.9.0"
+description: "Transforms Anthropic Compliance API organization-user directory records into the OCSF v1.9.0 User Inventory Info (5003) class, in the Discovery category."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-users"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "ai"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
+          # Source: Anthropic Compliance API — List organization users
+          #   (GET /v1/compliance/organizations/{org_uuid}/users)
+          # One user directory record per invocation -> one OCSF event.
+          #
+          # Documented user fields: id, full_name, email, organization_role,
+          # created_at. organization_uuid is the canonical org id from the
+          # same Compliance API and is mapped to cloud/tenant context when the
+          # connector attaches it.
+          #
+          # 5003 base-requires the osint and cloud objects (an OCSF 1.9.0
+          # peculiarity of this class). osint is populated minimally from the
+          # user's email (type_id 8 = Email); cloud.provider is Anthropic.
+          # activity_id 2 = Collect (records are pulled via the API).
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.organization_role // "") as $role
+          # admin-class roles -> user.type_id 2 (Admin); everything else -> 1 (User)
+          | (if ($role | IN("admin","owner","primary_owner","membership_admin"))
+             then 2 else 1 end) as $utype
+          | (($r.full_name // $r.email // $r.id)) as $uname
+
+          | ({ type_id: $utype,
+               name: $uname,
+               full_name: $r.full_name,
+               uid: $r.id,
+               email_addr: $r.email,
+               org: (if ($r.organization_uuid // "") != ""
+                     then { uid: $r.organization_uuid, name: "Anthropic Organization" }
+                     else null end) }) as $user
+
+          | ([ (if ($r.email // "") != "" then {name:"user.email_addr", type_id:5, value:$r.email} else empty end),
+               (if ($r.id // "") != "" then {name:"user.uid", type_id:10, value:$r.id} else empty end),
+               (if ($uname // "") != "" then {name:"user.name", type_id:4, value:$uname} else empty end) ]) as $obs
+
+          | { category_uid: 5,
+              class_uid: 5003,
+              activity_id: 2,
+              type_uid: 500302,
+              severity_id: 1,
+              time: to_epoch($r.created_at),
+              metadata: {
+                "profiles": ["cloud", "osint"],
+                version: "1.9.0",
+                product: { vendor_name: "Anthropic", name: "Claude Compliance API" },
+                log_name: "compliance.organization.users",
+                tenant_uid: $r.organization_uuid
+              },
+              user: $user,
+              # 5003 base-requires osint + cloud; populate minimally & correctly
+              osint: [ { value: ($r.email // $r.id // "unknown"), type_id: 8 } ],
+              cloud: {
+                provider: "Anthropic",
+                org: (if ($r.organization_uuid // "") != ""
+                      then { uid: $r.organization_uuid, name: "Anthropic Organization" }
+                      else null end)
+              },
+              status_id: 1,
+              status: "Success",
+              message: (($uname // "user") + " (" + ($role // "member") + ")"),
+              observables: $obs,
+              unmapped: { organization_role: $r.organization_role },
+              raw_data: ($r | tostring)
+            }
+
+          # prune null / empty-string / empty-array leaves (required objects survive)
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)

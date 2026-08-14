@@ -1,0 +1,121 @@
+name: "Atlassian Confluence Audit Logs to OCSF v1.9.0"
+description: "Transforms Atlassian Confluence audit log records into the OCSF v1.9.0 Entity Management (3004) class, mapping the acting author to the actor, the affected Confluence object to the managed entity, and the audit summary/category to the CRUD activity."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-confluence-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "atlassian"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Entity Management (class_uid=3004, category_uid=3) — v1.9.0
+          # Input: one Atlassian Confluence audit record per invocation.
+          # A Confluence audit record reports a create/read/update/delete on
+          # a managed Confluence object (space, page, user, permission, ...),
+          # which is exactly the Entity Management semantic.
+          # ---------------------------------------------------------------
+
+          # Confluence creationDate is epoch MILLISECONDS; OCSF timestamp_t is
+          # epoch-ms, so pass it through numerically. ISO strings (server API)
+          # are converted to ms.
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          # Derive the CRUD activity from the human summary/category text.
+          def lc($s): ($s // "") | ascii_downcase;
+          def prune:
+            walk(
+              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ($r.author // {}) as $au
+          | (lc($r.summary) + " " + lc($r.description) + " " + lc($r.category)) as $txt
+          | ( if   ($txt | test("creat|add|grant|enabl")) then 1
+              elif ($txt | test("delet|remov|revok|disabl")) then 4
+              elif ($txt | test("updat|chang|modif|edit|renam|move")) then 3
+              elif ($txt | test("view|read|access|export|download")) then 2
+              else 99 end ) as $act
+          | {
+              category_uid: 3,
+              class_uid:    3004,
+              type_uid:     (3004 * 100 + $act),
+              activity_id:  $act,
+              severity_id:  1,
+
+              time: to_epoch_ms($r.creationDate),
+
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Atlassian",
+                  name: "Confluence"
+                },
+                profiles: []
+              },
+
+              # The affected Confluence object is the managed entity.
+              entity: {
+                name: ($r.affectedObject.name // $r.summary),
+                type: ($r.affectedObject.objectType // "Confluence Object"),
+                type_id: 99
+              },
+
+              # The audit author is the actor performing the change.
+              actor: {
+                user: {
+                  type_id: 1,
+                  name: ($au.displayName // $au.publicName),
+                  uid: $au.accountId,
+                  account: (if $au.accountType != null then { type: $au.accountType } else null end)
+                }
+              },
+
+              src_endpoint: (if is_ip($r.remoteAddress) then { ip: $r.remoteAddress } else null end),
+
+              status_id: 1,
+              message: ($r.description // $r.summary),
+
+              observables: (
+                [ (if $au.displayName != null then { name: "actor.user.name", type: "User", value: $au.displayName } else empty end),
+                  (if is_ip($r.remoteAddress) then { name: "src_endpoint.ip", type: "IP Address", value: $r.remoteAddress } else empty end)
+                ]
+              ),
+
+              unmapped: {
+                category: $r.category,
+                sysAdmin: $r.sysAdmin,
+                superAdmin: $r.superAdmin,
+                changedValues: $r.changedValues,
+                associatedObjects: $r.associatedObjects
+              },
+
+              raw_data: ($r | tostring)
+            }
+          | prune
+          # osint + cloud are class-required in OCSF 1.9.0. Confluence Cloud is
+          # a hosted SaaS (provider populated); no OSINT enrichment on an audit
+          # record, so osint is an empty array. Added post-prune so the empty
+          # array survives.
+          | . + {
+              osint: [],
+              cloud: { provider: "Atlassian" }
+            }

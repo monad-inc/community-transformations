@@ -1,0 +1,129 @@
+name: "AWS Cognito Users to OCSF v1.9.0"
+description: "Transforms AWS Cognito user-pool user records (ListUsers UserType) into the OCSF v1.9.0 User Inventory Info (class_uid 5003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-cognito-users"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
+          # Input: one AWS Cognito user record per invocation, as emitted by
+          #   the Monad `aws-cognito-users` input connector (the Cognito
+          #   ListUsers/AdminGetUser UserType shape).
+          #
+          # A Cognito user-pool listing is a proactively-collected identity
+          # inventory snapshot, not an audit event -> activity_id 2 (Collect).
+          #
+          # Field mappings:
+          #   .Username / Attributes[sub]      -> user.uid / user.name
+          #   Attributes[email]                -> user.email_addr
+          #   Attributes[name]                 -> user.full_name
+          #   Attributes[preferred_username]   -> user.name (preferred)
+          #   MFAOptions (non-empty)           -> user.has_mfa
+          #   .Enabled                         -> user.account.is_default? (no) -> status
+          #   .UserStatus                      -> status / status_detail
+          #   .UserLastModifiedDate            -> time / metadata.modified_time
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then ($ts / 1000 | floor) else ($ts | floor) end)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          . as $r
+          # Flatten the Cognito Attributes name/value array into a lookup map.
+          | ( ( $r.Attributes // [] )
+              | map(select(.Name != null))
+              | map({ (.Name): .Value }) | add // {} ) as $a
+          | ( $a["email"] ) as $email
+          | ( $a["preferred_username"] // $a["name"] // $r.Username ) as $display
+          | ( $a["sub"] // $r.Username ) as $uid
+          | ( (( $r.MFAOptions // [] ) | length) > 0 ) as $has_mfa
+
+          | {
+              "category_uid": 5,
+              "class_uid":    5003,
+              "type_uid":     500302,
+              "activity_id":  2,
+              "severity_id":  1,
+
+              "time": to_epoch($r.UserLastModifiedDate // $r.UserCreateDate),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "AWS",
+                  "name": "Amazon Cognito"
+                },
+                "modified_time": to_epoch($r.UserLastModifiedDate),
+                "profiles": ["cloud"]
+              },
+
+              # ---- required objects ----
+              "user": {
+                "name": ($r.Username // $display),
+                "uid": $uid,
+                "type_id": 1,
+                "type": "User",
+                "full_name": $a["name"],
+                "display_name": $display,
+                "email_addr": $email,
+                "phone_number": $a["phone_number"],
+                "has_mfa": $has_mfa,
+                "account": {
+                  "uid": $uid,
+                  "name": ($display // $r.Username),
+                  "type_id": 0
+                }
+              },
+
+              # osint is a base-required object for 5003; a user-pool listing
+              # carries no threat indicator, so anchor it on the most
+              # indicator-like identity artifact (the user's email address).
+              "osint": (
+                if $email != null
+                then { "value": $email, "type_id": 9, "type": "Email Address" }
+                else { "value": $uid, "type_id": 99, "type": "Other" }
+                end
+              ),
+
+              "cloud": {
+                "provider": "AWS"
+              },
+
+              # ---- recommended ----
+              "status": (if truthy($r.Enabled) then "Enabled" else "Disabled" end),
+              "status_detail": $r.UserStatus,
+              "message": ("Cognito user " + ($r.Username // "") + " (" + ($r.UserStatus // "UNKNOWN") + ")"),
+
+              "unmapped": {
+                "email_verified": $a["email_verified"],
+                "phone_number_verified": $a["phone_number_verified"],
+                "mfa_options": $r.MFAOptions,
+                "enabled": $r.Enabled
+              }
+            }
+          # Drop null/empty leaves while preserving required objects.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

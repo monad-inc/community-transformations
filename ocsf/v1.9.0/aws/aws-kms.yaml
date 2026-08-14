@@ -1,0 +1,120 @@
+name: "AWS KMS Keys to OCSF v1.9.0"
+description: "Transforms AWS Key Management Service (KMS) key inventory records — DescribeKey KeyMetadata plus rotation status, aliases, and grants collected by the aws-kms connector — into the OCSF v1.9.0 Cloud Resources Inventory Info class (class_uid 5023)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-kms"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one AWS KMS key inventory record per invocation, as
+          # emitted by the Monad `aws-kms` connector (DescribeKey
+          # KeyMetadata joined with GetKeyRotationStatus, ListAliases,
+          # ListGrants, and tags).
+          #
+          # activity_id = 2 (Collect) — the connector proactively polls the
+          # KMS APIs, which is the "collection process" activity.
+          # type_uid    = 5023 * 100 + 2 = 502302
+          # ---------------------------------------------------------------
+
+          # AWS timestamps arrive as ISO-8601 with a numeric offset
+          # ("...+00:00") or, from some SDKs, as a numeric epoch. Normalize
+          # both to integer epoch seconds (OCSF `time` is epoch seconds).
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor)
+            else ( $ts
+                   | gsub("\\.[0-9]+"; "")
+                   | gsub("[+-][0-9]{2}:[0-9]{2}$"; "Z")
+                   | fromdateiso8601 )
+            end;
+
+          . as $r
+          | ( $r.KeyMetadata // {} ) as $km
+          | ( $r.KeyRotationStatus // {} ) as $rot
+          | ( $r.Aliases // [] ) as $aliases
+          | ( ($aliases[0].AliasName) // $km.KeyId ) as $display_name
+          | ( ($r.Tags // []) | map("\(.TagKey):\(.TagValue)") ) as $labels
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 5,
+              "class_uid":    5023,
+              "type_uid":     502302,
+              "activity_id":  2,
+              "activity_name": "Collect",
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($km.CreationDate),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "AWS",
+                  "name": "AWS Key Management Service",
+                  "feature": { "name": "KMS" }
+                }
+              },
+
+              # --- OSINT (REQUIRED array; no threat-intel context here) ---
+              "osint": [],
+
+              # --- Cloud context (recommended) ---
+              "cloud": {
+                "provider": "aws",
+                "region": ($r.Region // ($km.Arn | if type == "string" then (split(":")[3]) else null end)),
+                "account": {
+                  "uid": $km.AWSAccountId,
+                  "type": "AWS Account",
+                  "type_id": 10
+                }
+              },
+
+              # --- The inventoried resource: the KMS key itself ---
+              "resources": [
+                {
+                  "uid": $km.Arn,
+                  "name": $display_name,
+                  "type": "AWS::KMS::Key",
+                  "labels": $labels,
+                  "criticality": ($km.KeyManager // null),
+                  "data": $km
+                }
+              ],
+
+              # --- Recommended enrichers ---
+              "status_id": 1,
+              "message": ("AWS KMS key " + ($km.KeyId // "unknown") + " (" + ($km.KeyState // "unknown") + ")"),
+              "count": 1,
+
+              # --- Everything the class has no first-class home for ---
+              "unmapped": {
+                "key_state": $km.KeyState,
+                "key_usage": $km.KeyUsage,
+                "key_spec": ($km.KeySpec // $km.CustomerMasterKeySpec),
+                "key_manager": $km.KeyManager,
+                "origin": $km.Origin,
+                "enabled": $km.Enabled,
+                "multi_region": $km.MultiRegion,
+                "rotation": $rot,
+                "aliases": $aliases,
+                "grants": ($r.Grants // [])
+              },
+
+              # --- Original record for audit / debugging ---
+              "raw_data": ($r | tostring)
+            }

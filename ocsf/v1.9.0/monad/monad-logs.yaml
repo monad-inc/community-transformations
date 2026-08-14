@@ -1,0 +1,89 @@
+name: "Monad Organization Logs to OCSF v1.9.0"
+description: "Transforms Monad Organization Logs (monad-logs) into the OCSF v1.9.0 API Activity (6003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "monad-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "monad"
+  - "organization"
+  - "logs"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Monad Organization Logs -> OCSF v1.9.0 API Activity (class_uid 6003)
+          . as $r
+          | (
+              if   $r.method == "GET"    then 2   # Read
+              elif $r.method == "POST"   then 1   # Create
+              elif $r.method == "PATCH"  then 3   # Update
+              elif $r.method == "PUT"    then 3   # Update
+              elif $r.method == "DELETE" then 4   # Delete
+              else 99                             # Other
+              end
+            ) as $activity_id
+          | (
+              if   ($r.status | tonumber) >= 500 then 4   # High
+              elif ($r.status | tonumber) >= 400 then 3   # Medium
+              else 1                                       # Informational
+              end
+            ) as $severity_id
+          | {
+              "time": (
+                $r.timestamp
+                | sub("\\.[0-9]+Z$"; "Z")
+                | fromdateiso8601 * 1000
+              ),
+              "activity_id": $activity_id,
+              "type_uid": (6003 * 100 + $activity_id),
+              "category_uid": 6,
+              "class_uid": 6003,
+              "severity_id": $severity_id,
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "product": {
+                  "name": "Monad",
+                  "vendor_name": "Monad",
+                  "version": ($r.log_version // "unknown")
+                },
+                "version": "1.9.0"
+              },
+              "cloud": {
+                "provider": "Monad"
+              },
+              "actor": {
+                "user": {
+                  "name": $r.user_email,
+                  "email_addr": $r.user_email
+                }
+              },
+              "api": {
+                "operation": $r.method,
+                "request": {
+                  "uid": $r.id
+                },
+                "response": {
+                  "code": ($r.status | tonumber)
+                }
+              },
+              "src_endpoint": {
+                "ip": $r.client_ip
+              },
+              "http_request": {
+                "http_method": $r.method,
+                "url": { "path": $r.resource },
+                "user_agent": $r.client_info
+              },
+              "osint": [],
+              "unmapped": (
+                { "additional_info": $r.additional_info }
+                | with_entries(select(.value != null))
+              )
+            }

@@ -1,0 +1,141 @@
+name: "Veracode Applications to OCSF v1.9.0"
+description: "Transforms Veracode Applications API records (application inventory and policy-compliance posture) into the OCSF v1.9.0 Application Security Posture Finding (2007) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "veracode-applications"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "veracode"
+  - "findings"
+metadata:
+  version: "1.9.0"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Application Security Posture Finding (class_uid=2007) — v1.9.0
+          # Input: one Veracode Applications API record per invocation
+          #        (_embedded.applications[] element).
+          # Base-required objects: metadata, finding_info, cloud, osint.
+          # Declared profiles: cloud, osint.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.profile // {}) as $p
+          | (($p.policies // []) | .[0]) as $pol
+          | ($pol.policy_compliance_status // null) as $pcs
+          # business_criticality -> OCSF severity_id
+          | ( { "VERY_HIGH": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "VERY_LOW": 1 }[$p.business_criticality // ""] // 0 ) as $sev
+          # policy compliance -> finding status_id (New / Resolved / Suppressed / Unknown)
+          | ( { "PASSED": 4, "CONDITIONAL_PASS": 2, "DID_NOT_PASS": 1,
+                "NOT_ASSESSED": 0, "VENDOR_REVIEW": 2, "DETERMINE_FROM_APPLICATION": 0 }[$pcs // ""] // 0 ) as $status
+          # first completed scan -> Create; already completed -> Update
+          | ( if $r.last_completed_scan_date == null then 1 else 2 end ) as $act
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 2,
+              "class_uid":    2007,
+              "activity_id":  $act,
+              "type_uid":     (2007 * 100 + $act),
+              "severity_id":  $sev,
+
+              # --- Time (REQUIRED) ---
+              "time": ( to_epoch($r.modified) // to_epoch($r.last_completed_scan_date) // to_epoch($r.created) ),
+
+              # --- Metadata (REQUIRED: product + version) ---
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Veracode",
+                  "name": "Veracode Application Security"
+                },
+                "profiles": [ "cloud", "osint" ],
+                "original_time": $r.modified
+              },
+
+              # --- Cloud (base-required; profile declared) ---
+              "cloud": {
+                "provider": "Veracode"
+              },
+
+              # --- OSINT (base-required array; profile declared) ---
+              # No natural OSINT indicator on an application-inventory record;
+              # carry the application identity as an Other-type indicator so the
+              # required object is populated without fabricating threat intel.
+              "osint": [
+                {
+                  "value": ( $r.guid // ($p.name // "unknown") ),
+                  "type_id": 99,
+                  "type": "Application Identifier"
+                }
+              ],
+
+              # --- Finding info (base-required: uid) ---
+              "finding_info": {
+                "uid":   ( $r.guid // ($r.id | tostring) ),
+                "title": ( $p.name // "Veracode Application" ),
+                "desc":  $p.description,
+                "types": [ "Application Security Posture" ],
+                "tags":  ( ($p.tags // "") | if . == "" then null else (split(",") | map(gsub("^\\s+|\\s+$"; ""))) end ),
+                "product_uid": ( $r.id | tostring ),
+                "src_url": ( $r.app_profile_url // $r.results_url ),
+                "created_time":  to_epoch($r.created),
+                "modified_time": to_epoch($r.modified)
+              },
+
+              # --- Recommended context ---
+              "status_id": $status,
+              "status": $pcs,
+              "message": ( "Application \"" + ($p.name // "unknown")
+                           + "\" (" + ($p.business_criticality // "UNKNOWN")
+                           + " criticality) policy compliance: "
+                           + ($pcs // "UNKNOWN") ),
+
+              # --- Related application (recommended) ---
+              "application": {
+                "name": $p.name,
+                "uid":  $r.guid,
+                "uid_alt": ( $r.id | tostring )
+              },
+
+              # --- Related compliance (recommended) ---
+              "compliance": ( if $pcs != null then {
+                  "status": $pcs,
+                  "status_id": ( { "PASSED": 1, "DID_NOT_PASS": 2 }[$pcs // ""] // 0 ),
+                  "control": ( $pol.name // null ),
+                  "standards": [ ( $pol.name // "Veracode Policy" ) ]
+                } else null end ),
+
+              "src_url": ( $r.results_url // $r.app_profile_url ),
+
+              # --- Unmapped source fields kept for audit ---
+              "unmapped": {
+                "oid": $r.oid,
+                "organization_id": $r.organization_id,
+                "business_unit": $p.business_unit,
+                "teams": $p.teams,
+                "business_owners": $p.business_owners,
+                "custom_fields": $p.custom_fields,
+                "sca_enabled": $p.sca_enabled,
+                "scans": $r.scans,
+                "last_policy_compliance_check_date": $r.last_policy_compliance_check_date
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Prune nulls / empty containers while keeping required objects.
+          | walk( if type == "object" then
+                    with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+                  else . end )

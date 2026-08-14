@@ -1,0 +1,111 @@
+name: "Cloudflare DDoS Attack Analytics to OCSF v1.9.0"
+description: "Transforms Cloudflare DDoS Attack Analytics (dosdAttackAnalyticsGroups GraphQL) records into the OCSF v1.9.0 Network Activity (4001) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-ddos-attack-analytics"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "network"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Network Activity (class_uid=4001) — v1.9.0
+          # Input: one Cloudflare DDoS Attack Analytics group row per
+          # invocation (dosdAttackAnalyticsGroups: dimensions{} + sum{}).
+          # A DDoS attack Cloudflare detected and mitigated is modeled as
+          # aggregated inbound traffic (activity_id=6 Traffic) that a
+          # security control denied/dropped.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.dimensions // {}) as $d
+          | ($r.sum // {}) as $s
+          | {
+              "category_uid": 4,
+              "class_uid":    4001,
+              "activity_id":  6,
+              "type_uid":     400106,
+              "severity_id":  4,
+              "is_alert":     true,
+              "status_id":    1,
+              "status":       "Success",
+
+              "time": to_epoch($d.datetime),
+              "start_time": to_epoch($d.startDatetime),
+              "end_time": to_epoch($d.endDatetime),
+
+              "metadata": {
+                "profiles": ["cloud", "osint", "security_control"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare DDoS Protection",
+                  "feature": { "name": "DDoS Attack Analytics" }
+                }
+              },
+
+              # OCSF 1.9.0 requires these on Network Activity.
+              "cloud": { "provider": "Cloudflare" },
+              "osint": [],
+
+              # Mitigation outcome: packets dropped by the DDoS managed ruleset.
+              "action_id": 2,
+              "action": "Denied",
+              "disposition_id": 6,
+              "disposition": "Dropped",
+
+              "dst_endpoint": {
+                "ip": $d.destinationIP,
+                "port": $d.destinationPort,
+                "location": {
+                  "city": $d.coloCity,
+                  "country": $d.coloCountry
+                }
+              },
+
+              "connection_info": {
+                "direction": "Inbound",
+                "direction_id": 1,
+                "protocol_name": ( $d.attackProtocol // $d.attackProtocolName
+                                   | if . == null then null else ascii_downcase end )
+              },
+
+              "traffic": {
+                "packets": $s.packets,
+                "bytes": ( if $s.bits == null then null else ($s.bits / 8 | floor) end )
+              },
+
+              "message": ( [ "Cloudflare mitigated ", ($d.attackType // "DDoS attack"),
+                             " (", ($d.attackVector // "unknown vector"), ")" ] | add ),
+
+              "unmapped": {
+                "attackId": $d.attackId,
+                "attackType": $d.attackType,
+                "attackVector": $d.attackVector,
+                "mitigationType": $d.mitigationType,
+                "action": $d.action,
+                "sourcePort": $d.sourcePort,
+                "droppedPackets": $s.droppedPackets,
+                "droppedBits": $s.droppedBits,
+                "sampleInterval": ($r.avg.sampleInterval),
+                "count": $r.count
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Drop nulls/empties so required objects stay intact but noise is pruned.
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {})) else . end )

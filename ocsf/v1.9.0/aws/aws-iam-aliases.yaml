@@ -1,0 +1,118 @@
+name: "AWS IAM Account Aliases to OCSF v1.9.0"
+description: "Transforms AWS IAM account-alias inventory records (one AWS account and its IAM account alias) into the OCSF v1.9.0 Cloud Resources Inventory Info class (class_uid 5023)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-iam-aliases"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one aws-iam-aliases record per invocation, shape:
+          #   { "AccountID": "123456789012", "Alias": "acme-production" }
+          # emitted by the Monad `aws-iam-aliases` input connector, which
+          # lists each configured AWS account together with its single IAM
+          # account alias (AWS permits at most one alias per account).
+          #
+          # This is an INVENTORY SNAPSHOT, not an event: the source carries
+          # no event time and no actor. It is modeled as a proactively
+          # collected cloud-resource inventory record.
+          #   activity_id = 2 (Collect — gathered via the IAM API, not a log)
+          #   time        = collection time (now); source has no timestamp
+          #   .AccountID  -> cloud.account.uid, resources[].uid
+          #   .Alias      -> cloud.account.name, resources[].name
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.AccountID // null) as $acct
+          | ($r.Alias // null) as $alias
+          | (now | floor) as $t
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 5,
+              "class_uid":    5023,
+              "type_uid":     502302,       # 5023 * 100 + activity_id(2)
+              "activity_id":  2,            # Collect
+              "severity_id":  1,            # Informational
+
+              # --- Time (REQUIRED) — collection time, source has none ---
+              "time": $t,
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "AWS",
+                  "name": "AWS IAM"
+                }
+              },
+
+              # --- OSINT (REQUIRED by the 5023 base in OCSF 1.9.0) --------
+              # The Cloud Resources Inventory Info class marks `osint` as a
+              # base-required field in OCSF 1.9.0. An account alias is not a
+              # threat indicator, so this is a schema-mandated placeholder:
+              # type_id 99 (Other), value = the account identity.
+              "osint": [{
+                "value":   ($alias // $acct // "unknown"),
+                "type_id": 99,
+                "name":    "AWS account alias",
+                "desc":    "Schema-required OSINT placeholder; not a threat indicator."
+              }],
+
+              # --- Recommended: the cloud account this record describes ---
+              "cloud": {
+                "provider": "aws",
+                "account": {
+                  "uid":     $acct,
+                  "name":    $alias,
+                  "type_id": 10        # AWS Account
+                }
+              },
+
+              # --- Recommended: the inventoried resource(s) ---
+              "resources": [
+                {
+                  "uid":  $acct,
+                  "name": $alias,
+                  "type": "AWS Account"
+                }
+              ],
+
+              "status_id": 1,          # Success
+              "message": (
+                if $alias != null and $acct != null
+                then "AWS account " + $acct + " alias: " + $alias
+                elif $acct != null
+                then "AWS account " + $acct + " (no alias set)"
+                else "AWS account alias inventory record" end
+              ),
+
+              "observables": (
+                [ ( if $acct  != null then {"name":"cloud.account.uid","type_id":10,"value":$acct} else empty end ),
+                  ( if $alias != null then {"name":"cloud.account.name","type_id":0,"value":$alias} else empty end ) ]
+              ),
+
+              "raw_data": ($r | tostring)
+            }
+
+          # Drop nulls / empties while preserving required objects.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

@@ -1,0 +1,132 @@
+name: "Box Users to OCSF v1.9.0"
+description: "Transforms Box User account records (Admin API /2.0/users) into the OCSF v1.9.0 User Inventory Info class (5003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "box-users"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "box"
+  - "discovery"
+  - "identity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003, category_uid=5) — v1.9.0
+          # Input: one Box User account record per invocation.
+          # activity_id=2 (Collect) — records are proactively collected from
+          # the Box Admin API user listing.
+          # ---------------------------------------------------------------
+          # RFC3339 with numeric offset (Box: "2026-08-01T18:20:00-07:00") -> epoch seconds (UTC)
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else
+              ($ts | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?<tz>Z|[+-][0-9]{2}:[0-9]{2})$")) as $m
+              | (($m.d + "Z") | fromdateiso8601) as $base
+              | (if $m.tz == "Z" then 0
+                 else (($m.tz[1:3] | tonumber) * 3600 + ($m.tz[4:6] | tonumber) * 60) as $secs
+                      | (if ($m.tz[0:1]) == "-" then $secs else (- $secs) end)
+                 end) as $adj
+              | ($base + $adj)
+            end;
+
+          . as $u |
+          # Box role -> OCSF user.type_id: admin/coadmin => Admin(2), else User(1)
+          (if ($u.role // "user") == "admin" or ($u.role // "") == "coadmin"
+             then 2 else 1 end) as $utype |
+          2 as $activity_id |
+
+          {
+            "category_uid": 5,
+            "class_uid": 5003,
+            "type_uid": (5003 * 100 + $activity_id),
+            "activity_id": $activity_id,
+            "activity_name": "Collect",
+            "severity_id": 1,
+            "severity": "Informational",
+
+            "time": to_epoch($u.modified_at // $u.created_at),
+
+            "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "osint"],
+              "product": {
+                "vendor_name": "Box",
+                "name": "Box"
+              },
+              "original_time": ($u.modified_at // $u.created_at)
+            },
+
+            # --- Cloud (required by class) ---
+            "cloud": ({
+              "provider": "Box"
+            } + (if ($u.enterprise.id // "") != "" then {
+              "account": {
+                "uid": ($u.enterprise.id | tostring),
+                "name": ($u.enterprise.name // ""),
+                "type_id": 99
+              }
+            } else {} end)),
+
+            # --- OSINT (required by class): the user's login email as an indicator ---
+            "osint": [{
+              "value": ($u.login // ($u.id | tostring)),
+              "type_id": (if ($u.login // "") != "" then 9 else 0 end)
+            }],
+
+            # --- User (required by class) ---
+            "user": ({
+              "uid": ($u.id | tostring),
+              "type_id": $utype
+            }
+            + (if ($u.login // "") != "" then {"name": $u.login, "email_addr": $u.login} else {} end)
+            + (if ($u.name // "") != "" then {"full_name": $u.name} else {} end)
+            + {"type": (if $utype == 2 then "Admin" else "User" end)}
+            + (if ($u.enterprise.id // "") != "" then {
+                "org": {
+                  "uid": ($u.enterprise.id | tostring),
+                  "name": ($u.enterprise.name // "")
+                },
+                "account": {
+                  "uid": ($u.enterprise.id | tostring),
+                  "name": ($u.enterprise.name // ""),
+                  "type_id": 99
+                }
+              } else {} end)
+            + (if ($u.is_exempt_from_login_verification // null) != null
+                 then {"has_mfa": ($u.is_exempt_from_login_verification | not)} else {} end)),
+
+            "message": (
+              "Box user " + ($u.login // ($u.id | tostring))
+              + " (" + ($u.status // "unknown") + ", role " + ($u.role // "user") + ")"
+            ),
+
+            "enrichments": ([
+              (if ($u.job_title // "") != "" then {"name": "job_title", "value": $u.job_title, "data": {"job_title": $u.job_title}} else null end),
+              (if ($u.space_used // null) != null then {"name": "space_used", "value": ($u.space_used | tostring), "data": {"space_used": $u.space_used, "space_amount": $u.space_amount}} else null end)
+            ] | map(select(. != null))),
+
+            "observables": ([
+              (if ($u.login // "") != "" then {"name": "user.email_addr", "type_id": 5, "value": $u.login} else null end),
+              (if ($u.id // null) != null then {"name": "user.uid", "type_id": 0, "value": ($u.id | tostring)} else null end)
+            ] | map(select(. != null))),
+
+            "unmapped": ({}
+              + (if ($u.role // "") != "" then {"role": $u.role} else {} end)
+              + (if ($u.status // "") != "" then {"status": $u.status} else {} end)
+              + (if ($u.language // "") != "" then {"language": $u.language} else {} end)
+              + (if ($u.timezone // "") != "" then {"timezone": $u.timezone} else {} end)
+              + (if ($u.phone // "") != "" then {"phone": $u.phone} else {} end)
+              + (if ($u.address // "") != "" then {"address": $u.address} else {} end)
+              + (if ($u.max_upload_size // null) != null then {"max_upload_size": $u.max_upload_size} else {} end)
+              + (if ($u.is_platform_access_only // null) != null then {"is_platform_access_only": $u.is_platform_access_only} else {} end)
+              + (if ($u.is_sync_enabled // null) != null then {"is_sync_enabled": $u.is_sync_enabled} else {} end)
+              + (if ($u.tracking_codes // null) != null then {"tracking_codes": $u.tracking_codes} else {} end))
+          }

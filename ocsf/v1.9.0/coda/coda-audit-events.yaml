@@ -1,0 +1,100 @@
+name: "Coda Audit Events to OCSF v1.9.0"
+description: "Transforms Coda Admin Audit API events into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "coda-audit-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "coda"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.9.0
+          # Input: one Coda Admin Audit API event per invocation.
+          # Coda audit auth actions: LogInUser (Logon), LogOutUser (Logoff).
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.action // "") as $action
+          | ($r.result // "") as $result
+          | (if   $action == "LogInUser"  then 1
+             elif $action == "LogOutUser" then 2
+             else 0 end) as $activity_id
+          | (if ($result | ascii_downcase) == "allowed" then 1 else 2 end) as $status_id
+          | def to_epoch($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then $ts
+              else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              end;
+          {
+            "category_uid": 3,
+            "class_uid": 3002,
+            "type_uid": (3002 * 100 + $activity_id),
+            "activity_id": $activity_id,
+            "severity_id": 1,
+            "status_id": $status_id,
+            "status": $result,
+            "time": to_epoch($r.timestamp),
+            "metadata": {
+                "profiles": ["cloud", "osint"],
+              "version": "1.9.0",
+              "log_name": $action,
+              "tenant_uid": $r.organizationId,
+              "product": {
+                "vendor_name": "Coda",
+                "name": "Coda Admin Audit"
+              }
+            },
+            "user": {
+              "name": $r.user.email,
+              "uid": ($r.user.id | tostring),
+              "type_id": 1,
+              "type": "User"
+            },
+            "service": {
+              "name": "Coda"
+            },
+            "cloud": {
+              "provider": "Coda"
+            },
+            "osint": [],
+            "auth_protocol": ($r.eventDetails.providerName // null),
+            "session": (
+              if $r.userContext.sessionId != null
+              then { "uid": $r.userContext.sessionId }
+              else null end
+            ),
+            "src_endpoint": (
+              if $r.userContext.ipAddress != null
+              then { "ip": $r.userContext.ipAddress }
+              else null end
+            ),
+            "http_request": (
+              if $r.userContext.browser.ua != null
+              then { "user_agent": $r.userContext.browser.ua }
+              else null end
+            ),
+            "observables": (
+              [
+                (if $r.user.email != null
+                 then { "name": "user.name", "type_id": 4, "value": $r.user.email }
+                 else empty end),
+                (if $r.userContext.ipAddress != null
+                 then { "name": "src_endpoint.ip", "type_id": 2, "value": $r.userContext.ipAddress }
+                 else empty end)
+              ]
+            ),
+            "unmapped": {
+              "entity_type": $r.entity.type,
+              "client_source": $r.userContext.source
+            },
+            "raw_data": ($r | tostring)
+          }
+          | with_entries(select(.value != null))

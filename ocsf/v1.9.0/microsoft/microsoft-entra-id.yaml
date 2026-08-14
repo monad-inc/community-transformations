@@ -1,0 +1,201 @@
+name: "Microsoft Entra ID Sign-in Logs to OCSF v1.9.0"
+description: "Transforms Microsoft Entra ID (Azure AD) sign-in log records into the OCSF v1.9.0 Authentication class (class_uid 3002)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "microsoft-entra-id"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "microsoft"
+  - "entra-id"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.9.0
+          # Input: one Microsoft Entra ID (Azure AD) sign-in log record per
+          # invocation, as emitted by the Monad `microsoft-entra-id` input
+          # (Microsoft Graph auditLogs/signIns resource shape).
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ( $r.status // {} ) as $st
+          | ( $r.deviceDetail // {} ) as $dd
+          | ( $r.location // {} ) as $loc
+          # Entra sign-in success is signalled by status.errorCode == 0.
+          | ( ($st.errorCode // 0) == 0 ) as $ok
+          # multiFactorAuthentication requirement -> is_mfa true.
+          | ( ($r.authenticationRequirement // "") == "multiFactorAuthentication" ) as $mfa
+          | {
+              # --- Classification (REQUIRED) ---
+              category_uid: 3,
+              category_name: "Identity & Access Management",
+              class_uid: 3002,
+              class_name: "Authentication",
+              activity_id: 1,
+              activity_name: "Logon",
+              type_uid: 300201,
+              type_name: "Authentication: Logon",
+
+              # --- Severity: success is informational; a failed sign-in is
+              #     surfaced as Medium so downstream detection can key on it ---
+              severity_id: ( if $ok then 1 else 3 end ),
+              severity: ( if $ok then "Informational" else "Medium" end ),
+
+              # --- Status ---
+              status_id: ( if $ok then 1 else 2 end ),
+              status: ( if $ok then "Success" else "Failure" end ),
+              status_code: (($st.errorCode // 0) | tostring),
+              status_detail: ($st.failureReason // $st.additionalDetails),
+
+              # --- Time (REQUIRED) ---
+              time: to_epoch($r.createdDateTime),
+
+              # --- Auth details ---
+              is_mfa: $mfa,
+              # Entra sign-in logs don't report the underlying auth protocol
+              # (NTLM/Kerberos/etc.); the MFA requirement is carried by is_mfa.
+              auth_protocol_id: 0,
+              auth_protocol: "Unknown",
+              logon_type: ($r.clientAppUsed),
+
+              # --- User (REQUIRED) ---
+              user: {
+                type_id: 1,
+                type: "User",
+                name: ($r.userPrincipalName),
+                uid: ($r.userId),
+                full_name: ($r.userDisplayName),
+                email_addr: ($r.userPrincipalName)
+              },
+
+              # --- Service (satisfies the class at_least_one[service,dst_endpoint]) ---
+              service: {
+                name: ($r.resourceDisplayName),
+                uid: ($r.resourceId)
+              },
+
+              # --- Source endpoint ---
+              src_endpoint: {
+                ip: ($r.ipAddress),
+                location: {
+                  city: ($loc.city),
+                  region: ($loc.state),
+                  country: ($loc.countryOrRegion),
+                  lat: ($loc.geoCoordinates.latitude),
+                  long: ($loc.geoCoordinates.longitude)
+                }
+              },
+
+              # --- Device ---
+              device: {
+                type_id: 0,
+                uid: ($dd.deviceId),
+                name: ($dd.displayName),
+                os: (
+                  if ($dd.operatingSystem // "") != ""
+                  then {
+                    name: $dd.operatingSystem,
+                    type_id: (
+                      ($dd.operatingSystem | ascii_downcase) as $os
+                      | if   ($os | test("windows")) then 100
+                        elif ($os | test("ipados")) then 302
+                        elif ($os | test("ios")) then 301
+                        elif ($os | test("mac")) then 300
+                        elif ($os | test("android")) then 201
+                        elif ($os | test("linux")) then 200
+                        else 0 end
+                    )
+                  }
+                  else null end
+                ),
+                is_compliant: ($dd.isCompliant),
+                is_managed: ($dd.isManaged)
+              },
+
+              # --- Session ---
+              session: {
+                uid: ($r.correlationId),
+                is_remote: true
+              },
+
+              # --- Cloud (Entra ID is an Azure cloud IAM service) ---
+              cloud: {
+                provider: "Microsoft Azure",
+                account: {
+                  uid: ($r.resourceTenantId // $r.homeTenantId),
+                  type: "Azure AD Tenant"
+                }
+              },
+
+              # --- OSINT: the sign-in source address as an observed indicator.
+              #     The Authentication class carries an osint context array;
+              #     populate it with the client IP seen on this event. ---
+              osint: [
+                {
+                  type_id: 1,
+                  value: ($r.ipAddress // "unknown")
+                }
+              ],
+
+              # --- Metadata (REQUIRED) ---
+              metadata: {
+                "profiles": ["cloud", "osint", "host", "security_control"],
+                version: "1.9.0",
+                uid: ($r.id),
+                correlation_uid: ($r.correlationId),
+                original_time: ($r.createdDateTime),
+                product: {
+                  vendor_name: "Microsoft",
+                  name: "Microsoft Entra ID"
+                }
+              },
+
+              # --- Observables ---
+              observables: (
+                [ ( if $r.userPrincipalName != null
+                    then { name: "user.name", type: "User Name", type_id: 4, value: $r.userPrincipalName }
+                    else empty end ),
+                  ( if $r.ipAddress != null
+                    then { name: "src_endpoint.ip", type: "IP Address", type_id: 2, value: $r.ipAddress }
+                    else empty end ) ]
+              ),
+
+              # --- Recommended ---
+              message: (
+                "Sign-in for " + ($r.userPrincipalName // "unknown")
+                + " to " + ($r.resourceDisplayName // "resource")
+                + ( if $ok then " succeeded" else " failed" end )
+              ),
+              risk_level: ($r.riskLevelDuringSignIn),
+
+              # --- Pass-through / audit ---
+              unmapped: {
+                appId: ($r.appId),
+                appDisplayName: ($r.appDisplayName),
+                conditionalAccessStatus: ($r.conditionalAccessStatus),
+                resourceTenantId: ($r.resourceTenantId),
+                homeTenantId: ($r.homeTenantId),
+                isInteractive: ($r.isInteractive)
+              },
+              raw_data: (. | tostring)
+            }
+          # Single shallow prune of top-level nulls; keeps required objects.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )

@@ -1,0 +1,152 @@
+name: "AlienVault OTX Indicators to OCSF v1.9.0"
+description: "Transforms AlienVault OTX IOC indicator records (enriched with parent-pulse threat context) into the OCSF v1.9.0 Detection Finding class (class_uid 2004) using the OSINT object."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "alienvault-otx-indicators"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "alienvault"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Detection Finding (class_uid=2004) — v1.9.0
+          # Input: ONE AlienVault OTX indicator record per invocation, as
+          #   emitted by the Monad `alienvault-otx-indicators` connector:
+          #   an IOC (indicator/type/created/role/...) enriched with a nested
+          #   parent-pulse object under `.pulse`.
+          #
+          # A threat-intel indicator is modeled as a Detection Finding that
+          # carries the IOC in the required `osint` object; the pulse supplies
+          # the finding title, references, and threat actor context.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z")
+                  | (if test("Z$") then . else . + "Z" end)
+                  | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.type // "") as $itype
+          | ($r.pulse // {}) as $p
+          | ($r.role // "") as $role
+
+          # OTX indicator type -> OCSF osint.type_id
+          | ( { "IPv4":1, "IPv6":1, "CIDR":1,
+                "domain":2,
+                "hostname":3,
+                "URL":5, "URI":5,
+                "FileHash-MD5":4, "FileHash-SHA1":4, "FileHash-SHA256":4,
+                "FileHash-PEHASH":4, "FileHash-IMPHASH":4, "FileHash-SSDEEP":4,
+                "email":9,
+                "CVE":10,
+                "FilePath":11, "Mutex":11 }[$itype] // 0 ) as $osint_type_id
+
+          # role -> OCSF severity_id (Unknown/Info/Low/Medium/High/Critical)
+          | ( { "malware_hosting":4, "c2":5, "command_and_control":5,
+                "exploit_hosting":4, "phishing":4, "scanning_host":3,
+                "malware":4, "bruteforce":3 }[$role] // 3 ) as $sev
+
+          | {
+              "category_uid": 2,
+              "class_uid":    2004,
+              "activity_id":  1,
+              "type_uid":     200401,
+              "severity_id":  $sev,
+
+              "time": to_epoch($r.created),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "AlienVault",
+                  "name": "Open Threat Exchange (OTX)"
+                }
+              },
+
+              # The feed source of the indicator. Detection Finding requires a
+              # cloud object in the bundled schema; the OTX feed is the provider.
+              "cloud": {
+                "provider": "AlienVault OTX"
+              },
+
+              "finding_info": {
+                "uid": ($r.id // $r.indicator | tostring),
+                "title": ($p.name // $r.title // ("OTX indicator: " + ($r.indicator // "unknown"))),
+                "desc": ($r.description // $r.content // $p.description // null),
+                "types": (if $itype == "" then null else [$itype] end),
+                "src_url": ($p.references[0]? // null)
+              },
+
+              # OSINT object carries the IOC itself (required: value, type_id).
+              # osint is an array of OSINT objects on Detection Finding.
+              "osint": [{
+                "value": ($r.indicator // ""),
+                "type_id": $osint_type_id,
+                "type": (if $itype == "" then null else $itype end),
+                "tlp": (if ($p.tlp // "") == "" then null else ($p.tlp | ascii_upcase) end),
+                "confidence_id": (if ($r.is_active // 0) == 1 then 2 else 0 end),
+                "name": ($r.title // null),
+                "desc": ($r.description // $r.content // null),
+                "uid": ($r.id | tostring),
+                "created_time": to_epoch($r.created),
+                "expiration_time": to_epoch($r.expiration),
+                "labels": ($p.tags // null),
+                "threat_actor": (if ($p.adversary // "") == "" then null
+                                 else { "name": $p.adversary } end),
+                # malware.classification_ids is required; source has only
+                # family names, so classification is Unknown (0).
+                "malware": (if ($p.malware_families // []) | length > 0
+                            then [ $p.malware_families[]
+                                   | { "name": ., "classification_ids": [0] } ]
+                            else null end),
+                # OTX attack_ids are MITRE ATT&CK technique IDs -> attacks[].technique.
+                "attacks": (if ($p.attack_ids // []) | length > 0
+                            then [ $p.attack_ids[] | { "technique": { "uid": . } } ]
+                            else null end)
+              }],
+
+              "status_id": (if ($r.is_active // 0) == 1 then 1 else 3 end),
+              "message": (($p.name // "OTX indicator")
+                          + " — " + ($itype // "indicator")
+                          + " " + ($r.indicator // "")),
+
+              "observables": (
+                [ { "name": "osint.value",
+                    "type_id": (if $osint_type_id == 1 then 2
+                                elif $osint_type_id == 2 then 1
+                                elif $osint_type_id == 5 then 6
+                                elif $osint_type_id == 4 then 8
+                                else 0 end),
+                    "value": ($r.indicator // "") } ]
+              ),
+
+              "unmapped": {
+                "role": (if $role == "" then null else $role end),
+                "targeted_countries": ($p.targeted_countries // null),
+                "industries": ($p.industries // null),
+                "pulse_id": ($p.id // null),
+                "pulse_modified": ($p.modified // null)
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # prune null / empty leaves while keeping required objects populated
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            )

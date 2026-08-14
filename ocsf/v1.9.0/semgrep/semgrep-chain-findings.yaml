@@ -1,0 +1,147 @@
+name: "Semgrep Supply Chain Findings to OCSF v1.9.0"
+description: "Transforms Semgrep Supply Chain (dependency) Findings into the OCSF v1.9.0 Vulnerability Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+  - "https://github.com/Credgate"
+inputs:
+  - "semgrep-chain-findings"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "semgrep"
+  - "supply-chain"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one semgrep-chain-findings record per invocation.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | (if   $sev == "critical" then 5
+             elif $sev == "high"     then 4
+             elif $sev == "medium"   then 3
+             elif $sev == "low"      then 2
+             else 1 end) as $sev_id
+          | ($r.rule.cwe_names[0] // null) as $cwe0
+          | (($r.rule.vulnerability_identifier // "") | startswith("CVE-")) as $has_cve
+          | ({ "5": "Critical", "4": "High", "3": "Medium", "2": "Low", "1": "Informational" }[$sev_id | tostring] // "Unknown") as $sev_caption
+          | ($r.found_dependency // {}) as $dep
+          | (if ($dep.package // null) != null
+             then ($dep.package + (if ($dep.version // null) != null then "@" + $dep.version else "" end))
+             else ($r.repository.name // ($r.id | tostring)) end) as $indicator
+          | {
+              "class_uid": 2002,
+              "category_uid": 2,
+              "activity_id": 1,
+              "type_uid": 200201,
+              "severity_id": $sev_id,
+              "severity": $sev_caption,
+
+              "time": to_epoch($r.created_at),
+              "start_time": to_epoch($r.relevant_since),
+
+              "status_id": (if ($r.status // $r.state) == "open" or ($r.status // $r.state) == "unresolved" then 1
+                            elif ($r.status // $r.state) == "resolved" or ($r.status // $r.state) == "fixed" then 4
+                            else 0 end),
+              "status": (if ($r.status // $r.state) == "resolved" or ($r.status // $r.state) == "fixed" then "Resolved" else "New" end),
+              "message": $r.rule_message,
+
+              "observables": [
+                { "name": "finding_info.uid", "type_id": 0, "value": ($r.id | tostring) },
+                { "name": "metadata.uid", "type_id": 0, "value": ($r.id | tostring) }
+              ],
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Semgrep",
+                  "name": "Semgrep Supply Chain"
+                },
+                "uid": ($r.id | tostring)
+              },
+
+              "cloud": {
+                "provider": "Unknown",
+                "account": { "name": $r.repository.name }
+              },
+
+              "finding_info": {
+                "uid": ($r.id | tostring),
+                "title": $r.rule_name,
+                "desc": $r.rule_message,
+                "first_seen_time": to_epoch($r.relevant_since),
+                "src_url": ($r.repository.url // null)
+              },
+
+              "osint": [
+                {
+                  "value": $indicator,
+                  "type_id": 99,
+                  "type": "Software Package"
+                }
+              ],
+
+              "vulnerabilities": [
+                {
+                  "desc": $r.rule_message,
+                  "title": $r.rule_name,
+                  "severity": ($r.severity // "Unknown"),
+                  "vendor_name": "Semgrep",
+                  "is_fix_available": (($r.fix_recommendations // []) | length > 0),
+                  "first_seen_time": to_epoch($r.relevant_since),
+                  "last_seen_time": to_epoch($r.created_at),
+                  # vulnerability carries a just_one [advisory, cve, cwe]
+                  # constraint — emit exactly one. Prefer the CVE (more
+                  # actionable); fall back to the CWE only when no CVE exists.
+                  "cve": (if $has_cve
+                          then { "uid": $r.rule.vulnerability_identifier }
+                          else null end),
+                  "cwe": (if ($has_cve | not) and $cwe0 != null
+                          then {
+                            "uid": ($cwe0 | split(":")[0]),
+                            "caption": ($cwe0 | split(": ")[1:] | join(": ")),
+                            "src_url": "https://cwe.mitre.org/"
+                          }
+                          else null end),
+                  "affected_packages": [
+                    {
+                      "name": ($dep.package // null),
+                      "version": ($dep.version // null),
+                      "package_manager": ($dep.ecosystem // null),
+                      "fixed_in_version": ($r.fix_recommendations // [] | (.[0].version // null))
+                    }
+                  ],
+                  "affected_code": [
+                    {
+                      "file": {
+                        "path": $r.location.file_path,
+                        "name": ($r.location.file_path | split("/")[-1]),
+                        "type_id": 0
+                      },
+                      "start_line": $r.location.line,
+                      "end_line": $r.location.end_line
+                    }
+                  ],
+                  "references": ($r.rule.references // $r.rule.owasp_names // null)
+                }
+              ],
+
+              "raw_data": ($r | tostring)
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != [] and .value != {})) else . end)

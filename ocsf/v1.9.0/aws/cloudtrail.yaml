@@ -1,0 +1,198 @@
+name: "AWS CloudTrail to OCSF v1.9.0"
+description: "Transforms individual AWS CloudTrail event records into the OCSF v1.9.0 API Activity (6003) class, resolving the acting identity across every AWS sign-in form and mapping the API call, cloud context, and source endpoint."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudtrail"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "cloudtrail"
+  - "api"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one AWS CloudTrail event record per invocation, as emitted
+          #   by the Monad `cloudtrail` input connector.
+          #
+          # CloudTrail is the canonical example of an OCSF API Activity event:
+          # a general CRUD API call. activity_id is derived from the eventName
+          # verb (Create=1 / Read=2 / Update=3 / Delete=4, else Other=99).
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          def real_name($s):
+            if ($s | type) == "string" and $s != "HIDDEN_DUE_TO_SECURITY_REASONS"
+            then $s else null end;
+
+          def g($o; $k): if ($o | type) == "object" then $o[$k] else null end;
+
+          def sid($o): real_name(g($o; "sourceIdentity"));
+
+          def session_name($p):
+            if ($p | type) == "string" and ($p | test(":"))
+            then ($p | sub("^[^:]*:"; "")) else null end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.userIdentity // {} ) as $ui
+          | ( $ui.sessionContext // {} ) as $sc
+          | ( $r.requestParameters ) as $rp
+          | ( $r.responseElements ) as $re
+          | ( $r.additionalEventData ) as $aed
+
+          # ---- activity_id (CRUD) from the eventName verb -----------------
+          | ( ($r.eventName // "") ) as $en
+          | ( if ($r.readOnly // false) == true then 2
+              elif ($en | test("^(Create|Add|Enable|Register|Put|Allocate|Import|Run|Provision|Attach|Associate|Generate|Issue)")) then 1
+              elif ($en | test("^(Delete|Remove|Deregister|Disable|Detach|Disassociate|Terminate|Revoke)")) then 4
+              elif ($en | test("^(Update|Modify|Set|Change|Replace|Put)")) then 3
+              elif ($en | test("^(Describe|Get|List|Lookup|Head|Search|View|Batch)")) then 2
+              else 99 end ) as $activity_id
+
+          # ---- outcome / status ------------------------------------------
+          | ( ($r.errorCode // null) != null ) as $is_failure
+          | ( if $is_failure then 2 else 1 end ) as $status_id
+
+          # ---- IDENTITY RESOLUTION (most-authoritative first) ------------
+          | ( g($ui.onBehalfOf; "userId") ) as $idc_user_id
+          | ( if $idc_user_id != null then session_name($ui.principalId)
+              else null end ) as $idc_name
+          | ( sid($sc) // sid($rp) // sid($re) ) as $source_identity
+          | ( $source_identity
+              // $idc_name
+              // real_name(g($aed; "UserName"))
+              // real_name($ui.userName)
+              // real_name($sc.sessionIssuer.userName) ) as $actor_name
+
+          | {
+              # --- Classification (required) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $activity_id,
+              "type_uid":     (6003 * 100 + $activity_id),
+              "severity_id":  1,
+              "status_id":    $status_id,
+              "status":       ( if $is_failure then "Failure" else "Success" end ),
+
+              # --- Time (required) ---
+              "time": to_epoch($r.eventTime),
+
+              # --- Metadata (required) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "uid": $r.eventID,
+                "correlation_uid": $r.requestID,
+                "product": {
+                  "vendor_name": "AWS",
+                  "name": "CloudTrail",
+                  "feature": { "name": ($r.eventType // "AwsApiCall") }
+                }
+              },
+
+              # --- OSINT (required array; empty when no threat-intel context) ---
+              "osint": [],
+
+              # --- Cloud (required) ---
+              "cloud": {
+                "provider": "AWS",
+                "region": $r.awsRegion,
+                "account": { "uid": ($r.recipientAccountId // $ui.accountId), "type_id": 10 }
+              },
+
+              # --- Actor (required; at_least_one user/... satisfied by user) ---
+              "actor": {
+                "user": {
+                  "name": $actor_name,
+                  "uid": ($idc_user_id // $ui.principalId),
+                  "uid_alt": $ui.arn,
+                  "account": { "uid": $ui.accountId, "type_id": 10 },
+                  "credential_uid": $ui.accessKeyId
+                },
+                "session": {
+                  "created_time": ( to_epoch(g($sc.attributes; "creationDate")) ),
+                  "is_mfa": ( (g($sc.attributes; "mfaAuthenticated") // "") == "true" ),
+                  "issuer": $sc.sessionIssuer.arn
+                },
+                "invoked_by": $ui.invokedBy
+              },
+
+              # --- API (required; api.operation required) ---
+              "api": {
+                "operation": $r.eventName,
+                "version": $r.apiVersion,
+                "request": { "uid": $r.requestID },
+                "response": (
+                  if $is_failure
+                  then { "error": $r.errorCode, "message": $r.errorMessage }
+                  else null end
+                ),
+                "service": { "name": $r.eventSource }
+              },
+
+              # --- Source endpoint (required; at_least_one ip/domain/...) ---
+              "src_endpoint": {
+                "ip": ( if is_ip($r.sourceIPAddress) then $r.sourceIPAddress else null end ),
+                "domain": ( if is_ip($r.sourceIPAddress) then null else $r.sourceIPAddress end ),
+                "uid": $r.vpcEndpointId
+              },
+
+              # --- Recommended fields ---
+              "dst_endpoint": {
+                "svc_name": $r.eventSource,
+                "domain": ( g($r.tlsDetails; "clientProvidedHostHeader") )
+              },
+              "http_request": { "user_agent": $r.userAgent },
+              "resources": ( ($r.resources // [])
+                | map({ "uid": .ARN, "type": .type,
+                        "cloud_partition": null,
+                        "labels": null } | with_entries(select(.value != null))) ),
+              "unmapped": {
+                "eventVersion": $r.eventVersion,
+                "managementEvent": $r.managementEvent,
+                "readOnly": $r.readOnly,
+                "eventCategory": $r.eventCategory,
+                "tlsVersion": ( g($r.tlsDetails; "tlsVersion") ),
+                "cipherSuite": ( g($r.tlsDetails; "cipherSuite") )
+              },
+
+              # --- Observables (a real attribute of this class each) ---
+              "observables": (
+                [ ( if $actor_name != null
+                    then { "name": "actor.user.name", "type_id": 21, "value": $actor_name }
+                    else null end ),
+                  ( if is_ip($r.sourceIPAddress)
+                    then { "name": "src_endpoint.ip", "type_id": 2, "value": $r.sourceIPAddress }
+                    else null end ) ]
+                | map(select(. != null))
+              )
+            }
+          # Prune nulls/empties, then guarantee the required osint scaffold
+          # survives (an empty array is valid and expected here).
+          | . as $built
+          | ($built | prune) + { "osint": ($built.osint // []) }

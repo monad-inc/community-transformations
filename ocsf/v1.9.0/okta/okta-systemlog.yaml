@@ -1,0 +1,140 @@
+name: "Okta System Log to OCSF v1.9.0"
+description: "Transforms Okta System Log records into the OCSF v1.9.0 Authentication (class_uid 3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "okta-systemlog"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "okta"
+  - "authentication"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002, category_uid=3) — v1.9.0
+          # Input: one Okta System Log record per invocation.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $d
+          | ($d.eventType // "") as $et
+          | ($d.actor // {}) as $actor
+          | ($d.client // {}) as $client
+          | ($d.debugContext.debugData // {}) as $dd
+          | ($d.authenticationContext // {}) as $ac
+          | ($d.outcome.result // "") as $result
+
+          # Logon vs Logoff vs Unknown.
+          | ( if ($et | startswith("user.session.start")) or ($et | startswith("user.authentication"))
+                then {aid: 1, aname: "Logon"}
+              elif ($et | startswith("user.session.end")) or ($et | contains("logout"))
+                then {aid: 2, aname: "Logoff"}
+              else {aid: 0, aname: "Unknown"} end ) as $act
+
+          # Okta severity string -> OCSF severity_id.
+          | ( { "DEBUG": 1, "INFO": 1, "WARN": 3, "ERROR": 4 }[$d.severity] // 0 ) as $sev
+
+          # Okta outcome.result -> OCSF status_id (1 Success / 2 Failure).
+          | ( if ($result | ascii_upcase) == "SUCCESS" then 1
+              elif $result == "" then 0
+              else 2 end ) as $status_id
+
+          # MFA / factor-based auth is signalled by the auth provider.
+          | ( ($ac.authenticationProvider // "") | ascii_upcase | contains("FACTOR") ) as $is_mfa
+
+          | {
+              "category_uid": 3,
+              "class_uid":    3002,
+              "activity_id":  $act.aid,
+              "activity_name": $act.aname,
+              "type_uid":     (3002 * 100 + $act.aid),
+              "severity_id":  $sev,
+
+              # Okta is a cloud identity provider; class requires cloud + osint.
+              "cloud": { "provider": "Okta" },
+
+              "time": to_epoch($d.published),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Okta",
+                  "name": "Okta System Log"
+                },
+                "uid": $d.uuid,
+                "original_time": $d.published,
+                "log_provider": "Okta"
+              },
+
+              # at_least_one(account, name, uid) — name + uid populated.
+              "user": {
+                "name": $actor.displayName,
+                "uid": $actor.id,
+                "email_addr": $actor.alternateId,
+                "type": $actor.type
+              },
+
+              "src_endpoint": {
+                "ip": $client.ipAddress,
+                "hostname": $dd.requestUri,
+                "interface_name": $client.device,
+                "location": (
+                  ($client.geographicalContext // {}) as $g
+                  | { "city": $g.city, "region": $g.state, "country": $g.country,
+                      "postal_code": $g.postalCode }
+                  | with_entries(select(.value != null and .value != ""))
+                )
+              },
+
+              # authentication class constraint at_least_one(service, dst_endpoint).
+              "dst_endpoint": {
+                "hostname": $dd.requestUri,
+                "svc_name": $dd.url
+              },
+
+              "auth_protocol_id": ( if $is_mfa then 1 else 0 end ),
+              "auth_protocol": ( if $is_mfa then "Other / MFA" else "Unknown" end ),
+              "is_mfa": $is_mfa,
+
+              "logon_type": $d.transaction.type,
+              "session": {
+                "uid": $ac.externalSessionId
+              },
+
+              "status": ( if $result == "" then null else $result end ),
+              "status_id": $status_id,
+
+              "message": $d.displayMessage,
+
+              "observables": (
+                [ ( if $actor.alternateId then
+                      { "name": "user.email_addr", "type": "Email Address", "type_id": 5, "value": $actor.alternateId }
+                    else empty end ),
+                  ( if $client.ipAddress then
+                      { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": $client.ipAddress }
+                    else empty end ),
+                  ( if $actor.displayName then
+                      { "name": "user.name", "type": "User Name", "type_id": 4, "value": $actor.displayName }
+                    else empty end ) ]
+              ),
+
+              "raw_data": ($d | tostring)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null))
+              else . end
+            )
+          # osint is class-required; no OSINT data for Okta auth events -> empty.
+          | . + { "osint": [] }

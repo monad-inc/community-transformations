@@ -1,0 +1,109 @@
+name: "Atlassian Jira Audit Logs to OCSF v1.9.0"
+description: "Transforms Atlassian Jira audit log records into the OCSF v1.9.0 Entity Management (3004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "atlassian"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Entity Management (class_uid=3004) — v1.9.0
+          # Input: one Atlassian Jira audit log record per invocation, as
+          #   returned by the Jira auditing REST API (/rest/api/3/auditing
+          #   /record). Fields: id, summary, remoteAddress, authorKey,
+          #   authorAccountId, created, category, eventSource, description,
+          #   objectItem{id,name,typeName,parentId,parentName},
+          #   changedValues[], associatedItems[].
+          # ---------------------------------------------------------------
+          . as $r
+
+          # Jira `created` looks like "2026-08-11T14:52:07.913+0000" (numeric
+          # offset, fractional seconds) — normalize to a form fromdateiso8601
+          # accepts (strip fractional secs + offset, treat as UTC).
+          | (if ($r.created | type) == "number" then $r.created
+             elif $r.created == null then null
+             else ($r.created
+                   | sub("\\.[0-9]+"; "")
+                   | sub("([+-][0-9]{2}:?[0-9]{2}|Z)$"; "")
+                   | . + "Z"
+                   | fromdateiso8601)
+             end) as $time
+
+          # Map the summary verb to an Entity Management activity_id.
+          | ($r.summary // "" | ascii_downcase) as $s
+          | (if   ($s | test("creat|added|grant")) then 1
+             elif ($s | test("delet|remov|revok"))  then 4
+             elif ($s | test("updat|chang|renam|modif")) then 3
+             else 99 end) as $activity_id
+
+          # Managed entity = the object the audit record acted upon.
+          | ($r.objectItem // {}) as $obj
+          | {
+              "category_uid": 3,
+              "class_uid":    3004,
+              "type_uid":     (3004 * 100 + $activity_id),
+              "activity_id":  $activity_id,
+              "activity_name": $r.summary,
+              "severity_id":  1,
+              "status_id":    1,
+
+              "time": $time,
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "uid": ($r.id | tostring),
+                "product": {
+                  "vendor_name": "Atlassian",
+                  "name": "Jira",
+                  "feature": { "name": ($r.eventSource // "Audit Log") }
+                }
+              },
+
+              # Base-required objects on 3004 (profile=null in the schema).
+              "entity": ( {
+                "type":    $obj.typeName,
+                "name":    $obj.name,
+                "uid":     (if ($obj.id == null) then null else ($obj.id | tostring) end),
+                "type_id": (if ($obj.typeName | type) == "string"
+                            then ({ "USER": 1, "GROUP": 6 }[($obj.typeName | ascii_upcase)] // 0)
+                            else null end)
+              } | with_entries(select(.value != null)) ),
+              "osint": [],
+              "cloud": { "provider": "Atlassian" },
+
+              # Recommended: who did it, from where.
+              "actor": {
+                "user": ( {
+                  "name": $r.authorKey,
+                  "uid":  $r.authorAccountId
+                } | with_entries(select(.value != null)) )
+              },
+              "src_endpoint": (
+                if ($r.remoteAddress | type) == "string" and ($r.remoteAddress | test("^[0-9A-Fa-f:.]+$"))
+                then { "ip": $r.remoteAddress }
+                else null end
+              ),
+              "status": "Success",
+              "message": ($r.description // $r.summary),
+
+              "unmapped": ( {
+                "category":        $r.category,
+                "changed_values":  $r.changedValues,
+                "associated_items": $r.associatedItems,
+                "object_parent":   $obj.parentName
+              } | with_entries(select(.value != null)) ),
+
+              "raw_data": ($r | tostring)
+            }
+          | with_entries(select(.value != null))

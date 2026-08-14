@@ -1,0 +1,110 @@
+name: "GitHub Audit Logs to OCSF v1.9.0"
+description: "Transforms GitHub (Enterprise/Organization) audit log records into the OCSF v1.9.0 API Activity (6003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "github"
+  - "application"
+metadata:
+  version: "1.9.0"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one GitHub audit-log record per invocation.
+          # GitHub audit entries are administrative CRUD actions on the
+          # platform (org/team/repo/member management), which map cleanly
+          # to OCSF API Activity.
+          # ---------------------------------------------------------------
+          . as $r
+
+          # created_at / @timestamp are epoch-milliseconds in GitHub exports.
+          | def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then ($ts | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+
+          # operation_type -> OCSF activity_id (Create/Read/Update/Delete/Other)
+          ( { "create": 1, "access": 2, "modify": 3, "remove": 4 }[$r.operation_type] // 99 ) as $act
+
+          | {
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $act,
+              "type_uid":     (6003 * 100 + $act),
+              "severity_id":  1,
+
+              "time": to_epoch_ms($r.created_at // $r["@timestamp"]),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "GitHub",
+                  "name": "GitHub Audit Log"
+                },
+                "uid": $r._document_id
+              },
+
+              # --- Cloud (REQUIRED on api_activity): GitHub is the SaaS provider ---
+              "cloud": {
+                "provider": "GitHub",
+                "org": { "name": $r.org, "uid": (if $r.org_id != null then ($r.org_id | tostring) else null end) }
+              },
+
+              # --- Actor (REQUIRED): who performed the action ---
+              "actor": {
+                "user": {
+                  "type_id": 1,
+                  "name": $r.actor,
+                  "uid": (if $r.actor_id != null then ($r.actor_id | tostring) else null end)
+                },
+                "app_name": $r.user_agent
+              },
+
+              # --- API details (REQUIRED): api.operation is required ---
+              "api": {
+                "operation": $r.action,
+                "service": { "name": ($r.action | split(".")[0]) }
+              },
+
+              # --- Source endpoint (REQUIRED) ---
+              "src_endpoint": {
+                "ip": $r.actor_ip,
+                "location": { "country": $r.actor_location.country_code }
+              },
+
+              "status_id": 1,
+              "status": "Success",
+              "message": (($r.actor // "?") + " performed " + ($r.action // "?")),
+
+              "unmapped": {
+                "org": $r.org,
+                "org_id": $r.org_id,
+                "business": $r.business,
+                "business_id": $r.business_id,
+                "repo": ($r.repo // $r.repository),
+                "team": $r.team,
+                "target_user": $r.user,
+                "target_user_id": $r.user_id
+              },
+
+              "raw_data": ($r | tostring)
+            }
+
+          # Drop null/empty leaves while preserving required objects.
+          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {})) else . end )
+
+          # osint is base-required on api_activity; audit logs carry no threat
+          # indicators, so emit an honest empty array (re-added post-prune).
+          | . + { "osint": [] }

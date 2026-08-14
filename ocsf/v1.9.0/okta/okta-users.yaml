@@ -1,0 +1,122 @@
+name: "Okta Users to OCSF v1.9.0"
+description: "Transforms Okta Users directory records into the OCSF v1.9.0 User Inventory Info (5003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "okta-users"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "okta"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
+          # Input: one Okta Users (directory) record per invocation.
+          # activity_id=2 (Collect); type_uid = 5003*100 + 2 = 500302.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r |
+          ($r.profile // {}) as $p |
+          # Okta account status -> OCSF user account is_enabled / state
+          ($r.status // "") as $st |
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 5,
+            "class_uid":    5003,
+            "activity_id":  2,
+            "activity_name": "Collect",
+            "type_uid":     500302,
+            "type_name":    "User Inventory Info: Collect",
+            "severity_id":  1,
+            "severity":     "Informational",
+            "status_id":    (if $st == "ACTIVE" then 1 elif $st == "" then 0 else 2 end),
+            "status":       $st,
+            "message":      ("Okta user inventory: " + ($p.login // $p.email // $r.id) + " (" + $st + ")"),
+            "observables": ([
+              (if ($p.login // $p.email) then { "name": "user.name", "type_id": 21, "value": ($p.login // $p.email) } else empty end),
+              (if $p.email then { "name": "user.email_addr", "type_id": 5, "value": $p.email } else empty end)
+            ]),
+
+            # --- Time (REQUIRED) ---
+            "time":       to_epoch($r.lastUpdated // $r.created),
+            "start_time": to_epoch($r.created),
+            "end_time":   to_epoch($r.lastLogin),
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+                "profiles": ["cloud", "osint"],
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "Okta",
+                "name": "Okta"
+              },
+              "original_time": ($r.lastUpdated // $r.created)
+            },
+
+            # --- User (REQUIRED) ---
+            "user": {
+              "uid":         $r.id,
+              "name":        ($p.login // $p.email),
+              "email_addr":  $p.email,
+              "full_name":   ($p.displayName // (($p.firstName // "") + " " + ($p.lastName // "") | ltrimstr(" ") | rtrimstr(" "))),
+              "type_id":     1,
+              "type":        "User",
+              "phone_number": $p.mobilePhone,
+              "uid_alt":      $p.employeeNumber,
+              "org": {
+                "name":        $p.organization,
+                "ou_name":     $p.department
+              },
+              "account": {
+                "uid":         $r.id,
+                "name":        ($p.login // $p.email),
+                "type_id":     99,
+                "type":        "Okta",
+                "is_disabled": ($st != "ACTIVE")
+              }
+            },
+
+            # --- Cloud (REQUIRED by class) ---
+            "cloud": {
+              "provider": "Okta"
+            },
+
+            # --- OSINT (REQUIRED by class) ---
+            "osint": [
+              {
+                "value":   ($p.email // $p.login // $r.id),
+                "type_id": 6
+              }
+            ],
+
+            # --- Unmapped Okta directory fields ---
+            "unmapped": {
+              "status":          $r.status,
+              "statusChanged":   $r.statusChanged,
+              "passwordChanged": $r.passwordChanged,
+              "activated":       $r.activated,
+              "title":           $p.title,
+              "manager":         $p.manager,
+              "userType":        $p.userType,
+              "credentialProvider": ($r.credentials.provider.type // null),
+              "city":            $p.city,
+              "state":           $p.state,
+              "countryCode":     $p.countryCode
+            },
+
+            # --- Original record ---
+            "raw_data": ($r | tostring)
+          }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)

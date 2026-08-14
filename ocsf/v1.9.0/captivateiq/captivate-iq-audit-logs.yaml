@@ -1,0 +1,109 @@
+name: "CaptivateIQ Audit Logs to OCSF v1.9.0"
+description: "Transforms CaptivateIQ Audit Logs records into the OCSF v1.9.0 Entity Management (class_uid 3004) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "captivate-iq-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "captivateiq"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Entity Management (class_uid=3004, category_uid=3) — v1.9.0
+          # Input: one CaptivateIQ audit_log record per invocation.
+          # A user at the CaptivateIQ management console performs a
+          # create/update/delete on a managed entity (worksheet, plan,
+          # employee, user, column, ...). event_type -> activity_id.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.event_type // "" | ascii_downcase) as $et
+          | ( { "create": 1, "read": 2, "update": 3, "delete": 4 }[$et] // 0 ) as $act
+          | ($r.object_type // "" | ascii_downcase) as $ot
+          | ( if ($ot == "user") then 2
+              elif ($ot == "employee") then 2
+              elif ($ot == "organization" or $ot == "org") then 4
+              else 99 end ) as $ent_type_id
+          | ($r.ip_address) as $ip
+          | ($r.user_email // $r.logged_in_user_email) as $email
+          | {
+              "category_uid": 3,
+              "class_uid":    3004,
+              "activity_id":  $act,
+              "type_uid":     (3004 * 100 + $act),
+              "severity_id":  1,
+
+              "time": to_epoch($r.created_at),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "CaptivateIQ",
+                  "name": "CaptivateIQ"
+                },
+                "tenant_uid": $r.organization_id,
+                "log_name": "audit_log",
+                "uid": $r.id
+              },
+
+              # The managed entity that was created/updated/deleted.
+              "entity": ( {
+                "type_id": $ent_type_id,
+                "uid":     $r.object_id,
+                "name":    $r.object_name,
+                "type":    $r.object_type,
+                "data":    ($r.data // null)
+              } | with_entries(select(.value != null)) ),
+
+              # Who performed it. The logged-in principal (impersonation case)
+              # is retained under unmapped; actor.invoked_by is deprecated in
+              # OCSF 1.9.0.
+              "actor": {
+                "user": ( {
+                  "uid":        $r.user_id,
+                  "name":       $r.user_name,
+                  "email_addr": $r.user_email
+                } | with_entries(select(.value != null)) )
+              },
+
+              "src_endpoint": ( { "ip": $ip } | with_entries(select(.value != null)) ),
+
+              # osint + cloud are class-required in OCSF 1.9.0. Represent the
+              # source IP as an observable indicator; cloud = the SaaS provider.
+              "osint": ( if $ip != null then [{ "type_id": 1, "value": $ip }]
+                         elif $email != null then [{ "type_id": 8, "value": $email }]
+                         else [{ "type_id": 99, "value": ($r.object_id // "unknown") }] end ),
+              "cloud": { "provider": "CaptivateIQ" },
+
+              "status_id": 1,
+              "status": "Success",
+              "message": ("CaptivateIQ " + ($r.event_type // "event") + " on " + ($r.object_type // "object") + " " + ($r.object_name // ($r.object_id // ""))),
+
+              "unmapped": ( {
+                "api_version":         $r.version,
+                "object":              $r.object,
+                "organization_name":   $r.organization_name,
+                "logged_in_user_name": $r.logged_in_user_name,
+                "logged_in_user_id":   ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id)
+                                         then $r.logged_in_user_id else null end ),
+                "logged_in_user_email": ( if ($r.logged_in_user_id != null and $r.logged_in_user_id != $r.user_id)
+                                          then $r.logged_in_user_email else null end ),
+                "parent_objects":      $r.parent_objects
+              } | with_entries(select(.value != null)) ),
+
+              "raw_data": ($r | tostring)
+            }

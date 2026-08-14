@@ -1,0 +1,172 @@
+name: "AWS Inspector Findings to OCSF v1.9.0"
+description: "Transforms AWS Inspector (Inspector2) findings into the OCSF v1.9.0 Vulnerability Finding class (2002), mapping package-vulnerability, code-vulnerability, and network-reachability findings, CVSS/EPSS scores, and the affected AWS resource."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-inspector"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one AWS Inspector (Inspector2) Finding record per call.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then ($ts | floor)
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Prune null / "" / {} but KEEP arrays (osint: [] must survive).
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {}))
+              else . end
+            );
+
+          . as $r
+          | ( $r.packageVulnerabilityDetails ) as $pvd
+          | ( $r.resources // [] ) as $res
+          | ( $res[0] // {} ) as $r0
+
+          # --- severity: Inspector -> OCSF severity_id ---
+          | ( { "INFORMATIONAL": 1, "LOW": 2, "MEDIUM": 3,
+                "HIGH": 4, "CRITICAL": 5, "UNTRIAGED": 0 }[$r.severity] // 0 ) as $sev
+
+          # --- status: Inspector -> OCSF status_id ---
+          | ( { "ACTIVE": 1, "SUPPRESSED": 3, "CLOSED": 4 }[$r.status] // 0 ) as $stat
+
+          # --- activity: closed finding -> Close; re-observed -> Update; else Create ---
+          | ( if $r.status == "CLOSED" then 3
+              elif (($r.updatedAt // 0) > ($r.firstObservedAt // 0)) then 2
+              else 1 end ) as $act
+
+          # --- CVSS scores from packageVulnerabilityDetails.cvss[] ---
+          | ( ($pvd.cvss // [])
+              | map({ base_score: .baseScore,
+                      vector_string: .scoringVector,
+                      version: .version,
+                      src_url: .source }) ) as $cvss
+
+          # --- affected packages ---
+          | ( ($pvd.vulnerablePackages // [])
+              | map({ name: .name,
+                      version: .version,
+                      architecture: .arch,
+                      epoch: .epoch,
+                      release: .release,
+                      package_manager: .packageManager,
+                      path: .filePath,
+                      fixed_in_version: .fixedInVersion,
+                      remediation: ( if .remediation != null
+                                     then { desc: .remediation } else null end ) }
+                    | with_entries(select(.value != null))) ) as $pkgs
+
+          | {
+              category_uid: 2,
+              class_uid:    2002,
+              activity_id:  $act,
+              type_uid:     (2002 * 100 + $act),
+              severity_id:  $sev,
+              status_id:    $stat,
+
+              time: to_epoch($r.updatedAt // $r.lastObservedAt // $r.firstObservedAt),
+              start_time: to_epoch($r.firstObservedAt),
+              end_time:   to_epoch($r.lastObservedAt),
+
+              message: $r.description,
+
+              metadata: {
+                "profiles": ["cloud", "osint"],
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "Amazon Inspector",
+                  feature: { name: $r.type }
+                },
+                uid: $r.findingArn
+              },
+
+              # OSINT is a base-required attribute of the class in 1.9.0.
+              # Inspector carries no open-source-intel indicators, so emit [].
+              osint: [],
+
+              cloud: {
+                provider: "AWS",
+                region: ($r0.region // "unknown"),
+                account: { uid: $r.awsAccountId }
+              },
+
+              finding_info: {
+                uid: $r.findingArn,
+                title: ($r.title // ($pvd.vulnerabilityId // "AWS Inspector finding")),
+                desc: $r.description,
+                types: [ $r.type ],
+                created_time: to_epoch($r.firstObservedAt),
+                first_seen_time: to_epoch($r.firstObservedAt),
+                last_seen_time: to_epoch($r.lastObservedAt),
+                modified_time: to_epoch($r.updatedAt),
+                src_url: ($pvd.sourceUrl // null)
+              },
+
+              vulnerabilities: [
+                {
+                  title: $r.title,
+                  desc: $r.description,
+                  severity: $r.severity,
+                  is_fix_available: ( ($r.fixAvailable // "NO") | (. == "YES" or . == "PARTIAL") ),
+                  is_exploit_available: ( ($r.exploitAvailable // "NO") == "YES" ),
+                  references: ($pvd.referenceUrls // []),
+                  first_seen_time: to_epoch($r.firstObservedAt),
+                  last_seen_time: to_epoch($r.lastObservedAt),
+                  remediation: ( if ($r.remediation.recommendation.text // null) != null
+                                 then { desc: $r.remediation.recommendation.text,
+                                        references: ( [ $r.remediation.recommendation.Url ]
+                                                      | map(select(. != null)) ) }
+                                 else null end ),
+                  affected_packages: $pkgs,
+                  cve: ( if ($pvd.vulnerabilityId // null) != null then {
+                           uid: $pvd.vulnerabilityId,
+                           title: $r.title,
+                           references: ($pvd.referenceUrls // []),
+                           created_time: to_epoch($pvd.vendorCreatedAt),
+                           modified_time: to_epoch($pvd.vendorUpdatedAt),
+                           cvss: $cvss,
+                           epss: ( if ($r.epss.score // null) != null
+                                   then { score: ($r.epss.score | tostring) } else null end )
+                         } | with_entries(select(.value != null)) else null end )
+                }
+                | with_entries(select(.value != null))
+              ],
+
+              resources: ( $res | map({
+                  uid: .id,
+                  type: .type,
+                  region: .region,
+                  cloud_partition: .partition,
+                  labels: ( (.tags // {}) | to_entries | map("\(.key):\(.value)") )
+                } | with_entries(select(.value != null))) ),
+
+              observables: (
+                [ ( if ($pvd.vulnerabilityId // null) != null
+                    then { name: "vulnerabilities.cve.uid", type_id: 25, value: $pvd.vulnerabilityId }
+                    else null end ),
+                  ( if ($r0.id // null) != null
+                    then { name: "resources.uid", type_id: 10, value: $r0.id }
+                    else null end ) ]
+                | map(select(. != null)) ),
+
+              raw_data: ($r | tostring)
+            }
+          | prune

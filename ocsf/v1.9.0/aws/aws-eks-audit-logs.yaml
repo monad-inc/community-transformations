@@ -1,0 +1,156 @@
+name: "AWS EKS Audit Logs to OCSF v1.9.0"
+description: "Transforms Amazon EKS (Kubernetes API server) audit.k8s.io/v1 audit records into the OCSF v1.9.0 API Activity class (class_uid 6003)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-eks-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003, category_uid=6) — v1.9.0
+          # Input: one Amazon EKS Kubernetes audit event (audit.k8s.io/v1)
+          # per invocation, as delivered by the aws-eks-audit-logs connector.
+          #
+          # Kubernetes audit verb -> OCSF activity_id:
+          #   create                       -> 1 (Create)
+          #   get/list/watch               -> 2 (Read)
+          #   update/patch                 -> 3 (Update)
+          #   delete/deletecollection      -> 4 (Delete)
+          #   anything else                -> 99 (Other)
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          | ( $r.user // {} )           as $u
+          | ( $r.objectRef // {} )      as $obj
+          | ( $r.responseStatus // {} ) as $rs
+          | ( $r.annotations // {} )    as $ann
+          | ( $r.verb // "" )           as $verb
+          | ( { "create":1, "get":2, "list":2, "watch":2,
+                "update":3, "patch":3, "delete":4, "deletecollection":4 }[$verb] // 99 ) as $activity
+          # Map the Kubernetes audit verb to the closest real HTTP method for
+          # http_request.http_method (an enum). Unknown verbs -> null (omitted).
+          | ( { "create":"POST", "get":"GET", "list":"GET", "watch":"GET",
+                "update":"PUT", "patch":"PATCH", "delete":"DELETE",
+                "deletecollection":"DELETE" }[$verb] ) as $httpm
+          | ( $rs.code // null )        as $code
+          | ( $ann["authorization.k8s.io/decision"] // null ) as $decision
+          | ( if ($decision == "forbid") or ($code != null and $code >= 400)
+              then 2 else 1 end ) as $status_id
+          | ( if $status_id == 2 then 3 else 1 end ) as $severity_id
+
+          | ( {
+              category_uid: 6,
+              class_uid:    6003,
+              type_uid:     (6003 * 100 + $activity),
+              activity_id:  $activity,
+              severity_id:  $severity_id,
+
+              status_id:     $status_id,
+              status:        ( if $status_id == 2 then "Failure" else "Success" end ),
+              status_code:   ( if $code != null then ($code | tostring) else null end ),
+              status_detail: ( $rs.reason // $rs.status ),
+
+              time:    to_epoch($r.requestReceivedTimestamp),
+              message: ( $ann["authorization.k8s.io/reason"] ),
+
+              metadata: {
+                "profiles": ["cloud", "osint"],
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "Amazon EKS",
+                  feature: { name: "Kubernetes Audit" }
+                },
+                uid: $r.auditID,
+                log_name: $r.level,
+                log_provider: "audit.k8s.io",
+                original_time: $r.requestReceivedTimestamp
+              },
+
+              cloud: { provider: "aws" },
+
+              actor: {
+                user: {
+                  name: $u.username,
+                  uid:  $u.uid,
+                  groups: ( ($u.groups // []) | map({ name: . }) )
+                }
+              },
+
+              api: {
+                operation: $verb,
+                version:   $obj.apiVersion,
+                service:   { name: ( $obj.apiGroup // "core" ) },
+                request:   { uid: $r.auditID },
+                response:  {
+                  code:  $code,
+                  message: ( $rs.status // $rs.reason ),
+                  error: ( if $status_id == 2 then ($rs.reason // $rs.status) else null end )
+                }
+              },
+
+              http_request: {
+                user_agent: $r.userAgent,
+                http_method: $httpm,
+                url: { path: $r.requestURI }
+              },
+
+              http_response: {
+                code: $code,
+                status: ( $rs.status // $rs.reason )
+              },
+
+              src_endpoint: {
+                ip: ( $r.sourceIPs // [] | .[0] ),
+                intermediate_ips: ( ($r.sourceIPs // []) | .[1:] )
+              },
+
+              resources: [ {
+                type:      $obj.resource,
+                name:      $obj.name,
+                uid:       $obj.uid,
+                namespace: $obj.namespace,
+                version:   $obj.apiVersion
+              } ],
+
+              unmapped: {
+                stage:          $r.stage,
+                stageTimestamp: $r.stageTimestamp,
+                subresource:    $obj.subresource,
+                impersonatedUser: $r.impersonatedUser
+              },
+
+              raw_data: ( $r | tostring )
+            } | prune ) as $core
+
+          # osint and src_endpoint are class-required containers; re-attach
+          # after prune so an empty-value collapse can never drop them.
+          | $core + {
+              osint: [],
+              src_endpoint: ( $core.src_endpoint // {} )
+            }

@@ -1,0 +1,139 @@
+name: "AWS Organizations Account Inventory to OCSF v1.9.0"
+description: "Transforms AWS Organizations account inventory records (the ListAccounts / DescribeAccount Account object) into the OCSF v1.9.0 Cloud Resources Inventory Info class (class_uid 5023, Discovery)."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-organizations"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "aws"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) - v1.9.0
+          # Category: Discovery (5). Activity: Collect (2) -> type_uid 502302.
+          #
+          # Input: ONE AWS Organizations Account record per invocation, as
+          # emitted by the Monad `aws-organizations` input connector (the
+          # ListAccounts / DescribeAccount Account object). Documented fields:
+          #   .Id              -> AWS account id (12 digits)
+          #   .Arn             -> account ARN (carries org id + mgmt acct id)
+          #   .Email           -> account root email
+          #   .Name            -> account friendly name
+          #   .Status          -> ACTIVE | SUSPENDED | PENDING_CLOSURE
+          #   .JoinedMethod    -> INVITED | CREATED
+          #   .JoinedTimestamp -> ISO 8601 join time
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # Recursively drop null / empty so the event stays compact while
+          # every required object survives (they are always populated below).
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null))
+              else . end
+            );
+
+          . as $r
+          # The account ARN encodes both the organization id and the
+          # management (payer) account id:
+          #   arn:aws:organizations::<mgmt-acct-id>:account/<org-id>/<acct-id>
+          | ( ($r.Arn // "") | split("/") ) as $arn_parts
+          | ( if ($arn_parts | length) > 1 then $arn_parts[1] else null end ) as $org_id
+          | ( ($r.Arn // "") | split(":") ) as $arn_colon
+          | ( if ($arn_colon | length) > 4 and ($arn_colon[4] != "") then $arn_colon[4] else null end ) as $mgmt_id
+          | ( ($arn_colon | if length > 1 then .[1] else null end) ) as $partition
+
+          | {
+              # --- Classification (REQUIRED) ---
+              category_uid: 5,
+              class_uid: 5023,
+              activity_id: 2,
+              type_uid: 502302,
+              severity_id: 1,
+
+              # --- Time (REQUIRED) ---
+              time: to_epoch($r.JoinedTimestamp),
+
+              # --- Metadata (REQUIRED) ---
+              metadata: {
+                version: "1.9.0",
+                product: {
+                  vendor_name: "AWS",
+                  name: "AWS Organizations"
+                },
+                profiles: ["cloud"]
+              },
+
+              # --- OSINT (REQUIRED base attr on this 1.9.0 class) ---
+              # This class carries a required `osint` object. An account is not
+              # an intel indicator, so the ARN is recorded as an Other-typed
+              # value purely to satisfy the schema requirement.
+              osint: {
+                value: ($r.Arn // $r.Id),
+                type_id: 99,
+                type: "Other"
+              },
+
+              # --- Cloud context (satisfies the at_least_one constraint) ---
+              cloud: {
+                provider: "aws",
+                region: "aws-global",
+                account: {
+                  uid: $r.Id,
+                  name: $r.Name,
+                  type: "AWS Account",
+                  type_id: 10
+                },
+                org: {
+                  uid: $org_id,
+                  name: $org_id
+                }
+              },
+
+              # --- The account modeled as a cloud resource ---
+              resources: [
+                {
+                  type: "AWS::Organizations::Account",
+                  uid: $r.Id,
+                  name: $r.Name,
+                  region: "aws-global",
+                  cloud_partition: $partition,
+                  labels: (
+                    [ (if $r.Status != null then "status:" + $r.Status else null end),
+                      (if $r.JoinedMethod != null then "joined_method:" + $r.JoinedMethod else null end),
+                      (if $r.Email != null then "email:" + $r.Email else null end),
+                      (if $mgmt_id != null then "management_account_id:" + $mgmt_id else null end) ]
+                    | map(select(. != null))
+                  )
+                }
+              ],
+
+              # --- Collection outcome + account lifecycle status ---
+              status_id: 1,
+              status: "Success",
+              status_detail: $r.Status,
+              message: ("AWS account " + ($r.Name // $r.Id) + " (" + ($r.Id // "") + ") status " + ($r.Status // "unknown")),
+
+              unmapped: {
+                JoinedMethod: $r.JoinedMethod
+              },
+
+              raw_data: ($r | tostring)
+            }
+          | prune

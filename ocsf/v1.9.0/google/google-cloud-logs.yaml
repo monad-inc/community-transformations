@@ -1,0 +1,153 @@
+name: "Google Cloud Audit Logs to OCSF v1.9.0"
+description: "Transforms Google Cloud (Cloud Audit) Logs into the OCSF v1.9.0 API Activity (6003) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+  - "https://github.com/Credgate"
+inputs:
+  - "google-cloud-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "google"
+  - "gcp"
+  - "api-activity"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003) — v1.9.0
+          # Input: one google-cloud-logs (Cloud Audit Log) record per call.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.protoPayload // {}) as $pp
+          | ($pp.requestMetadata // {}) as $rm
+          | ($pp.methodName // "") as $mn
+          | ($mn | ascii_downcase) as $mnl
+          | (if   ($mnl | test("insert|create")) then 1
+             elif ($mnl | test("get|list|read|aggregatedlist|search|batchget")) then 2
+             elif ($mnl | test("update|patch|set|write")) then 3
+             elif ($mnl | test("delete|remove")) then 4
+             else 0 end) as $activity_id
+          | (($pp.status // {}).code // 0) as $status_code
+          | (if $status_code == 0 then 1 else 2 end) as $status_id
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $activity_id,
+              "type_uid":     (6003 * 100 + $activity_id),
+
+              "severity_id": (
+                if   $r.severity == "DEFAULT"   then 1
+                elif $r.severity == "DEBUG"     then 1
+                elif $r.severity == "INFO"      then 1
+                elif $r.severity == "NOTICE"    then 1
+                elif $r.severity == "WARNING"   then 3
+                elif $r.severity == "ERROR"     then 4
+                elif $r.severity == "CRITICAL"  then 5
+                elif $r.severity == "ALERT"     then 5
+                elif $r.severity == "EMERGENCY" then 6
+                else 0 end
+              ),
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.timestamp),
+
+              # --- Status ---
+              "status_id": $status_id,
+              "status": (if $status_id == 1 then "Success" else "Failure" end),
+              "status_code": ($status_code | tostring),
+              "status_detail": (($pp.status // {}).message // null),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Google",
+                  "name": "Google Cloud Platform"
+                },
+                "uid": $r.insertId,
+                "log_name": $r.logName,
+                "labels": [
+                  ("log_name=" + ($r.logName // "")),
+                  ("insert_id=" + ($r.insertId // ""))
+                ]
+              },
+
+              # --- OSINT (REQUIRED in 1.9.0; empty array when no intel) ---
+              "osint": [],
+
+              # --- Cloud (REQUIRED) ---
+              "cloud": {
+                "provider": "Google Cloud",
+                "account": {
+                  "uid": (($r.resource // {}).labels // {}).project_id
+                },
+                "zone": (($r.resource // {}).labels // {}).zone
+              },
+
+              # --- Actor (REQUIRED) ---
+              "actor": {
+                "user": {
+                  "type_id": 1,
+                  "name": (($pp.authenticationInfo // {}).principalEmail),
+                  "email_addr": (($pp.authenticationInfo // {}).principalEmail)
+                }
+              },
+
+              # --- API (REQUIRED; operation required on the api object) ---
+              "api": {
+                "operation": $mn,
+                "service": {
+                  "name": $pp.serviceName
+                },
+                "response": {
+                  "code": $status_code,
+                  "error_message": (($pp.status // {}).message // null)
+                }
+              },
+
+              # --- Source endpoint (REQUIRED) ---
+              "src_endpoint": {
+                "ip": $rm.callerIp
+              },
+
+              # --- Recommended: HTTP request (user agent) ---
+              "http_request": {
+                "user_agent": $rm.callerSuppliedUserAgent
+              },
+
+              # --- Recommended: resources ---
+              "resources": [
+                {
+                  "type": (($r.resource // {}).type),
+                  "name": $pp.resourceName,
+                  "uid": ((($r.resource // {}).labels // {}).instance_id)
+                }
+              ],
+
+              # --- Recommended: message + observables ---
+              "message": ($mn + " on " + ($pp.resourceName // "")),
+
+              "observables": (
+                [
+                  (if $rm.callerIp then {"name":"src_endpoint.ip","type_id":2,"value":$rm.callerIp} else empty end),
+                  (if ($pp.authenticationInfo // {}).principalEmail then {"name":"actor.user.email_addr","type_id":5,"value":($pp.authenticationInfo.principalEmail)} else empty end)
+                ]
+              ),
+
+              # --- Original record ---
+              "raw_data": ($r | tostring)
+            }
+          | walk(if type == "object" then with_entries(select(.value != null and .value != "")) else . end)

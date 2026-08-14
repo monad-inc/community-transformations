@@ -1,0 +1,106 @@
+name: "Snyk Issue Findings to OCSF v1.9.0"
+description: "Transforms Snyk Issue Findings into the OCSF v1.9.0 Vulnerability Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+  - "https://github.com/Credgate"
+inputs:
+  - "snyk-issues"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "snyk"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one Snyk REST API /issues record per invocation.
+          # ---------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | {
+              "class_uid":    2002,
+              "category_uid": 2,
+              "activity_id":  2,
+              "type_uid":     200202,
+              "severity_id": (
+                { "info": 1, "low": 2, "medium": 3, "high": 4, "critical": 5 }[$a.effective_severity_level] // 0
+              ),
+              "status": $a.status,
+              "status_id": ({ "open": 1, "resolved": 4, "ignored": 3 }[$a.status] // 99),
+              "message": ($a.title // ""),
+              "time": (to_epoch($a.updated_at) // to_epoch($a.created_at) // 0),
+              "cloud": {
+                "provider": "Snyk"
+              },
+              "osint": [
+                ( $a.problems[]? | select(.source == "NVD") | { "value": .id, "type_id": 99, "src_url": .url } )
+              ],
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "name": "Snyk",
+                  "vendor_name": "Snyk"
+                },
+                "uid": $r.id
+              },
+              "finding_info": {
+                "uid": $r.id,
+                "title": $a.title,
+                "desc": $a.description,
+                "types": [ $a.type ],
+                "created_time": (to_epoch($a.created_at) // 0),
+                "modified_time": (to_epoch($a.updated_at) // 0),
+                "src_url": ($a.problems[0].url // null)
+              },
+              "vulnerabilities": [
+                {
+                  "title": $a.title,
+                  "desc": $a.description,
+                  "severity": $a.effective_severity_level,
+                  "is_fix_available": ($a.coordinates[0].is_fixable_snyk // null),
+                  "references": [ $a.problems[]?.url ],
+                  "cve": (
+                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
+                    | if $cve != null then {
+                        "uid": $cve,
+                        "cvss": [ $a.severities[]? | select(.score != null) | {
+                            "version": "3.1",
+                            "base_score": .score,
+                            "vector_string": .vector
+                        } ]
+                      } else null end
+                  ),
+                  # vulnerability carries a just_one(advisory, cve, cwe) constraint;
+                  # prefer the CVE and only emit the CWE when no CVE is present.
+                  "cwe": (
+                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
+                    | ( [ $a.classes[]?  | select(.source == "CWE") | .id ][0] ) as $cwe
+                    | if ($cve == null and $cwe != null) then { "uid": $cwe } else null end
+                  ),
+                  "affected_packages": [
+                    $a.coordinates[]?.representations[]?.dependency
+                    | select(. != null)
+                    | {
+                        "name": .package_name,
+                        "version": .package_version
+                      }
+                  ]
+                }
+              ],
+              "raw_data": ($r | tostring)
+            }
+            | walk( if type == "object" then with_entries(select(.value != null and .value != [] and .value != {})) else . end )

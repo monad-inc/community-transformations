@@ -1,0 +1,170 @@
+name: "NIST NVD CVE to OCSF v1.9.0"
+description: "Transforms NIST NVD CVE records into the OCSF v1.9.0 Vulnerability Finding (class_uid=2002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "nist-cve"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "nist"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one NIST NVD CVE record (native API 2.0 shape,
+          # {cve:{...}}) per invocation.
+          # ---------------------------------------------------------------
+
+          # NVD timestamps carry fractional seconds and no zone
+          # (e.g. "2024-08-13T18:15:10.017"); strip the fraction, force Z.
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          # CVSS baseSeverity string -> OCSF severity_id (+ caption sibling).
+          def sev_to_id($s):
+            ($s // "" | ascii_downcase) as $x |
+            if   $x == "none"     then 1
+            elif $x == "low"      then 2
+            elif $x == "medium"   then 3
+            elif $x == "high"     then 4
+            elif $x == "critical" then 5
+            else 0 end;
+          def sev_caption($id):
+            {"0":"Unknown","1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Unknown";
+
+          # NVD vulnStatus -> OCSF status_id (+ caption).
+          def status_to_id($s):
+            ($s // "" | ascii_downcase) as $x |
+            if   $x == "rejected" then 4
+            elif ($x | test("analy")) then 1
+            elif ($x | test("await|undergoing|received")) then 2
+            else 99 end;
+          def status_caption($id):
+            {"1":"New","2":"In Progress","4":"Resolved"}[$id|tostring] // "Other";
+
+          (.cve // .) as $c |
+          # English description preferred; fall back to first available.
+          (($c.descriptions // []) | (map(select(.lang == "en")) | .[0].value) // (.[0].value)) as $desc |
+          # Primary CVSS v3.1 metric (fall back to v3.0, then v2).
+          (($c.metrics.cvssMetricV31 // $c.metrics.cvssMetricV30 // $c.metrics.cvssMetricV2 // []) | .[0]) as $m |
+          ($m.cvssData // {}) as $cd |
+          # CWEs from the weaknesses[].description[].value entries.
+          ([ ($c.weaknesses // [])[].description[]? | select(.value | test("^CWE-")) | .value ] | unique) as $cwes |
+          # Reference URLs.
+          ([ ($c.references // [])[].url ] | unique) as $refs |
+
+          (sev_to_id($cd.baseSeverity)) as $sev_id |
+          (status_to_id($c.vulnStatus)) as $status_id |
+
+          # One OCSF cvss object when a base score is present.
+          (if $cd.baseScore != null then
+             [ { "version": ($cd.version // "3.1"), "base_score": $cd.baseScore }
+               + (if $cd.vectorString != null then { "vector_string": $cd.vectorString } else {} end)
+               + (if $cd.baseSeverity != null then { "severity": $cd.baseSeverity } else {} end) ]
+           else null end) as $cvss |
+
+          # The CVE object embedded in the vulnerability (required just_one).
+          ({
+            "uid": $c.id,
+            "desc": $desc,
+            "created_time": to_epoch($c.published),
+            "modified_time": to_epoch($c.lastModified),
+            "references": $refs
+          } + (if $cvss != null then { "cvss": $cvss } else {} end)) as $cve_obj |
+
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200201,
+            "activity_id": 1,
+
+            # --- Severity (REQUIRED); sibling string = OCSF caption ---
+            "severity_id": $sev_id,
+            "severity": sev_caption($sev_id),
+
+            # --- Time (REQUIRED) = CVE publication time ---
+            "time": to_epoch($c.published),
+
+            # --- Status ---
+            "status_id": $status_id,
+            "status": status_caption($status_id),
+            "status_detail": $c.vulnStatus,
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+                "profiles": ["cloud", "osint"],
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "NIST",
+                "name": "National Vulnerability Database",
+                "feature": { "name": "CVE API 2.0" }
+              },
+              "logged_time": to_epoch($c.lastModified)
+            },
+
+            # --- Cloud (REQUIRED in 1.9.0; provider = the OSINT source) ---
+            "cloud": { "provider": "NIST NVD" },
+
+            # --- OSINT (REQUIRED in 1.9.0); the CVE as a vulnerability
+            # indicator (type_id 10 = Vulnerability) ---
+            "osint": [
+              {
+                "value": $c.id,
+                "type_id": 10,
+                "type": "Vulnerability",
+                "desc": $desc
+              }
+            ],
+
+            # --- Finding Info (REQUIRED) ---
+            "finding_info": {
+              "uid": $c.id,
+              "title": ("NIST NVD " + $c.id),
+              "desc": $desc,
+              "created_time": to_epoch($c.published),
+              "modified_time": to_epoch($c.lastModified),
+              "src_url": ($refs | first),
+              "types": ["Vulnerability"]
+            },
+
+            # --- Vulnerabilities (REQUIRED); one entry, CVE branch of the
+            # just_one:[advisory,cve,cwe] constraint ---
+            "vulnerabilities": [
+              {
+                "title": $c.id,
+                "desc": $desc,
+                "severity": ($cd.baseSeverity // sev_caption($sev_id)),
+                "references": $refs,
+                "cve": $cve_obj,
+                "first_seen_time": to_epoch($c.published),
+                "last_seen_time": to_epoch($c.lastModified)
+              }
+            ],
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": (
+              [ { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": $c.id } ]
+              + ($cwes | map({ "name": "vulnerabilities.cwe.uid", "type": "CWE Object: uid", "type_id": 19, "value": . }))
+            ),
+
+            # --- Message summary ---
+            "message": ($c.id + ": " + ($desc // "")),
+
+            # --- Original record for audit / debugging ---
+            "raw_data": (. | tostring)
+          }
+          # Drop keys that resolved to null (OCSF rejects null-typed values);
+          # the single permitted recursive pass.
+          | del(.. | nulls)

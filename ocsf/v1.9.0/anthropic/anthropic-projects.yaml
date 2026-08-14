@@ -1,0 +1,102 @@
+name: "Anthropic Projects to OCSF v1.9.0"
+description: "Transforms Anthropic (Claude) Projects inventory records into the OCSF v1.9.0 Cloud Resources Inventory Info (5023) class, modeling each Claude project as a collected SaaS cloud resource with its owner, privacy state, and content counts."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-projects"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "anthropic"
+  - "ai"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one Anthropic (Claude) Projects record per invocation.
+          #
+          # A Claude Project fetched from the Anthropic SaaS API is a cloud/
+          # SaaS resource. The 5023 class description explicitly covers
+          # "inventory of cloud resource information from ... SaaS APIs", so
+          # each project maps to one collected resource (activity_id=2 Collect).
+          # The `osint` and `cloud` objects are emitted because the bundled
+          # v1.9.0 schema marks them required on this class; osint carries the
+          # resource id as an "Other" indicator, cloud names the provider.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.details // {}) as $d
+          | ($r.user // $d.user // {}) as $u
+          | ($r.organization_id // $d.organization_id) as $org
+          | (if ($r.is_private != null) then $r.is_private else $d.is_private end) as $priv
+          | ($r.id // $d.id) as $pid
+          | ($r.name // $d.name) as $pname
+          | (to_epoch($d.updated_at // $r.updated_at // $d.created_at // $r.created_at)) as $time
+
+          | {
+              category_uid: 5,
+              class_uid: 5023,
+              activity_id: 2,
+              type_uid: 502302,
+              severity_id: 1,
+              time: $time,
+              metadata: {
+                "profiles": ["cloud", "osint"],
+                version: "1.9.0",
+                product: { vendor_name: "Anthropic", name: "Claude", feature: { name: "Projects" } },
+                log_name: "anthropic.projects",
+                tenant_uid: $org,
+                original_time: ($d.updated_at // $r.updated_at // $r.created_at)
+              },
+              osint: [ { value: ($pid // $pname // "unknown"), type_id: 99, type: "Claude Project Resource ID" } ],
+              cloud: { provider: "Anthropic", org: (if $org != null then { uid: $org } else null end) },
+              resources: [ {
+                type: "claude.project",
+                uid: $pid,
+                name: $pname,
+                namespace: $org,
+                owner: (if (($u.email_address // $u.id) != null)
+                        then { type_id: 1, name: ($u.email_address // $u.id), uid: $u.id, email_addr: $u.email_address }
+                        else null end),
+                created_time: to_epoch($r.created_at // $d.created_at),
+                modified_time: to_epoch($d.updated_at // $r.updated_at),
+                labels: ([ (if $priv == true then "private" elif $priv == false then "public" else empty end) ]),
+                data: {
+                  description: $d.description,
+                  instructions: $d.instructions,
+                  is_private: $priv,
+                  chats_count: $d.chats_count,
+                  attachments_count: ($d.attachments_count // (($r.attachments // []) | length))
+                }
+              } ],
+              status_id: 1,
+              status: "Success",
+              message: ("Claude project inventory: " + ($pname // $pid // "unknown")),
+              observables: ([
+                (if $pid != null then { name: "resources.uid", type_id: 10, value: $pid } else empty end),
+                (if ($u.email_address // null) != null then { name: "resources.owner.email_addr", type_id: 5, value: $u.email_address } else empty end)
+              ]),
+              unmapped: {
+                attachments: $r.attachments,
+                attachments_count: ($d.attachments_count // (($r.attachments // []) | length)),
+                chats_count: $d.chats_count
+              },
+              raw_data: ($r | tostring)
+            }
+
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)

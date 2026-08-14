@@ -1,0 +1,166 @@
+name: "MLflow GenAI Traces to OCSF v1.9.0"
+description: "Transforms one MLflow GenAI trace (info + data.spans) into a single OCSF v1.9.0 API Activity (6003) event in the Application category, carrying the ai_operation profile (ai_model + message_context with token counts) plus the cloud and osint objects the class requires."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "mlflow-genai-traces"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "mlflow"
+  - "ai"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # =================================================================
+          # MLflow GenAI Trace  ->  OCSF v1.9.0  API Activity (class_uid 6003)
+          #
+          # Input: ONE MLflow Trace per invocation, shape { info, data.spans[] }.
+          #   info: trace_id, state (OK|ERROR|IN_PROGRESS|STATE_UNSPECIFIED),
+          #         request_time (epoch-ms), execution_duration (ms),
+          #         request_preview, response_preview, trace_location,
+          #         trace_metadata{...}, tags{...}, client_request_id.
+          #   data.spans[]: name, span_type (LLM|CHAT_MODEL|AGENT|TOOL|
+          #         RETRIEVER|CHAIN|...), parent_span_id, attributes{...}.
+          #
+          # A trace is an end-to-end GenAI application invocation, so it maps to
+          # the Application category's API Activity (6003) with activity 99/Other
+          # (an LLM generation is not a CRUD verb). 6003 carries the ai_operation
+          # profile, so the aggregate model + token usage go in the native
+          # ai_model / message_context objects (declared via metadata.profiles).
+          # 6003 also *requires* the cloud and osint objects.
+          #
+          # MLflow serializes span/metadata attribute VALUES as JSON strings
+          # (e.g. "\"gpt-4o-mini\"" or "{...}"), so every attribute read goes
+          # through pj() which parses a JSON string and otherwise passes through.
+          # One trace in -> one OCSF event out (aggregate, not per-span fan-out).
+          # =================================================================
+
+          def pj($v):
+            if $v == null then null
+            elif ($v | type) == "string" then ($v | fromjson? // $v)
+            else $v end;
+          def sattr($sp; $k): (($sp.attributes // {})[$k]) | pj(.);
+          def mattr($i; $k):  (($i.trace_metadata // {})[$k]) | pj(.);
+
+          . as $t
+          | ($t.info // {}) as $i
+          | ($t.data.spans // []) as $spans
+          | ( $spans | map(select(((.span_type // "") | ascii_upcase) as $st
+                          | $st == "LLM" or $st == "CHAT_MODEL")) | (.[0] // null) ) as $llm
+          | ( $spans | map(select(.parent_span_id == null)) | (.[0] // null) ) as $root
+
+          # ---- token usage: prefer trace-level aggregate, fall back to LLM span
+          | ( mattr($i; "mlflow.trace.tokenUsage") ) as $ttok
+          | ( if $llm != null then sattr($llm; "mlflow.chat.tokenUsage") else null end ) as $stok
+          | ( (if ($ttok | type) == "object" then $ttok.input_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.input_tokens else null end) ) as $in_tok
+          | ( (if ($ttok | type) == "object" then $ttok.output_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.output_tokens else null end) ) as $out_tok
+          | ( (if ($ttok | type) == "object" then $ttok.total_tokens else null end)
+              // (if ($stok | type) == "object" then $stok.total_tokens else null end)
+              // (if ($in_tok != null or $out_tok != null) then (($in_tok // 0) + ($out_tok // 0)) else null end) ) as $total_tok
+
+          # ---- model + provider from the primary LLM span
+          | ( if $llm != null then
+                ( sattr($llm; "gen_ai.request.model")
+                  // sattr($llm; "gen_ai.response.model")
+                  // sattr($llm; "mlflow.chat.model") )
+              else null end ) as $model
+          | ( if $llm != null then
+                ( sattr($llm; "gen_ai.system") // sattr($llm; "gen_ai.provider.name") )
+              else null end ) as $provider
+
+          | ( $i.state // "STATE_UNSPECIFIED" ) as $state
+          | ( $i.trace_id ) as $tid
+          | ( mattr($i; "mlflow.trace.user") ) as $user_id
+          | ( mattr($i; "mlflow.trace.session") ) as $sess
+          | ( mattr($i; "mlflow.source.name") ) as $src_name
+          | ( $i.trace_location // {} ) as $loc
+          | ( $root.name // ($i.tags."mlflow.traceName") // "genai.trace" ) as $op
+
+          # OK -> Success/Informational, ERROR -> Failure/Medium, else Unknown/Info
+          | ( if $state == "OK" then 1 elif $state == "ERROR" then 2 else 0 end ) as $status_id
+          | ( if $state == "ERROR" then 3 else 1 end ) as $severity_id
+
+          # trace_location distinguishes a self-hosted experiment from a
+          # Databricks Unity Catalog schema; that is the only "cloud" signal.
+          | ( if ($loc.uc_schema != null) or ($loc.unity_catalog != null)
+                 or (($loc.type // "") | test("^UC")) then "Databricks" else "MLflow" end ) as $cloud_provider
+
+          | ( { time: $i.request_time,
+                category_uid: 6,
+                class_uid: 6003,
+                activity_id: 99,
+                type_uid: 600399,
+                activity_name: $op,
+                severity_id: $severity_id,
+                status_id: $status_id,
+                status: (if $state == "OK" then "Success" elif $state == "ERROR" then "Failure" else "Unknown" end),
+
+                metadata: {
+                "profiles": ["cloud", "osint"],
+                  version: "1.9.0",
+                  product: { vendor_name: "MLflow", name: "MLflow GenAI Traces" },
+                  uid: $tid,
+                  log_name: "mlflow.genai.trace",
+                  labels: [ ($i.tags.environment // empty) ]
+                },
+
+                # 6003 requires cloud + osint. There is no threat indicator in a
+                # trace, so osint carries the model identifier as an Other(99)
+                # indicator purely to satisfy the class contract.
+                cloud: { provider: $cloud_provider },
+                osint: [ { type_id: 99, value: ($model // $tid // "mlflow-genai-trace") } ],
+
+                actor: {
+                  application: { name: "MLflow" },
+                  user: (if $user_id != null then { type_id: 1, name: $user_id, uid: $user_id, email_addr: $user_id } else null end)
+                },
+                api: { operation: $op },
+                src_endpoint: { name: "mlflow-genai-traces", svc_name: ($src_name // "mlflow") },
+
+                # ai_operation profile blocks (declared below when present)
+                ai_model: (if $model != null then { name: $model, ai_provider: ($provider // "unknown"), uid: $model } else null end),
+                message_context: (if ($in_tok != null or $out_tok != null or $model != null) then
+                    { ai_role_id: 2, prompt_tokens: $in_tok, completion_tokens: $out_tok,
+                      total_tokens: $total_tok, service: { name: "MLflow GenAI" } }
+                  else null end),
+
+                message: ($op + " (" + $state + ")"),
+
+                observables: ( [ { name: "metadata.uid", type_id: 10, value: $tid } ]
+                  + (if $user_id != null then [ { name: "actor.user.name", type_id: 4, value: $user_id } ] else [] end) ),
+
+                # No native OCSF home: trace timing, request/response previews,
+                # experiment/session identifiers, span count, raw tags.
+                unmapped: {
+                  execution_duration_ms: $i.execution_duration,
+                  request_preview: $i.request_preview,
+                  response_preview: $i.response_preview,
+                  experiment_id: $loc.mlflow_experiment.experiment_id,
+                  session_id: $sess,
+                  client_request_id: $i.client_request_id,
+                  span_count: ($spans | length),
+                  tags: $i.tags
+                },
+                raw_data: ($t | tostring)
+              } ) as $ev
+
+          # Declare the profiles whose objects this event carries. 6003 exposes
+          # cloud + osint only under their profiles (they are not base attrs), and
+          # the AI blocks require the ai_operation profile.
+          | ( $ev | .metadata.profiles =
+                ( ["cloud", "osint"]
+                  + (if (.ai_model != null) or (.message_context != null) then ["ai_operation"] else [] end) ) )
+
+          # single recursive prune: drop null / "" / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)

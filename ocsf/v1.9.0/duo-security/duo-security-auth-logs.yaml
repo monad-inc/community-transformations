@@ -1,0 +1,130 @@
+name: "Duo Security Authentication Logs to OCSF v1.9.0"
+description: "Transforms Cisco Duo Security authentication log records into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "duo-security-auth-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "duo-security"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.9.0
+          # Input: one Duo Security authentication log record per invocation.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+"; "") | gsub("\\+00:00$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.result // "" | ascii_downcase) as $result
+          | (if $result == "success" then 1 else 2 end) as $status_id
+          | (if $result == "success" then 1
+             elif ($result == "fraud") then 4
+             elif ($result == "denied") or ($result == "failure") or ($result == "error") then 3
+             else 0 end) as $severity_id
+          | {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 3,
+            "class_uid": 3002,
+            "activity_id": 1,
+            "activity_name": "Logon",
+            "type_uid": 300201,
+            "severity_id": $severity_id,
+
+            # --- Time (REQUIRED) ---
+            "time": to_epoch($r.timestamp // $r.isotimestamp),
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+                "profiles": ["cloud", "osint"],
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "Cisco",
+                "name": "Duo Security",
+                "feature": { "name": "Authentication Logs" }
+              },
+              "uid": $r.txid,
+              "log_name": "authentication",
+              "original_time": $r.isotimestamp
+            },
+
+            # --- User (REQUIRED; at_least_one account/name/uid) ---
+            "user": ({
+              "name": ($r.user.name // $r.email),
+              "uid": $r.user.key,
+              "email_addr": $r.email,
+              "groups": (($r.user.groups // []) | map(select(. != null and . != "") | { "name": . }))
+            } | with_entries(select(.value != null and .value != "" and .value != []))),
+
+            # --- OSINT (REQUIRED in 1.9.0; none present in Duo auth logs) ---
+            "osint": [],
+
+            # --- Cloud (REQUIRED in 1.9.0) ---
+            "cloud": {
+              "provider": "Cisco Duo Security"
+            },
+
+            # --- at_least_one [service, dst_endpoint] ---
+            "service": ({
+              "name": $r.application.name,
+              "uid": $r.application.key
+            } | with_entries(select(.value != null and .value != ""))),
+
+            # --- Authentication-specific recommended ---
+            "status_id": $status_id,
+            "status": (if $status_id == 1 then "Success" else "Failure" end),
+            "status_detail": ($r.reason // null),
+            "is_mfa": true,
+            "auth_factors": (if ($r.factor // null) != null
+                             then [ { "factor_type_id": 99, "factor_type": $r.factor } ]
+                             else null end),
+            "logon_type": ($r.factor // null),
+
+            # --- Source endpoint (Duo access_device) ---
+            "src_endpoint": ({
+              "ip": ($r.access_device.ip // null),
+              "hostname": ($r.access_device.hostname // null),
+              "os": (if ($r.access_device.os // null) != null
+                     then { "name": $r.access_device.os, "version": ($r.access_device.os_version // null),
+                            "type_id": (if ($r.access_device.os | ascii_downcase | startswith("mac")) then 300
+                                        elif ($r.access_device.os | ascii_downcase | startswith("windows")) then 100
+                                        elif ($r.access_device.os | ascii_downcase | contains("ios")) then 400
+                                        elif ($r.access_device.os | ascii_downcase | contains("android")) then 500
+                                        elif ($r.access_device.os | ascii_downcase | contains("linux")) then 200
+                                        else 0 end) } | with_entries(select(.value != null))
+                     else null end),
+              "location": (if ($r.access_device.location // null) != null
+                           then { "city": ($r.access_device.location.city // null), "region": ($r.access_device.location.state // null), "country": ($r.access_device.location.country // null) } | with_entries(select(.value != null))
+                           else null end)
+            } | with_entries(select(.value != null and .value != {}))),
+
+            "message": ($r.reason // ""),
+
+            # --- Observables ---
+            "observables": ([
+              (if ($r.email // null) != null then { "name": "user.email_addr", "type_id": 5, "value": $r.email } else null end),
+              (if ($r.access_device.ip // null) != null then { "name": "src_endpoint.ip", "type_id": 2, "value": $r.access_device.ip } else null end),
+              (if ($r.user.name // null) != null then { "name": "user.name", "type_id": 4, "value": $r.user.name } else null end)
+            ] | map(select(. != null))),
+
+            "unmapped": ({
+              "auth_device": $r.auth_device,
+              "trusted_endpoint_status": ($r.trusted_endpoint_status // null),
+              "alias": (if ($r.alias // "") != "" then $r.alias else null end),
+              "ood_software": ($r.ood_software // null)
+            } | with_entries(select(.value != null))),
+
+            "raw_data": ($r | tostring)
+          }
+          | with_entries(select(.value != null and .value != "" and .value != {}))

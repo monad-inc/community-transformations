@@ -1,0 +1,115 @@
+name: "Buildkite Audit Logs to OCSF v1.9.0"
+description: "Transforms Buildkite Audit Log events into the OCSF v1.9.0 User Management (3007) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "buildkite-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "buildkite"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF User Management (class_uid=3007) — v1.9.0
+          # Input: one Buildkite Audit Log event per invocation.
+          # Buildkite audit events record administrative/lifecycle actions on
+          # organization members, teams, tokens, pipelines, etc. Member/user
+          # lifecycle events map cleanly to User Management; the activity_id is
+          # derived from the SCREAMING_SNAKE event `type` suffix.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          . as $r
+          | ($r.type // "") as $t
+          | (if   ($t | endswith("_CREATED")) then 1
+             elif ($t | endswith("_DELETED")) then 3
+             elif ($t | endswith("_UPDATED")) then 2
+             elif ($t | endswith("_ENABLED")) then 4
+             elif ($t | endswith("_DISABLED")) then 5
+             else 99 end) as $activity_id
+          | ({ "1": "Create", "2": "Update", "3": "Delete", "4": "Enable",
+               "5": "Disable", "99": "Other" }[$activity_id | tostring]) as $activity_name
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 3,
+              "class_uid":    3007,
+              "activity_id":  $activity_id,
+              "type_uid":     (3007 * 100 + $activity_id),
+              "activity_name": $activity_name,
+              "severity_id":  1,
+
+              # --- Time (REQUIRED) ---
+              "time": to_epoch($r.occurred_at),
+
+              # --- Metadata (REQUIRED: product + version) ---
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Buildkite",
+                  "name": "Buildkite Audit Log"
+                },
+                "uid": $r.uuid,
+                "log_name": $t,
+                "original_time": $r.occurred_at
+              },
+
+              # --- Managed user = the event subject (REQUIRED) ---
+              "user": ({
+                "name":       ($r.subject.name // null),
+                "uid":        ($r.subject.uuid // null),
+                "type":       ($r.subject.type // null),
+                "type_id":    (if ($r.subject.type // "") == "User" then 1 else 0 end),
+                "email_addr": ($r.data.email // null)
+              } | with_entries(select(.value != null))),
+
+              # --- cloud (REQUIRED in the 1.9.0 3007 bundle: provider) ---
+              "cloud": { "provider": "Buildkite" },
+
+              # --- osint (REQUIRED key; no threat-intel indicators in an
+              #     audit record, so an empty array satisfies presence) ---
+              "osint": [],
+
+              # --- Actor: who performed the action (recommended) ---
+              "actor": ({
+                "user": ({
+                  "name":    ($r.actor.name // null),
+                  "uid":     ($r.actor.uuid // null),
+                  "type":    ($r.actor.type // null),
+                  "type_id": (if ($r.actor.type // "") == "User" then 1 else 0 end)
+                } | with_entries(select(.value != null)))
+              }),
+
+              # --- Source endpoint from the request context (recommended) ---
+              # network_endpoint has no user_agent; keep the UA in unmapped.
+              "src_endpoint": ({
+                "ip":         ($r.context.request_ip // null)
+              } | with_entries(select(.value != null))),
+
+              # --- Outcome: Buildkite records completed actions (recommended) ---
+              "status_id": 1,
+              "status": "Success",
+              "message": $t,
+
+              # --- Pass-through for fields without a clean OCSF home ---
+              "unmapped": ({
+                "graphql_id": $r.graphql_id,
+                "url":        $r.url,
+                "user_agent": ($r.context.request_user_agent // null),
+                "data":       $r.data
+              } | with_entries(select(.value != null))),
+
+              "raw_data": ($r | tostring)
+            }

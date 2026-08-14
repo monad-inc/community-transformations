@@ -1,0 +1,128 @@
+name: "JumpCloud Directory Insights Events to OCSF v1.9.0"
+description: "Transforms JumpCloud Directory Insights event records into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "jumpcloud-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "jumpcloud"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.9.0
+          # Input: one JumpCloud Directory Insights event per invocation.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.initiated_by // {}) as $ib
+          | ($r.geoip // {}) as $geo
+          | ($r.useragent // {}) as $ua
+          | (($r.event_type // "") | ascii_downcase) as $et
+
+          # --- Time (REQUIRED) ---
+          | ( if ($r.timestamp | type) == "number" then $r.timestamp
+              elif ($r.timestamp | type) == "string"
+                then ($r.timestamp | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+              else null end ) as $time
+
+          # --- Activity: login/logout inference ---
+          | ( if ($et | test("logout|logoff")) then 2
+              elif ($et | test("login|auth")) then 1
+              else 99 end ) as $activity_id
+
+          # --- Status from success flag ---
+          | ( if $r.success == true then 1
+              elif $r.success == false then 2
+              else 0 end ) as $status_id
+
+          # --- Severity: failed auth is elevated ---
+          | ( if $r.success == false then 3 else 1 end ) as $severity_id
+
+          | {
+              "category_uid": 3,
+              "class_uid":    3002,
+              "type_uid":     (3002 * 100 + $activity_id),
+              "activity_id":  $activity_id,
+              "severity_id":  $severity_id,
+              "status_id":    $status_id,
+              "status":       (if $r.success == true then "Success"
+                               elif $r.success == false then "Failure" else null end),
+              "time":         $time,
+              "is_mfa":       (if ($r.mfa | type) == "boolean" then $r.mfa else null end),
+
+              "metadata": {
+                "profiles": ["cloud", "osint"],
+                "version": "1.9.0",
+                "uid": $r.id,
+                "product": {
+                  "vendor_name": "JumpCloud",
+                  "name": "JumpCloud Directory Insights"
+                }
+              },
+
+              "cloud": {
+                "provider": "JumpCloud"
+              },
+
+              # osint is a base-required attribute in OCSF 1.9.0; no threat
+              # intel is present on an authentication event, so emit empty.
+              "osint": [],
+
+              "user": {
+                "name": ($r.username // $ib.username),
+                "uid":  (if $ib.type == "user" then $ib.id else null end),
+                "type_id": 1,
+                "has_mfa": (if ($r.mfa | type) == "boolean" then $r.mfa else null end)
+              },
+
+              "actor": {
+                "user": {
+                  "name": $ib.username,
+                  "uid":  $ib.id,
+                  "type_id": (if $ib.type == "user" then 1
+                              elif $ib.type == "api_key_id" then 3 else 0 end)
+                }
+              },
+
+              "service": (if $r.service then { "name": $r.service } else null end),
+
+              "src_endpoint": {
+                "ip": $r.client_ip,
+                "location": (if $geo.country_code then {
+                    "country": $geo.country_code,
+                    "region":  $geo.region_name,
+                    "coordinates": (if ($geo.longitude != null and $geo.latitude != null)
+                                    then [ $geo.longitude, $geo.latitude ] else null end)
+                  } else null end)
+              },
+
+              "message": $r.message,
+
+              "observables": (
+                [ (if ($r.username // $ib.username) then
+                     { "name": "user.name", "type_id": 4, "value": ($r.username // $ib.username) } else empty end),
+                  (if $r.client_ip then
+                     { "name": "src_endpoint.ip", "type_id": 2, "value": $r.client_ip } else empty end) ]
+              ),
+
+              "unmapped": {
+                "service": $r.service,
+                "raw_event_type": $r.raw_event_type,
+                "organization": $r.organization,
+                "useragent": (if ($ua|length) > 0 then $ua else null end)
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          # Drop nulls and empty strings but KEEP empty arrays (osint) and
+          # objects that carry required fields (cloud).
+          | walk(if type == "object"
+                 then with_entries(select(.value != null and .value != ""))
+                 else . end)

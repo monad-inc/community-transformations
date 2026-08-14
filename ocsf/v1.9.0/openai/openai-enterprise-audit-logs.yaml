@@ -1,0 +1,138 @@
+name: "OpenAI Enterprise Audit Logs to OCSF v1.9.0"
+description: "Transforms OpenAI Enterprise audit log events into OCSF v1.9.0, fanning out by type: login.*/logout.* -> Authentication (3002); all other admin/configuration events -> API Activity (6003). Populates the cloud and osint profiles."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-enterprise-audit-logs"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "openai"
+  - "iam"
+  - "application"
+  - "cloud"
+  - "osint"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Enterprise Audit Logs -> OCSF v1.9.0 (fan-out)
+          # One audit-log record in -> one OCSF event out.
+          #   login.* / logout.*  -> Authentication  (class_uid 3002)
+          #   everything else      -> API Activity     (class_uid 6003)
+          # cloud + osint profiles are populated on every event.
+          # -----------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+
+          . as $r
+          | ($r.type // "") as $etype
+          | ($etype | split(".")) as $seg
+          | ($seg[0]) as $head
+          | ($seg[-1]) as $tail
+          | ($r.actor // {}) as $act
+          | ($act.session // {}) as $sess
+          | ($act.api_key // {}) as $ak
+          | ($sess.user // $ak.user // {}) as $u
+          | ($ak.service_account // {}) as $sa
+          | ($sess.ip_address // null) as $ip
+          | ($u.email // null) as $email
+          | ($u.id // $sa.id // $ak.id // null) as $uid
+          | ($r.project // {}) as $proj
+          | ($r[$etype] // {}) as $payload
+          | (($ak.type == "service_account") or (($sa.id // "") != "")) as $is_svc
+
+          # user object (at_least_one [account,name,uid] satisfied via name+uid)
+          | ({ type_id: (if $is_svc then 4 else 1 end),
+               name: ($email // $sa.id // $ak.id // $uid // "unknown"),
+               uid: $uid,
+               email_addr: $email }) as $user
+
+          # cloud profile (provider required); tie the OpenAI project into cloud.account
+          | ({ provider: "OpenAI",
+               account: (if ($proj.id // $proj.name) != null
+                         then { uid: ($proj.id // null), name: ($proj.name // null), type_id: 99, type: "OpenAI Project" }
+                         else null end) }) as $cloud
+
+          # osint profile (value + type_id required); IP -> 1, Email Address -> 9,
+          # fall back to a principal identifier so the required array is never empty.
+          | ([ (if ($ip // "") != "" then { type_id: 1, value: $ip } else empty end),
+               (if ($email // "") != "" then { type_id: 9, value: $email } else empty end) ]) as $osint0
+          | (if ($osint0 | length) > 0 then $osint0
+             else [ { type_id: 0, value: ($uid // $r.id // $etype) } ] end) as $osint
+
+          | ({ version: "1.9.0",
+               product: { vendor_name: "OpenAI", name: "OpenAI Enterprise" },
+               uid: $r.id,
+               log_name: $etype }) as $metadata
+
+          | (if ($ip // "") != "" then { ip: $ip, svc_name: "OpenAI" }
+             else { svc_name: "OpenAI" } end) as $src_endpoint
+
+          | ({ time: to_epoch($r.effective_at),
+               metadata: $metadata,
+               cloud: $cloud,
+               osint: $osint,
+               unmapped: ($r | del(.id, .type, .effective_at, .actor, .project)),
+               raw_data: ($r | tostring) }) as $common
+
+          # =============================================================
+          | if ($head == "login" or $head == "logout") then
+              (if $head == "login" then 1 else 2 end) as $act_id
+            | ($tail == "failed") as $failed
+            | $common + {
+                category_uid: 3, class_uid: 3002,
+                activity_id: $act_id, type_uid: (3002 * 100 + $act_id),
+                severity_id: (if $failed then 3 else 1 end),
+                user: $user,
+                service: { name: "OpenAI Platform" },
+                src_endpoint: $src_endpoint,
+                status_id: (if $failed then 2 else 1 end),
+                status: (if $failed then "Failure" else "Success" end),
+                status_code: ($payload.error_code // null),
+                status_detail: ($payload.error_message // null),
+                message: $etype
+              }
+            else
+              (if ($tail | test("^(created|sent|registered|accepted|activated|enabled|added|provisioned|issued|upserted|started|bound_to_resource)$")) then 1
+               elif ($tail | test("^(updated|migrated)$")) then 3
+               elif ($tail | test("^(deleted|removed|archived|deactivated|disabled|revoked|declined|detached|unbound_from_resource)$")) then 4
+               else 99 end) as $act_id
+            | $common + {
+                category_uid: 6, class_uid: 6003,
+                activity_id: $act_id, type_uid: (6003 * 100 + $act_id),
+                activity_name: (if $act_id == 99 then $etype else null end),
+                severity_id: 1,
+                actor: { user: $user, application: { name: "OpenAI Platform" } },
+                api: { operation: $etype, service: { name: "OpenAI Platform" } },
+                src_endpoint: $src_endpoint,
+                status_id: 1, status: "Success",
+                message: $etype
+              }
+            end
+
+          # observables (reference only attributes the chosen class defines)
+          | ([ (if ($ip // "") != "" then { name: "src_endpoint.ip", type_id: 2, value: $ip } else empty end),
+               (if ($r.id // "") != "" then { name: "metadata.uid", type_id: 10, value: $r.id } else empty end),
+               (if ($email // "") != "" then
+                  (if .class_uid == 6003
+                   then { name: "actor.user.email_addr", type_id: 5, value: $email }
+                   else { name: "user.email_addr", type_id: 5, value: $email } end)
+                else empty end) ]) as $obs
+          | .observables = $obs
+          | .metadata.profiles = ["cloud", "osint"]
+
+          # prune null / empty-string / empty-array / empty-object leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)
+                        and ((((.value | type) == "object") and ((.value | length) == 0)) | not)))
+                 else . end)

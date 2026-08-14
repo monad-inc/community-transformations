@@ -1,0 +1,104 @@
+name: "Cloudflare DNS Records to OCSF v1.9.0"
+description: "Transforms Cloudflare DNS Records inventory into the OCSF v1.9.0 Cloud Resources Inventory Info (class_uid 5023) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-dns-records"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "cloudflare"
+  - "discovery"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one Cloudflare DNS record per invocation (List DNS Records).
+          # A DNS record is a cloud-hosted configuration resource, collected
+          # from the Cloudflare API -> activity_id 2 (Collect).
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+          def is_ip($s):
+            ($s | type) == "string"
+            and (($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) or ($s | test(":")));
+
+          . as $r
+          | {
+              "category_uid": 5,
+              "class_uid":    5023,
+              "type_uid":     502302,
+              "activity_id":  2,
+              "severity_id":  1,
+              "time":         to_epoch($r.modified_on),
+
+              "metadata": {
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Cloudflare",
+                  "name": "Cloudflare DNS"
+                },
+                "profiles": ["osint"],
+                "original_time": $r.modified_on
+              },
+
+              # at_least_one constraint: cloud + resources both populated.
+              "cloud": {
+                "provider": "Cloudflare"
+              },
+
+              "resources": [
+                {
+                  "uid":  $r.id,
+                  "name": $r.name,
+                  "type": ("DNS " + ($r.type // "") + " Record"),
+                  "hostname": $r.name,
+                  "ip": (if is_ip($r.content) then $r.content else null end),
+                  "labels": ($r.tags // []),
+                  "created_time": to_epoch($r.created_on),
+                  "modified_time": to_epoch($r.modified_on),
+                  "data": {
+                    "record_type": $r.type,
+                    "content": $r.content,
+                    "ttl": $r.ttl,
+                    "proxied": $r.proxied,
+                    "proxiable": $r.proxiable,
+                    "zone_id": $r.zone_id,
+                    "zone_name": $r.zone_name,
+                    "comment": $r.comment
+                  }
+                }
+              ],
+
+              # OSINT indicator: the record name is a domain/FQDN.
+              "osint": [
+                {
+                  "value": $r.name,
+                  "type_id": 2
+                }
+              ],
+
+              "status_id": 1,
+              "message": ("Cloudflare DNS " + ($r.type // "") + " record for " + ($r.name // "")),
+
+              "unmapped": {
+                "settings": $r.settings,
+                "meta": $r.meta,
+                "comment_modified_on": $r.comment_modified_on,
+                "tags_modified_on": $r.tags_modified_on
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              else . end
+            )

@@ -1,0 +1,252 @@
+name: "OpenAI Codex (OTLP) to OCSF v1.9.0"
+description: "Transforms OTLP telemetry from OpenAI Codex into OCSF v1.9.0 events, fanning out by type: LLM/API activity (api_request, sse_event, user_prompt, conversation_starts) -> Process Activity (1007) with the ai_operation profile; file tool results -> File System Activity (1001); MCP tool calls -> Network Activity (4001); tool approvals, sandbox outcomes and other control events -> API Activity (6003). Every event carries the base-required cloud + osint objects; null-identity events are tagged and severity-floored."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-codex"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "openai"
+  - "ai"
+  - "application"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Codex RAW OTLP logs -> OCSF v1.9.0 (fan-out)
+          # One OTLP envelope in -> one OCSF event per logRecord out.
+          # Metrics envelopes (resourceMetrics) produce no output.
+          #
+          # Class routing (event.name attribute = "codex.<event>"):
+          #   api_request / sse_event / user_prompt / conversation_starts
+          #                                  -> Process Activity 1007 (+ai_operation)
+          #   tool_result: mcp tool (mcp_server set)     -> Network Activity 4001
+          #                file tool (apply_patch/read/write/edit + path)
+          #                                              -> File System Activity 1001
+          #                shell/exec/other              -> Process Activity 1007
+          #   tool_decision / sandbox_outcome            -> API Activity 6003
+          #   (other: websocket/auth/startup/plugins)    -> API Activity 6003 / Other
+          #
+          # OCSF 1.9.0 base_event marks cloud + osint REQUIRED on these classes,
+          # so both are emitted on every event ($common). The ai_operation
+          # profile (ai_model + message_context with token counts) is 1.9.0's
+          # native AI block; only 1007 carries it here.
+          # -----------------------------------------------------------------
+
+          def to_epoch($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) end;
+          def nano2epoch($n):
+            if $n == null or $n == "" then null else (($n | tonumber) / 1000000000 | floor) end;
+          # token/duration fields arrive as strings ("%"-formatted) or numbers.
+          def num($x):
+            if $x == null or $x == "" then null
+            elif ($x | type) == "string" then ($x | tonumber? // null)
+            else $x end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+
+          (.resourceLogs // [])[] as $rl
+          | kv($rl.resource.attributes) as $res
+          | ($rl.scopeLogs // [])[] as $sl
+          | ($sl.logRecords // [])[] as $lr
+          | ($res + kv($lr.attributes)) as $r
+          | ( ($lr.body.stringValue) as $b
+              | if (($r["event.name"]) // "") != "" then $r["event.name"]
+                elif ($b != null and ($b | startswith("codex."))) then $b
+                else "codex.unknown" end ) as $en
+          | ($en | ltrimstr("codex.")) as $eshort
+          | (if (($r["event.timestamp"]) // "") != "" then to_epoch($r["event.timestamp"])
+             else nano2epoch($lr.timeUnixNano) end) as $time
+          | (($r["app.version"]) // ($r["service.version"])) as $ver
+          | ($r["model"] // "unknown") as $model
+
+          # identity guard input
+          | ( (($r["user.email"] // "") != "") or (($r["user.account_id"] // "") != "")
+              or (($r["conversation.id"] // "") != "") ) as $has_id
+
+          # user.at_least_one is [account,name,uid]; fall back to a sentinel name
+          # when no identity is present so the object stays valid — the miss is
+          # signalled by the label + severity floor below.
+          | ({ type_id: 1,
+               name: ($r["user.email"] // (if $has_id then null else "unknown" end)),
+               uid: $r["user.account_id"], email_addr: $r["user.email"] }) as $user
+          | ({ user: $user, application: { name: "OpenAI Codex" } }) as $actor
+          | ({ type_id: 0, hostname: $r["terminal.type"] }) as $device
+          # base-required in OCSF 1.9.0
+          | ({ provider: "OpenAI" }) as $cloud
+          | ([ { type_id: 99, value: $model } ]) as $osint
+
+          # observables (reference only attributes the target class defines)
+          | ([ (if ($r["conversation.id"] // "") != "" then {name:"metadata.uid", type_id:10, value:$r["conversation.id"]} else empty end) ]) as $obs_base
+          | ($obs_base + [ (if ($r["user.email"] // "") != "" then {name:"actor.user.email_addr", type_id:5, value:$r["user.email"]} else empty end) ]) as $obs_actor
+
+          | ($r | del(.["event.name"], .["event.timestamp"], .["event.kind"], .["event.sequence"],
+                      .["conversation.id"], .["user.email"], .["user.account_id"],
+                      .["app.version"], .["service.name"], .["service.version"],
+                      .["model"], .["slug"], .["terminal.type"])) as $unmapped
+
+          | ({ time: $time,
+               metadata: {
+                "profiles": ["cloud", "osint"], version: "1.9.0",
+                 product: { vendor_name: "OpenAI", name: "Codex", version: $ver },
+                 log_name: $en, uid: $r["conversation.id"] },
+               cloud: $cloud, osint: $osint,
+               unmapped: $unmapped, raw_data: ($lr | tostring) }) as $common
+
+          # message_context for LLM completions (ai_role 2 = Assistant)
+          | (num($r["input_token_count"])) as $in_tok
+          | (num($r["output_token_count"])) as $out_tok
+          | ({ ai_role_id: 2,
+               prompt_tokens: $in_tok, completion_tokens: $out_tok,
+               total_tokens: (num($r["tool_token_count"])
+                              // (if ($in_tok != null or $out_tok != null)
+                                  then (($in_tok // 0) + ($out_tok // 0)) else null end)),
+               service: { name: "OpenAI API" } }) as $mc_llm
+          | ({ name: $model, ai_provider: "OpenAI", uid: $model }) as $ai_model
+
+          # =================================================================
+          | if ($en == "codex.api_request" or $en == "codex.sse_event"
+                or $en == "codex.user_prompt" or $en == "codex.conversation_starts") then
+              (($r["error.message"] // $r["error"]) == null
+               and (($r["http.response.status_code"] == null)
+                    or (($r["http.response.status_code"] | tonumber? // 200) < 400))) as $ok
+            | ($en == "codex.user_prompt") as $is_prompt
+            | $common + {
+                category_uid: 1, class_uid: 1007, activity_id: 1, type_uid: 100701,
+                severity_id: (if $ok then 1 else 3 end),
+                process: { pid: 0, name: "codex", cmd_line: ("model:" + $model) },
+                device: $device, actor: $actor,
+                ai_model: (if $model != "unknown" then $ai_model else null end),
+                message_context: (if $is_prompt
+                                  then { ai_role_id: 1, service: { name: "OpenAI Codex" } }
+                                  else $mc_llm end),
+                duration: num($r["duration_ms"]),
+                observables: $obs_actor,
+                status_id: (if $ok then 1 else 2 end),
+                status: (if $ok then "Success" else "Failure" end),
+                status_code: (if ($r["http.response.status_code"] != null)
+                              then ($r["http.response.status_code"] | tostring) else null end),
+                status_detail: ($r["error.message"] // $r["error"]),
+                message: (if $is_prompt
+                          then ("user prompt (" + ((num($r["prompt_length"]) // 0) | tostring) + " chars)")
+                          else ($model + " " + $eshort + (if $ok then "" else " failed" end)) end)
+              }
+
+            elif $en == "codex.tool_result" then
+              ($r["tool_name"] // "unknown") as $tool
+            | ($tool | ascii_downcase) as $tl
+            | truthy($r["success"]) as $tok
+            | (($r["mcp_server"] // "") != "") as $is_mcp
+            | ( ($r["arguments"] // "") as $a
+                | if ($a | type) == "string" and $a != "" then ($a | fromjson? // {})
+                  elif ($a | type) == "object" then $a else {} end ) as $args
+            | (($args["file_path"]) // ($args["path"]) // ($args["notebook_path"])) as $path
+            | (($args["command"]) // ($args["cmd"]) // ($r["arguments"])) as $cmd
+            | (if $tl == "read_file" or $tl == "read" then 2
+               elif $tl == "write_file" or $tl == "write" then 1
+               elif ($tl | test("(apply_patch|edit|patch)")) then 3 else 0 end) as $fa
+            | if $is_mcp then
+                # ---- Network Activity 4001 (remote MCP tool call) ----
+                $common + {
+                  category_uid: 4, class_uid: 4001, activity_id: 1, type_uid: 400101,
+                  severity_id: (if $tok then 1 else 2 end),
+                  dst_endpoint: { name: $r["mcp_server"], svc_name: $tool },
+                  observables: $obs_base,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  message: ("MCP tool " + $tool + " via " + ($r["mcp_server"] // "server"))
+                }
+              elif (($fa != 0) and (($path // "") != "")) then
+                # ---- File System Activity 1001 ----
+                $common + {
+                  category_uid: 1, class_uid: 1001, activity_id: $fa, type_uid: (100100 + $fa),
+                  severity_id: (if $tok then 1 else 2 end),
+                  file: { name: $path, type_id: 1 },
+                  device: $device, actor: $actor, observables: $obs_actor,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  message: ($tool + " " + ({"1":"create","2":"read","3":"update"}[($fa|tostring)] // "access") + " " + ($path | tostring))
+                }
+              else
+                # ---- Process Activity 1007 (shell/exec + other tools) ----
+                $common + {
+                  category_uid: 1, class_uid: 1007, activity_id: 1, type_uid: 100701,
+                  severity_id: (if $tok then 1 else 2 end),
+                  process: { pid: 0, name: $tool, cmd_line: $cmd },
+                  device: $device, actor: $actor,
+                  message_context: { ai_role_id: 3, service: { name: "OpenAI Codex" } },
+                  observables: $obs_actor,
+                  status_id: (if $tok then 1 else 2 end),
+                  status: (if $tok then "Success" else "Failure" end),
+                  message: ($tool + " result")
+                }
+              end
+
+            elif $en == "codex.tool_decision" then
+              ($r["decision"] // "approved") as $decision
+            | ($decision | ascii_downcase | startswith("approv")) as $approved
+            | $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 99, type_uid: 600399, activity_name: $en,
+                severity_id: (if $approved then 1 else 3 end),
+                api: { operation: ("tool:" + ($r["tool_name"] // "unknown")), service: { name: "OpenAI Codex" } },
+                src_endpoint: { name: ($r["terminal.type"] // "codex-cli"), uid: $r["call_id"], svc_name: "openai-codex" },
+                actor: $actor, observables: $obs_actor,
+                status_id: (if $approved then 1 else 2 end),
+                status: (if $approved then "Success" else "Failure" end),
+                message: (($r["tool_name"] // "tool") + " decision: " + $decision)
+              }
+
+            elif $en == "codex.sandbox_outcome" then
+              (($r["outcome"] // "") | ascii_downcase) as $oc
+            | ($oc == "success" or $oc == "ok") as $sok
+            | $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 99, type_uid: 600399, activity_name: $en,
+                severity_id: (if $sok then 1 else 3 end),
+                api: { operation: ("sandbox:" + ($r["tool_name"] // "unknown")), service: { name: "OpenAI Codex" } },
+                src_endpoint: { name: ($r["terminal.type"] // "codex-cli"), uid: $r["call_id"], svc_name: "openai-codex" },
+                actor: $actor, observables: $obs_actor, duration: num($r["initial_duration_ms"]),
+                status_id: (if $sok then 1 else 2 end),
+                status: (if $sok then "Success" else "Failure" end),
+                message: (($r["tool_name"] // "tool") + " sandbox outcome: " + ($r["outcome"] // "unknown"))
+              }
+
+            else
+              $common + {
+                category_uid: 6, class_uid: 6003, activity_id: 99, type_uid: 600399, activity_name: $en, severity_id: 1,
+                api: { operation: $eshort, service: { name: "OpenAI Codex" } },
+                src_endpoint: { name: ($r["terminal.type"] // "codex-cli"), uid: $r["conversation.id"], svc_name: "openai-codex" },
+                actor: $actor, observables: $obs_actor, status_id: 0
+              }
+            end
+
+          # declare the ai_operation profile when an AI block is present
+          | (if (.ai_model != null) or (.message_context != null) then .metadata.profiles = ((.metadata.profiles // []) + ["ai_operation"]) else . end)
+          # identity guard: tag + raise severity floor; never drop
+          | (if ($has_id | not) then
+               .severity_id = ([.severity_id, 3] | max)
+               | .metadata.labels = ["identity.missing"]
+               | .message = ((.message // "") + " [identity.missing]")
+             else . end)
+          # prune null / empty-string / empty-array leaves
+          | walk(if type == "object"
+                 then with_entries(select((.value != null) and (.value != "")
+                        and ((((.value | type) == "array") and ((.value | length) == 0)) | not)))
+                 else . end)

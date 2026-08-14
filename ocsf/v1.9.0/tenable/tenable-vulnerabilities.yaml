@@ -1,0 +1,258 @@
+name: "Tenable Vulnerability Findings to OCSF v1.9.0"
+description: "Transforms Tenable Vulnerability Findings into the OCSF v1.9.0 Vulnerability Finding class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "tenable-vulnerabilities"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "tenable"
+  - "vulnerability"
+  - "findings"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Vulnerability Finding (class_uid=2002) — v1.9.0
+          # Input: one Tenable VM vulnerability export record per invocation.
+          # v1.9.0 makes `osint` and `cloud` base-required on this class
+          # (both added below on top of the proven v1.5.0 mapping).
+          # ---------------------------------------------------------------
+
+          # Tenable timestamps carry fractional seconds + Z (e.g.
+          # "2026-05-29T20:37:16.102395Z"); strip the fraction before parsing.
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def trim: if . == null then null else (. | gsub("^\\s+|\\s+$"; "")) end;
+
+          # Tenable severity label -> OCSF severity_id. Derived from the
+          # human-readable `severity` string; the numeric severity_id Tenable
+          # emits is its own scale and is preserved verbatim in raw_data.
+          def sev_to_id:
+            (. // "" | ascii_downcase | gsub("^\\s+|\\s+$"; "")) as $s |
+            if   $s == "info" or $s == "informational" then 1
+            elif $s == "low"      then 2
+            elif $s == "medium"   then 3
+            elif $s == "high"     then 4
+            elif $s == "critical" then 5
+            else 99 end;
+          def sev_caption($id):
+            {"1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Other";
+
+          # Tenable finding state -> OCSF status_id (+ caption for the sibling).
+          def state_to_status_id:
+            (. // "" | ascii_upcase) as $s |
+            if   $s == "OPEN"     then 1   # New
+            elif $s == "REOPENED" then 2   # In Progress
+            elif $s == "FIXED"    then 4   # Resolved
+            else 99 end;
+          def status_caption($id):
+            {"1":"New","2":"In Progress","4":"Resolved"}[$id|tostring] // "Other";
+
+          # OCSF os.type_id (+ caption): 100=Windows, 200=Linux, 300=macOS,
+          # 201=Android, 301=iOS, 99=Other.
+          def os_type_id:
+            (. // "" | ascii_downcase) as $o |
+            if   ($o | test("windows")) then 100
+            elif ($o | test("mac os|macos|os x")) then 300
+            elif ($o | test("android")) then 201
+            elif ($o | test("ios")) then 301
+            elif ($o | test("linux")) then 200
+            else 99 end;
+          def os_type_caption($id):
+            {"100":"Windows","200":"Linux","300":"macOS","201":"Android","301":"iOS"}[$id|tostring] // "Other";
+
+          # Build one OCSF CVSS object, omitting the optional vector when absent.
+          def mk_cvss($ver; $score; $vec):
+            {"version": $ver, "base_score": $score}
+            + (if $vec != null then {"vector_string": $vec} else {} end);
+
+          # Shared inputs reused across vulnerabilities / device / observables.
+          (.plugin // {}) as $p |
+          (.asset // {}) as $a |
+          ($p.see_also // []) as $refs |
+
+          # Cloud provider (v1.9.0 requires the cloud object). Tenable tags a
+          # cloud-hosted asset with per-CSP instance identifiers; derive the
+          # provider from whichever is present, else "Other".
+          (if   $a.aws_ec2_instance_id != null then "AWS"
+           elif ($a.azure_vm_id // $a.azure_resource_id) != null then "Azure"
+           elif ($a.gcp_instance_id // $a.gcp_project_id) != null then "GCP"
+           else "Other" end) as $cloud_provider |
+
+          # CVEs: union of plugin.cve (already "CVE-..."-prefixed) and any CVE
+          # cross-references (which arrive bare, e.g. "2024-0741").
+          ((($p.cve // []) + [ ($p.xrefs // [])[] | select(.type == "CVE") | "CVE-" + (.id | ltrimstr("CVE-")) ]) | unique) as $cves |
+          # CWEs from cross-references, if any.
+          ([ ($p.xrefs // [])[] | select(.type == "CWE") | "CWE-" + (.id | ltrimstr("CWE-")) ] | unique) as $cwes |
+
+          ([ (if $p.cvss3_base_score != null
+                then mk_cvss("3.0"; $p.cvss3_base_score; ($p.cvss3_vector.raw)) else empty end),
+             (if $p.cvss_base_score != null
+                then mk_cvss("2.0"; $p.cvss_base_score; ($p.cvss_vector.raw)) else empty end) ]) as $cvss |
+
+          # The base vulnerability object (shared by every entry in this record).
+          ({
+            "title": $p.name,
+            "desc": ($p.description // $p.synopsis),
+            "severity": (.severity | trim),
+            "references": $refs,
+            "is_exploit_available": ($p.exploit_available // false),
+            "is_fix_available": ($p.has_patch // false),
+            "first_seen_time": to_epoch(.first_found),
+            "last_seen_time": to_epoch(.last_found),
+            "remediation": { "desc": ($p.solution // "") }
+          }) as $base_vuln |
+
+          # The shared CVE object (uid is filled per-entry below).
+          ({
+            "references": $refs,
+            "created_time": to_epoch($p.vuln_publication_date)
+          } + (if ($cvss | length) > 0 then {"cvss": $cvss} else {} end)) as $cve_base |
+
+          (.severity | sev_to_id) as $sev_id |
+          (.state | state_to_status_id) as $status_id |
+
+          {
+            # --- Classification (REQUIRED) ---
+            "category_uid": 2,
+            "class_uid": 2002,
+            "type_uid": 200201,
+            "activity_id": 1,
+
+            # --- Severity (REQUIRED); sibling string set to OCSF caption ---
+            "severity_id": $sev_id,
+            "severity": sev_caption($sev_id),
+
+            # --- Time (REQUIRED) ---
+            "time": to_epoch(.scan.started_at),
+
+            # --- Status; raw Tenable state preserved in status_detail ---
+            "status_id": $status_id,
+            "status": status_caption($status_id),
+            "status_detail": .state,
+
+            # --- Metadata (REQUIRED) ---
+            "metadata": {
+                "profiles": ["cloud", "osint"],
+              "version": "1.9.0",
+              "product": {
+                "vendor_name": "Tenable",
+                "name": "Tenable Vulnerability Management"
+              },
+              "uid": .scan.uuid,
+              "logged_time": to_epoch(.indexed)
+            },
+
+            # --- Cloud (REQUIRED in v1.9.0); provider is the only required attr ---
+            "cloud": (
+              {
+                "provider": $cloud_provider
+              }
+              + (if $a.aws_region != null then {"region": $a.aws_region} else {} end)
+              + (if $a.aws_owner_id != null
+                   then {"account": {"uid": ($a.aws_owner_id | tostring), "type_id": 10, "type": "AWS Account"}}
+                   else {} end)
+            ),
+
+            # --- OSINT (REQUIRED in v1.9.0) ---
+            # One indicator per CVE (type_id 10 = Vulnerability); if the plugin
+            # reports no CVE, fall back to the Tenable plugin id so the required
+            # value/type_id pair is always populated.
+            "osint": (
+              if ($cves | length) > 0 then
+                [ $cves[] as $id | { "type_id": 10, "value": $id } ]
+              else
+                [ { "type_id": 10, "value": ($p.id | tostring) } ]
+              end
+            ),
+
+            # --- Finding Info (REQUIRED) ---
+            "finding_info": {
+              "uid": ($p.id | tostring),
+              "title": $p.name,
+              "desc": ($p.synopsis // $p.description),
+              "first_seen_time": to_epoch(.first_found),
+              "last_seen_time": to_epoch(.last_found),
+              "created_time": to_epoch($p.publication_date),
+              "modified_time": to_epoch($p.modification_date),
+              "src_url": ($refs | first),
+              "types": ["Vulnerability"]
+            },
+
+            # --- Vulnerabilities (REQUIRED) ---
+            # The OCSF `vulnerability` object carries a `just_one:
+            # [advisory, cve, cwe]` constraint. Emit one entry per CVE; if a
+            # plugin reports no CVE, fall back to CWE, then to an advisory
+            # synthesized from the plugin so the constraint holds.
+            "vulnerabilities": (
+              if ($cves | length) > 0 then
+                [ $cves[] as $id | $base_vuln + { "cve": ($cve_base + { "uid": $id }) } ]
+              elif ($cwes | length) > 0 then
+                [ $cwes[] as $id | $base_vuln + { "cwe": { "uid": $id } } ]
+              else
+                [ $base_vuln + { "advisory": {
+                    "uid": ($p.id | tostring),
+                    "desc": ($p.synopsis // $p.description),
+                    "references": $refs
+                  } } ]
+              end
+            ),
+
+            # --- Recommended: device (base-level attribute) ---
+            "device": {
+              "type_id": 0,
+              "hostname": ($a.hostname // $a.fqdn),
+              "uid": $a.uuid,
+              "ip": $a.ipv4,
+              "mac": $a.mac_address,
+              "name": ($a.netbios_name // $a.fqdn // $a.hostname),
+              "os": (
+                ($a.operating_system // [] | first) as $os |
+                if $os != null then
+                  ($os | os_type_id) as $otid |
+                  { "name": $os, "type_id": $otid, "type": os_type_caption($otid) }
+                else null end
+              )
+            },
+
+            # --- Recommended: generic resource + plural resources ---
+            "resource": {
+              "type": "host",
+              "name": ($a.hostname // $a.fqdn),
+              "uid": $a.uuid,
+              "labels": ($a.operating_system // [])
+            },
+            "resources": [{
+              "type": "host",
+              "name": ($a.hostname // $a.fqdn),
+              "uid": $a.uuid,
+              "labels": ($a.operating_system // [])
+            }],
+
+            # --- Recommended: observables (natural pivots) ---
+            "observables": [
+              ( $cves[]? | { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": . } ),
+              (if ($a.hostname // $a.fqdn) != null
+                then { "name": "device.hostname", "type": "Hostname", "type_id": 1, "value": ($a.hostname // $a.fqdn) } else empty end),
+              (if $a.ipv4 != null
+                then { "name": "device.ip", "type": "IP Address", "type_id": 2, "value": $a.ipv4 } else empty end),
+              (if $a.mac_address != null
+                then { "name": "device.mac", "type": "MAC Address", "type_id": 3, "value": $a.mac_address } else empty end)
+            ],
+
+            # --- Original record for audit / debugging ---
+            "raw_data": (. | tostring)
+          }
+          # Drop any keys that resolved to null so the event carries only
+          # populated attributes (the OCSF validator rejects null-typed values).
+          | del(.. | nulls)

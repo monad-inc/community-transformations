@@ -1,0 +1,114 @@
+name: "Bitwarden Event Logs to OCSF v1.9.0"
+description: "Transforms Bitwarden Events (organization audit log) records into the OCSF v1.9.0 Authentication (3002) class."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "bitwarden-events"
+tags:
+  - "v1.9.0"
+  - "ocsf"
+  - "bitwarden"
+  - "iam"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # OCSF Authentication (class_uid=3002) — v1.9.0
+          # Input: one Bitwarden Events (Public API /public/events) record.
+          # Fields: object,type,itemId,collectionId,groupId,policyId,
+          #         memberId,actingUserId,installationId,date,device,ipAddress
+          # Modeled for the login-family event types (1000/1005/1006);
+          # non-auth type codes fall back to activity/status Unknown.
+          # ---------------------------------------------------------------
+          def to_epoch($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then $ts
+            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
+            end;
+
+          def device_name($d):
+            {
+              "0":"Android","1":"iOS","2":"Chrome Extension","3":"Firefox Extension",
+              "4":"Opera Extension","5":"Edge Extension","6":"Windows Desktop",
+              "7":"macOS Desktop","8":"Linux Desktop","9":"Chrome Browser",
+              "10":"Firefox Browser","11":"Opera Browser","12":"Edge Browser",
+              "13":"IE Browser","14":"Unknown Browser","15":"Android (Amazon)",
+              "16":"UWP","17":"Safari Browser","18":"Vivaldi Browser",
+              "19":"Vivaldi Extension","20":"Safari Extension","21":"SDK"
+            }[$d | tostring];
+
+          def event_name($t):
+            {
+              "1000":"Logged in","1001":"Changed account password",
+              "1002":"Enabled/updated two-step login","1003":"Disabled two-step login",
+              "1004":"Recovered account from two-step login","1005":"Login attempt failed (bad password)",
+              "1006":"Login attempt failed (bad two-step)","1007":"Exported individual vault",
+              "1008":"Account recovery requested","1009":"Account recovery key migrated"
+            }[$t | tostring] // "Bitwarden event";
+
+          . as $r
+          | ($r.type) as $t
+          | (($t == 1005) or ($t == 1006)) as $failed
+          | {
+              "category_uid": 3,
+              "class_uid":    3002,
+              "activity_id":  (if $t == 1000 or $failed then 1 else 99 end),
+              "type_uid":     (3002 * 100 + (if $t == 1000 or $failed then 1 else 99 end)),
+              "severity_id":  (if $failed then 2 else 1 end),
+              "status_id":    (if $t == 1000 then 1 elif $failed then 2 else 0 end),
+              "status":       (if $t == 1000 then "Success" elif $failed then "Failure" else "Unknown" end),
+
+              "time": to_epoch($r.date),
+
+              "metadata": {
+                "profiles": ["cloud", "osint", "host"],
+                "version": "1.9.0",
+                "product": {
+                  "vendor_name": "Bitwarden",
+                  "name": "Bitwarden Event Logs"
+                },
+                "uid": ($r.actingUserId // $r.memberId),
+                "log_provider": "Bitwarden Public API"
+              },
+
+              "user": {
+                "uid": ($r.actingUserId // $r.memberId),
+                "type_id": 1
+              },
+
+              # at_least_one [service, dst_endpoint] — Bitwarden is the service.
+              "service": { "name": "Bitwarden" },
+
+              "src_endpoint": ( if $r.ipAddress != null
+                                then { "ip": $r.ipAddress } else null end ),
+
+              "device": ( if $r.device != null
+                          then { "name": device_name($r.device), "type": device_name($r.device), "type_id": 99 }
+                          else null end ),
+
+              # Required by the OCSF v1.9.0 base for this class.
+              "cloud":  { "provider": "Bitwarden" },
+              "osint":  [],
+
+              "message": event_name($t),
+
+              "unmapped": {
+                "bitwarden_event_type": $t,
+                "member_id": $r.memberId,
+                "item_id": $r.itemId,
+                "collection_id": $r.collectionId,
+                "group_id": $r.groupId,
+                "policy_id": $r.policyId,
+                "installation_id": $r.installationId,
+                "device_code": $r.device
+              },
+
+              "raw_data": ($r | tostring)
+            }
+          | walk( if type == "object"
+                  then with_entries(select(.value != null and .value != {} and .value != ""))
+                  else . end )
