@@ -1,0 +1,58 @@
+name: "Semgrep Projects to CEF"
+description: "Maps Semgrep project (scanned-repository) inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-projects"
+tags:
+  - "v0"
+  - "cef"
+  - "semgrep"
+  - "projects"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep project inventory -> CEF intermediate (T1). No escaping —
+          # the shared CEF Serializer (T2) owns all escaping. Emit final-form
+          # values: severity 0-10, times epoch-MILLISECONDS, custom slots
+          # paired with their *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | sub(" "; "T") | sub("\\.[0-9]+"; "")
+                   | sub("([+-][0-9][0-9]:[0-9][0-9]|Z)$"; "") + "Z"
+                   | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.tags // []) as $tags
+          | { _cef: {
+              vendor: "Semgrep",
+              product: "Semgrep Cloud Platform",
+              version: "",
+              signature_id: "semgrep.project.inventory",
+              name: ("Semgrep project inventory: " + ($r.name // "unknown")),
+              severity: 2,
+              extension: ( {
+                rt:      to_epoch_ms($r.created_at),
+                dvchost: $r.name,
+                request: $r.url,
+                act:     "collect",
+                cn1Label: "projectId",
+                cn1:     $r.id,
+                cs1Label: "primaryBranch",
+                cs1:     $r.primary_branch,
+                cs2Label: "defaultBranch",
+                cs2:     $r.default_branch,
+                cs3Label: "tags",
+                cs3:     (if ($tags | length) > 0 then ($tags | join(",")) else null end),
+                deviceCustomDate1Label: "latestScanAt",
+                deviceCustomDate1: to_epoch_ms($r.latest_scan_at)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,72 @@
+name: "AWS IAM Access Analyzer Findings to CEF"
+description: "Maps AWS IAM Access Analyzer external-access finding records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-iam-access-analyzer"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "access-analyzer"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS IAM Access Analyzer Finding -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity int 0-10, times in
+          # epoch-MILLISECONDS, every cs*/cn* slot paired with its *Label.
+          # One jq pass; shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ( $r.status // "ACTIVE" ) as $status
+          | ( [ ($r.principal // {}) | to_entries[] | .value ] | join(",") ) as $principal_str
+          | ( ($r.action // []) | join(",") ) as $actions_str
+          | ( ($r.analyzerArn // "") | split(":") ) as $aarn
+          | ( if ($aarn | length) > 3 and ($aarn[3] != "") then $aarn[3] else null end ) as $region
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "IAM Access Analyzer",
+              version: "",
+              signature_id: "iam-access-analyzer.external-access",
+              name: ("External access to " + ($r.resourceType // "resource") + " " + ($r.resource // $r.id)),
+              # Public exposure = 8, scoped external access = 5, closed = 3.
+              severity: ( if ($status == "RESOLVED" or $status == "ARCHIVED") then 3
+                          elif ($r.isPublic // false) == true then 8
+                          else 5 end ),
+              extension: ( {
+                rt:         to_epoch_ms($r.analyzedAt),
+                start:      to_epoch_ms($r.createdAt),
+                end:        to_epoch_ms($r.updatedAt),
+                externalId: $r.id,
+                suser:      (if $principal_str == "" then null else $principal_str end),
+                act:        $status,
+                outcome:    (if ($status == "RESOLVED") then "RESOLVED"
+                             elif ($status == "ARCHIVED") then "ARCHIVED"
+                             else "ACTIVE" end),
+                msg:        (if ($r.error // null) != null
+                             then ("Access Analyzer finding error: " + $r.error)
+                             else ("External access finding for " + ($r.resource // $r.id)) end),
+                # Resource identity + finding detail into custom string slots.
+                cs1Label: "resource",        cs1: $r.resource,
+                cs2Label: "resourceType",    cs2: $r.resourceType,
+                cs3Label: "resourceOwnerAccount", cs3: $r.resourceOwnerAccount,
+                cs4Label: "awsRegion",       cs4: $region,
+                cs5Label: "grantedActions",  cs5: (if $actions_str == "" then null else $actions_str end),
+                cs6Label: "analyzerArn",     cs6: $r.analyzerArn,
+                # isPublic as a numeric flag (1/0).
+                cn1Label: "isPublic",        cn1: (if ($r.isPublic // false) == true then 1 else 0 end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

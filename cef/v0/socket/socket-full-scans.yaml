@@ -1,0 +1,87 @@
+name: "Socket Full Scan Findings to CEF"
+description: "Maps Socket.dev full-scan SBOM artifact records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "socket-full-scans"
+tags:
+  - "v0"
+  - "cef"
+  - "socket"
+  - "full-scans"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Socket.dev full-scan SBOM artifact -> CEF intermediate (T1).
+          # Input: ONE Socket artifact per invocation (one scanned package
+          #   with an alerts[] array). CEF carries one event, so the WORST
+          #   alert drives the signature/name/severity; the full alert set is
+          #   preserved in custom-string slots.
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values (severity 0-10, times epoch-ms,
+          # every cs*/cn*/cfp* slot paired with its *Label).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # Socket severity label -> ordering rank and CEF 0-10 severity.
+          def sev_rank:
+            (. // "" | ascii_downcase) as $s |
+            if   $s == "critical" then 4
+            elif $s == "high"     then 3
+            elif $s == "middle" or $s == "medium" then 2
+            elif $s == "low"      then 1
+            else 0 end;
+          def rank_to_cef($n):
+            {"4":10,"3":8,"2":5,"1":3,"0":1}[$n|tostring] // 0;
+
+          . as $r
+          | ($r.alerts // []) as $alerts
+
+          | ( ($r.inputPurl)
+              // ( "pkg:" + ($r.type // "generic")
+                   + (if ($r.namespace // "") != "" then "/" + $r.namespace else "" end)
+                   + "/" + ($r.name // "unknown")
+                   + (if ($r.version // "") != "" then "@" + $r.version else "" end) )
+            ) as $purl
+
+          # The worst alert drives the CEF header.
+          | ( ($alerts | sort_by(.severity | sev_rank) | last) // {} ) as $worst
+          | ( [ $alerts[] | .type | select(. != null) ] | unique ) as $alert_types
+          | ( [ $alerts[] | .props.cveId | select(. != null) ] | unique ) as $cves
+
+          | { _cef: {
+                vendor: "Socket",
+                product: "Socket Full Scans",
+                version: "",
+                # signature = the worst alert's type; stable + low-cardinality.
+                signature_id: ($worst.type // "supplyChainScan"),
+                name: ( "Socket "
+                        + ($worst.type // "supply-chain scan")
+                        + " on " + ($r.name // "unknown")
+                        + "@" + ($r.version // "?") ),
+                severity: rank_to_cef($worst.severity | sev_rank),
+                extension: ( {
+                  rt:       to_epoch_ms($r.publishedAt),
+                  outcome:  ($worst.action),                       # error / warn / ignore
+                  msg:      ($worst.props.description // $worst.props.note),
+                  fname:    ($worst.file),
+                  cat:      ($worst.category),
+                  cs1Label: "packagePurl",   cs1: $purl,
+                  cs2Label: "ecosystem",     cs2: ($r.type),
+                  cs3Label: "cveIds",        cs3: (if ($cves | length) > 0 then ($cves | join(",")) else null end),
+                  cs4Label: "alertTypes",    cs4: (if ($alert_types | length) > 0 then ($alert_types | join(",")) else null end),
+                  cs5Label: "packageLicense", cs5: ($r.license),
+                  cn1Label: "alertCount",    cn1: ($alerts | length),
+                  cn2Label: "directDependency", cn2: (if ($r.direct == true) then 1 elif ($r.direct == false) then 0 else null end),
+                  cfp1Label: "cvssScore",    cfp1: ([ $alerts[] | .props.cvssScore | select(. != null) ] | max)
+                } | with_entries(select(.value != null and .value != "")) )
+          } }

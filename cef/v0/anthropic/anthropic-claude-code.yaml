@@ -1,0 +1,104 @@
+name: "Anthropic Claude Code (OTLP) to CEF"
+description: "Maps one OTLP log record from Claude Code into the normalized {_cef:{...}} CEF intermediate (Vendor Anthropic, Product Claude Code). Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string. signature_id is the low-cardinality event name; token counts and cost ride custom cn*/cs* slots with labels."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-claude-code"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "ai"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Claude Code RAW OTLP logs -> CEF intermediate (T1).
+          # One OTLP envelope in -> one _cef object (first logRecord).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10
+          #   - rt: epoch-MILLISECONDS
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass, per-record only; shallow with_entries null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000) end;
+          def nano2ms($n):
+            if $n == null or $n == "" then null else (($n | tonumber) / 1000000 | floor) end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+
+          def av($v):
+            if $v == null then null
+            elif $v.stringValue != null then $v.stringValue
+            elif $v.intValue != null then ($v.intValue | tonumber)
+            elif $v.doubleValue != null then $v.doubleValue
+            elif $v.boolValue != null then $v.boolValue
+            elif $v.arrayValue != null then ((($v.arrayValue.values) // []) | map(av(.)))
+            elif $v.kvlistValue != null then
+              (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
+            else null end;
+          def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
+
+          [ (.resourceLogs // [])[] as $rl
+            | kv($rl.resource.attributes) as $res
+            | ($rl.scopeLogs // [])[] as $sl
+            | ($sl.logRecords // [])[] as $lr
+            | ($res + kv($lr.attributes)) as $r
+            | ( ($lr.body.stringValue) as $b
+                | if ($b != null and ($b | startswith("claude_code."))) then $b
+                  elif (($r["event.name"]) // "") != "" then ("claude_code." + $r["event.name"])
+                  else ($b // "claude_code.unknown") end ) as $en
+            | (if (($r["event.timestamp"]) // "") != "" then to_epoch_ms($r["event.timestamp"])
+               else nano2ms($lr.timeUnixNano) end) as $rt
+
+            # outcome + severity buckets (0-10)
+            | ( if ($en == "claude_code.api_error" or $en == "claude_code.api_refusal"
+                    or $en == "claude_code.internal_error") then "FAILURE"
+                elif ($r["success"] != null) then (if truthy($r["success"]) then "SUCCESS" else "FAILURE" end)
+                elif ($r["status"] == "failed") then "FAILURE"
+                else "SUCCESS" end ) as $outcome
+            | ( if $en == "claude_code.internal_error" then 7
+                elif ($outcome == "FAILURE") then 6
+                elif $en == "claude_code.auth" then 4
+                else 2 end ) as $sev
+            | (($r["input_tokens"] // 0) + ($r["output_tokens"] // 0)
+               + ($r["cache_read_tokens"] // 0) + ($r["cache_creation_tokens"] // 0)) as $total_tokens
+
+            | { _cef: {
+                  vendor: "Anthropic",
+                  product: "Claude Code",
+                  version: (($r["app.version"]) // ($r["service.version"]) // ""),
+                  signature_id: $en,
+                  name: ($en | ltrimstr("claude_code.")),
+                  severity: $sev,
+                  extension: ( {
+                    rt: $rt,
+                    suser: $r["user.email"],
+                    suid: ($r["user.account_uuid"] // $r["user.id"]),
+                    dhost: $r["terminal.type"],
+                    act: ($en | ltrimstr("claude_code.")),
+                    outcome: $outcome,
+                    app: "claude-code",
+                    dvchost: $r["terminal.type"],
+                    reason: ($r["error"] // $r["error_type"] // $r["error_category"]),
+                    externalId: $r["request_id"],
+                    # --- custom slots (each paired with its *Label) ---
+                    cs1Label: "model",            cs1: $r["model"],
+                    cs2Label: "sessionId",        cs2: $r["session.id"],
+                    cs3Label: "organizationId",   cs3: $r["organization.id"],
+                    cs4Label: "querySource",      cs4: $r["query_source"],
+                    cn1Label: "inputTokens",      cn1: $r["input_tokens"],
+                    cn2Label: "outputTokens",     cn2: $r["output_tokens"],
+                    cn3Label: "totalTokens",      cn3: (if $total_tokens > 0 then $total_tokens else null end),
+                    cfp1Label: "costUsd",         cfp1: $r["cost_usd"],
+                    flexNumber1Label: "durationMs", flexNumber1: $r["duration_ms"]
+                  } | with_entries(select(.value != null and .value != "")) )
+              } }
+          ][0]

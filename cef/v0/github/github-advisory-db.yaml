@@ -1,0 +1,86 @@
+name: "GitHub Advisory Database to CEF"
+description: "Maps GitHub Advisory Database (Global Security Advisory) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "github-advisory-db"
+tags:
+  - "v0"
+  - "cef"
+  - "github"
+  - "advisory"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # GitHub Advisory Database -> CEF intermediate (T1).
+          # Input: ONE GitHub Global Security Advisory record per invocation.
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity as integer 0-10, time
+          # fields as epoch-MILLISECONDS, every cs*/cn*/cfp* slot paired with
+          # its label. One jq pass; shallow null-drop on `extension`.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          # GHSA severity label -> CEF severity bucket (integer 0-10).
+          def sev_bucket:
+            (. // "" | ascii_downcase) as $s |
+            if   $s == "low"       then 3
+            elif $s == "medium" or $s == "moderate" then 5
+            elif $s == "high"      then 8
+            elif $s == "critical"  then 10
+            else 0 end;
+
+          # A custom slot only exists when it has a value: emit {slotLabel,slot}
+          # together or neither, so no orphaned *Label survives the null-drop.
+          def slot($n; $label; $val):
+            if $val == null or $val == "" then {}
+            else { ($n + "Label"): $label, ($n): $val } end;
+
+          def joined($arr): ($arr | join(", ") | (if . == "" then null else . end));
+
+          . as $r
+          | ($r.vulnerabilities // []) as $vulns
+          | ($r.cwes // []) as $cwes
+          | (($r.cvss_severities.cvss_v3 // $r.cvss // {})) as $cv
+          | { _cef: {
+              vendor: "GitHub",
+              product: "GitHub Advisory Database",
+              version: "",
+              # Stable, low-cardinality identifier: prefer GHSA (always
+              # present), fall back to CVE.
+              signature_id: ($r.ghsa_id // $r.cve_id),
+              name: $r.summary,
+              severity: ($r.severity | sev_bucket),
+              extension: ( ( {
+                # rt = published; end = last updated (epoch-ms).
+                rt:      to_epoch_ms($r.published_at),
+                end:     to_epoch_ms($r.updated_at),
+                msg:     $r.description,
+                request: $r.html_url,
+                reason:  $r.severity
+              }
+              # Custom slots (each label emitted only alongside its value).
+              + slot("cs1"; "ghsaId"; $r.ghsa_id)
+              + slot("cs2"; "cveId"; $r.cve_id)
+              + slot("cs3"; "cweIds"; joined([ $cwes[]?.cwe_id ]))
+              + slot("cs4"; "affectedPackages";
+                     joined([ $vulns[]? | (.package.ecosystem // "?") + ":" + (.package.name // "?")
+                              + " " + (.vulnerable_version_range // "*") ]))
+              + slot("cs5"; "cvssVector"; $cv.vector_string)
+              + slot("cs6"; "fixedVersions";
+                     joined([ $vulns[]? | select(.first_patched_version != null)
+                              | (.package.name // "package") + " " + .first_patched_version ]))
+              # CVSS base score as a floating-point custom slot.
+              + (if $cv.score == null then {} else { cfp1Label: "cvssBaseScore", cfp1: $cv.score } end)
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

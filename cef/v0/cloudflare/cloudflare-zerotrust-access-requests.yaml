@@ -1,0 +1,55 @@
+name: "Cloudflare Zero Trust Access Requests to CEF"
+description: "Maps Cloudflare Zero Trust Access authentication (access_requests) logs into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-zerotrust-access-requests"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "access-requests"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Zero Trust Access access_requests -> CEF intermediate (T1).
+          # No escaping here (the shared serializer owns it). Final-form values:
+          #   severity int 0-10; times epoch-MS; custom slots paired with *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | (if $r.allowed == true then "SUCCESS"
+             elif $r.allowed == false then "FAILURE"
+             else "UNKNOWN" end) as $outcome
+          | (if $r.allowed == false then 6 else 2 end) as $sev
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Zero Trust Access",
+              version: "",
+              signature_id: ($r.action // "access_request"),
+              name: ("Cloudflare Access " + ($r.action // "request")
+                     + " (" + ($outcome | ascii_downcase) + ")"),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.created_at),
+                suser:   $r.user_email,
+                src:     $r.ip_address,
+                dhost:   $r.app_domain,
+                request: $r.app_domain,
+                act:     $r.action,
+                outcome: $outcome,
+                cs1Label: "idp",     cs1: $r.connection,
+                cs2Label: "appUid",  cs2: $r.app_uid,
+                cs3Label: "rayId",   cs3: $r.ray_id
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

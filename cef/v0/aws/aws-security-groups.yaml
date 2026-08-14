@@ -1,0 +1,68 @@
+name: "AWS Security Groups to CEF"
+description: "Maps AWS EC2 Security Group inventory records (from the aws-security-groups input connector) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-security-groups"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "security-groups"
+  - "cloud-security"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Security Groups -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values (severity int 0-10; times
+          # epoch-MILLISECONDS; every cs*/cn* slot paired with its *Label).
+          #
+          # Input: one EC2 SecurityGroup record (SDK/JSON PascalCase):
+          #   { GroupId, GroupName, Description, VpcId, OwnerId,
+          #     SecurityGroupArn, IpPermissions[], IpPermissionsEgress[],
+          #     Tags[] }.
+          # A security group carries no event time of its own, so rt is
+          # stamped at collection (now, epoch-ms). Severity is Low for a
+          # normal group, raised when an ingress rule is open to 0.0.0.0/0
+          # or ::/0. One jq pass; shallow null-drop; no escaping.
+          # ---------------------------------------------------------------
+          . as $r
+          | ( ($r.SecurityGroupArn // "") | split(":") ) as $arn
+          | ( if ($arn | length) > 3 and ($arn[3] != "") then $arn[3] else null end ) as $region
+          | ( ($r.IpPermissions // [])
+              | map( ( (.IpRanges   // []) | map(.CidrIp   == "0.0.0.0/0") | any )
+                     or ( (.Ipv6Ranges // []) | map(.CidrIpv6 == "::/0")     | any ) )
+              | map(select(.)) | length ) as $world_open_ingress
+          | ( ($r.Tags // []) | map("\(.Key)=\(.Value)") | join(",") ) as $tag_str
+          | { _cef: {
+              vendor: "AWS",
+              product: "Amazon EC2 Security Groups",
+              version: "",
+              signature_id: "aws.ec2.security-group.inventory",
+              name: ( "Security group \($r.GroupName // $r.GroupId) (\($r.GroupId)) inventory" ),
+              # Informational inventory = Low (2); a group exposed to the whole
+              # internet is raised to Medium (6).
+              severity: ( if $world_open_ingress > 0 then 6 else 2 end ),
+              extension: ( {
+                rt:       (now * 1000 | floor),
+                act:      "security-group-inventory",
+                outcome:  "SUCCESS",
+                cat:      "Cloud Security Group Inventory",
+                msg:      $r.Description,
+                dvchost:  $r.SecurityGroupArn,
+                cs1Label: "securityGroupId",   cs1: $r.GroupId,
+                cs2Label: "vpcId",             cs2: $r.VpcId,
+                cs3Label: "ownerAccountId",    cs3: $r.OwnerId,
+                cs4Label: "region",            cs4: $region,
+                cs5Label: "tags",              cs5: ( if $tag_str == "" then null else $tag_str end ),
+                cn1Label: "ingressRuleCount",  cn1: (($r.IpPermissions // []) | length),
+                cn2Label: "egressRuleCount",   cn2: (($r.IpPermissionsEgress // []) | length),
+                cn3Label: "worldOpenIngressRuleCount", cn3: $world_open_ingress
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

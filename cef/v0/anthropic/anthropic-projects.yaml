@@ -1,0 +1,60 @@
+name: "Anthropic Projects to CEF"
+description: "Maps Anthropic (Claude) Projects records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-projects"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "projects"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic (Claude) Projects -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns all
+          # escaping. Emit FINAL-FORM values: severity int 0-10, times as
+          # epoch-MILLISECONDS, every custom slot paired with its *Label.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.details // {}) as $d
+          | ($r.user // $d.user // {}) as $u
+          | ($r.organization_id // $d.organization_id) as $org
+          | (if ($r.is_private != null) then $r.is_private else $d.is_private end) as $priv
+          | ($r.name // $d.name) as $pname
+
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Claude Projects",
+              version: "",
+              signature_id: "anthropic.project",
+              name: ("Claude project: " + ($pname // $r.id // $d.id // "unknown")),
+              severity: 2,
+              extension: ( {
+                rt:    to_epoch_ms($d.updated_at // $r.updated_at // $r.created_at),
+                start: to_epoch_ms($r.created_at // $d.created_at),
+                end:   to_epoch_ms($d.updated_at // $r.updated_at),
+                suser: $u.email_address,
+                suid:  $u.id,
+                externalId: ($r.id // $d.id),
+                msg:   $d.description,
+                cs1Label: "organizationId", cs1: $org,
+                cs2Label: "projectName",    cs2: $pname,
+                cs3Label: "isPrivate",      cs3: (if $priv == null then null else ($priv | tostring) end),
+                cn1Label: "chatsCount",     cn1: $d.chats_count,
+                cn2Label: "attachmentsCount", cn2: ($d.attachments_count // (($r.attachments // []) | length))
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

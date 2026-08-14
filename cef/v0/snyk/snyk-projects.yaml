@@ -1,0 +1,54 @@
+name: "Snyk Project Metadata to CEF"
+description: "Maps Snyk Project Metadata into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-projects"
+tags:
+  - "v0"
+  - "cef"
+  - "snyk"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk /projects -> CEF intermediate (T1). NO escaping here.
+          # severity: integer 0-10 ; rt: epoch-MILLISECONDS ;
+          # custom slots cs*/cn* always paired with their *Label.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ( ($a.business_criticality // []) | if type == "array" then .[0] else . end ) as $crit
+          | { _cef: {
+              vendor: "Snyk",
+              product: "Snyk",
+              version: "",
+              signature_id: "project",
+              name: ($a.name // "Snyk Project"),
+              severity: (
+                { "low": 3, "medium": 5, "high": 8, "critical": 10 }[$crit // ""] // 0
+              ),
+              extension: ( {
+                rt:         to_epoch_ms($a.created),
+                externalId: $r.id,
+                fname:      $a.target_file,
+                msg:        $a.name,
+                cs1Label: "projectType",         cs1: $a.type,
+                cs2Label: "origin",              cs2: $a.origin,
+                cs3Label: "status",              cs3: $a.status,
+                cs4Label: "businessCriticality", cs4: $crit,
+                cs5Label: "environment",         cs5: (($a.environment // []) | if type == "array" then join(",") else . end),
+                cs6Label: "lifecycle",           cs6: (($a.lifecycle // []) | if type == "array" then join(",") else . end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,54 @@
+name: "Anthropic Compliance Organizations to CEF"
+description: "Maps Anthropic Compliance API organization directory records (List organizations endpoint) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "anthropic-compliance-organizations"
+tags:
+  - "v0"
+  - "cef"
+  - "anthropic"
+  - "compliance"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Anthropic Compliance API - List organizations -> CEF intermediate (T1)
+          # One organization record in -> one {_cef:{...}} object out.
+          # No escaping here — the shared CEF Serializer (T2) owns all escaping.
+          # Emit FINAL-FORM values: severity 0-10, times epoch-MILLISECONDS,
+          # custom slots cs*/cn* paired with their *Label.
+          #
+          # Source fields (all documented): uuid, name, created_at.
+          #   uuid       -> cs1 (organizationUuid)
+          #   name       -> cs2 (organizationName)  + Name header
+          #   created_at -> rt (epoch-ms; organization creation time)
+          # Directory snapshot => informational severity (2).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r
+          | { _cef: {
+              vendor: "Anthropic",
+              product: "Claude Compliance API",
+              version: "",
+              signature_id: "compliance.organization",
+              name: ("Organization directory record: " + ($r.name // $r.uuid // "unknown")),
+              severity: 2,
+              extension: ( {
+                rt:       to_epoch_ms($r.created_at),
+                act:      "organization-snapshot",
+                outcome:  "SUCCESS",
+                cs1Label: "organizationUuid",
+                cs1:      $r.uuid,
+                cs2Label: "organizationName",
+                cs2:      $r.name
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

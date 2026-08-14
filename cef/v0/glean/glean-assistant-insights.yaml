@@ -1,0 +1,65 @@
+name: "Glean Assistant Insights to CEF"
+description: "Maps Glean Assistant Insights interaction records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "glean-assistant-insights"
+tags:
+  - "v0"
+  - "cef"
+  - "glean"
+  - "assistant"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Glean Assistant Insights -> CEF intermediate (T1). NO escaping
+          # here (the shared serializer owns it). Final-form values only:
+          # severity integer 0-10, times epoch-MILLISECONDS, every cs*/cn*/
+          # flexString* slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test("^[0-9a-fA-F:]+:[0-9a-fA-F:]+$"));
+
+          . as $r
+          | (truthy($r.hadError)) as $err
+          | (($r.feedback // "") | ascii_upcase) as $fb
+          | { _cef: {
+              vendor: "Glean",
+              product: "Glean Assistant",
+              version: ($r.clientVersion // ""),
+              signature_id: ($r.feature // "assistant.chat"),
+              name: ("Glean Assistant " + ($r.feature // "interaction")),
+              severity: (if $err then 7 elif $fb == "NEGATIVE" then 5 else 3 end),
+              extension: ( {
+                rt:      to_epoch_ms($r.timestamp),
+                suser:   $r.userEmail,
+                suid:    $r.userId,
+                src:     (if is_ip($r.sourceIp) then $r.sourceIp else null end),
+                act:     ($r.feature // "chat"),
+                outcome: (if $err then "FAILURE" else "SUCCESS" end),
+                requestClientApplication: $r.userAgent,
+                cs1Label: "platform",       cs1: $r.platform,
+                cs2Label: "initiator",      cs2: $r.initiator,
+                cs3Label: "chatSessionId",  cs3: $r.chatSessionId,
+                cs4Label: "query",          cs4: $r.userQuery,
+                cs5Label: "model",          cs5: $r.modelName,
+                cs6Label: "department",     cs6: $r.department,
+                cn1Label: "inputTokens",    cn1: $r.inputTokens,
+                cn2Label: "outputTokens",   cn2: $r.outputTokens,
+                cn3Label: "responseMillis", cn3: $r.totalResponseMillis,
+                flexString1Label: "feedback", flexString1: $r.feedback
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,53 @@
+name: "Snyk Organizations to CEF"
+description: "Maps Snyk Organization inventory records (Snyk REST GET /orgs) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "snyk-organizations"
+tags:
+  - "v0"
+  - "cef"
+  - "snyk"
+  - "organizations"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Snyk Organizations -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values: severity int 0-10, times
+          # epoch-MILLISECONDS, custom slots cs* paired with their *Label.
+          # One jq pass; shallow null-drop on extension (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | { _cef: {
+              vendor: "Snyk",
+              product: "Snyk",
+              version: "",
+              signature_id: "org.inventory",
+              name: ("Snyk Organization Inventory: " + ($a.name // $r.id)),
+              severity: 1,
+              extension: ( {
+                rt:         to_epoch_ms($a.created_at),
+                externalId: $r.id,
+                deviceCustomDate1Label: "createdAt",
+                deviceCustomDate1: to_epoch_ms($a.created_at),
+                cs1Label: "orgName",  cs1: $a.name,
+                cs2Label: "orgSlug",  cs2: $a.slug,
+                cs3Label: "groupId",  cs3: $a.group_id,
+                cs4Label: "isPersonal", cs4: ($a.is_personal | tostring),
+                cs5Label: "accessRequestsEnabled", cs5: ($a.access_requests_enabled | tostring)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,69 @@
+name: "Rapid7 InsightVM Assets to CEF"
+description: "Maps Rapid7 InsightVM asset inventory records (GET /api/3/assets) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "rapid7-assets"
+tags:
+  - "v0"
+  - "cef"
+  - "rapid7"
+  - "device"
+  - "inventory"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # Rapid7 InsightVM asset inventory -> CEF intermediate (T1). No
+          # escaping here — the shared CEF Serializer (T2) owns all escaping.
+          # Emit FINAL-FORM values: severity int 0-10; times epoch-MILLISECONDS;
+          # custom slots cs*/cn* paired with their *Label. One jq pass; shallow
+          # null-drop.
+          def to_epoch_ms($ts):
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          . as $r |
+          ( ($r.history // []) | map(.date) | map(select(. != null)) | sort ) as $dates |
+          ( if ($dates | length) > 0 then $dates[0]  else null end ) as $first_scan |
+          ( if ($dates | length) > 0 then $dates[-1] else null end ) as $last_scan |
+          ( $r.hostName // ( ($r.hostNames // [])[0] | .name? ) ) as $primary_host |
+          ( $r.ip // ( ($r.addresses // [])[0] | .ip? ) ) as $primary_ip |
+          ( $r.mac // ( ($r.addresses // [])[0] | .mac? ) ) as $primary_mac |
+          { _cef: {
+              vendor: "Rapid7",
+              product: "InsightVM",
+              version: "",
+              signature_id: "rapid7:asset:inventory",
+              name: "Rapid7 Asset Inventory",
+              # Asset inventory snapshots are informational (CEF severity 2).
+              severity: 2,
+              extension: ( {
+                rt:               ( to_epoch_ms($last_scan) // to_epoch_ms($first_scan) // ((now * 1000) | floor) ),
+                start:            to_epoch_ms($first_scan),
+                end:              to_epoch_ms($last_scan),
+                externalId:       ($r.id | tostring),
+                dhost:            $primary_host,
+                dst:              $primary_ip,
+                dmac:             $primary_mac,
+                act:              "inventory",
+                cs1Label:         "operatingSystem",
+                cs1:              ($r.os // $r.osFingerprint.product),
+                cs2Label:         "assetType",
+                cs2:              $r.type,
+                cs3Label:         "osFamily",
+                cs3:              $r.osFingerprint.family,
+                cs4Label:         "osArchitecture",
+                cs4:              $r.osFingerprint.architecture,
+                cn1Label:         "riskScore",
+                cn1:              $r.riskScore,
+                cn2Label:         "criticalVulnerabilities",
+                cn2:              $r.vulnerabilities.critical,
+                cn3Label:         "totalVulnerabilities",
+                cn3:              $r.vulnerabilities.total
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

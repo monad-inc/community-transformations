@@ -1,0 +1,63 @@
+name: "Apple Business Manager Audit Events to CEF"
+description: "Maps Apple Business Manager audit events into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "apple-business-audit-events"
+tags:
+  - "v0"
+  - "cef"
+  - "apple-business"
+  - "audit-events"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Apple Business Manager auditEvents -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # severity: integer 0-10; rt: epoch-MILLISECONDS; custom slots
+          # paired with their *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+              if $ts == null then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000) end;
+
+          . as $r
+          | ($r.attributes // {}) as $a
+          | ($a.type // "") as $t
+          | ($a.subjectType // "" | ascii_upcase) as $st
+          | ($a.eventDataDeviceAddedToOrg // $a.eventDataDeviceRemovedFromOrg
+             // $a.eventDataDeviceAssignedToServer // $a.eventDataDeviceUnassignedFromServer
+             // $a.eventDataDeviceIsErased // {}) as $devdata
+
+          | { _cef: {
+              vendor: "Apple",
+              product: "Apple Business Manager",
+              version: "",
+              signature_id: $t,
+              name: (($t | gsub("_"; " ") | ascii_downcase) + " (" + ($a.category // "audit") + ")"),
+              severity: (
+                if ($a.outcome // "" | ascii_upcase) == "FAILURE" then 7 else 3 end),
+              extension: ( {
+                rt:         to_epoch_ms($a.eventDateTime),
+                externalId: $r.id,
+                act:        $t,
+                cat:        $a.category,
+                outcome:    $a.outcome,
+                suser:      $a.actorName,
+                suid:       $a.actorId,
+                duser:      (if $st == "USER" or $st == "ACCOUNT" or $st == "API_ACCOUNT" then $a.subjectName else null end),
+                duid:       $a.subjectId,
+                deviceExternalId: (if $st == "DEVICE" then $a.subjectId else null end),
+                msg:        (($a.actorName // "actor") + " " + $t + " on " + ($a.subjectName // ($a.subjectType // "resource"))),
+                cs1Label: "subjectType",  cs1: $a.subjectType,
+                cs2Label: "actorType",    cs2: $a.actorType,
+                cs3Label: "serialNumber", cs3: $devdata.serialNumber,
+                cs4Label: "groupId",      cs4: $a.groupId
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

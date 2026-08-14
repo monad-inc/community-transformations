@@ -1,0 +1,56 @@
+name: "Clumio Consolidated Alerts to CEF"
+description: "Maps Clumio consolidated alert records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "clumio-consolidated-alerts"
+tags:
+  - "v0"
+  - "cef"
+  - "clumio"
+  - "consolidated-alerts"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Clumio consolidated alert -> CEF intermediate (T1). No escaping.
+          # severity: integer 0-10; times epoch-ms; custom slots + labels.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.parent_entity // {}) as $pe
+          | ($r.details // {}) as $d
+          | def to_epoch_ms($ts):
+              if $ts == null or $ts == "" then null
+              elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+              else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+              end;
+          { _cef: {
+              vendor: "Clumio",
+              product: "Clumio",
+              version: "",
+              signature_id: ($r.type // "alert"),
+              name: (($r.type // "Alert") + ": " + ($r.cause // "unknown")),
+              severity: ( { "error": 7, "warning": 4 }[($r.severity // "" | ascii_downcase)] // 0 ),
+              extension: ( {
+                rt:      to_epoch_ms($r.updated_timestamp // $r.raised_timestamp),
+                start:   to_epoch_ms($r.raised_timestamp),
+                end:     to_epoch_ms($r.cleared_timestamp),
+                act:     ($r.type // null),
+                outcome: ({ "active": "ACTIVE", "cleared": "CLEARED" }[($r.status // "" | ascii_downcase)] // null),
+                msg:     ($d.cause // $r.cause // null),
+                reason:  ($r.cause // null),
+                externalId: ($r.id // null),
+                cs1Label: "parentEntityType", cs1: ($pe.type // null),
+                cs2Label: "parentEntityName", cs2: ($pe.value // null),
+                cs3Label: "parentEntityId",   cs3: ($pe.id // null),
+                cs4Label: "alertStatus",      cs4: ($r.status // null),
+                cs5Label: "alertCause",       cs5: ($r.cause // null),
+                cs6Label: "notes",            cs6: ($r.notes // null),
+                cn1Label: "activeEntityCount", cn1: ($r.active_entity_count // null),
+                cn2Label: "clearedEntityCount", cn2: ($r.cleared_entity_count // null)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

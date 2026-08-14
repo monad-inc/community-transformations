@@ -1,0 +1,68 @@
+name: "AWS Redshift Audit Logs to CEF"
+description: "Maps AWS Redshift database audit connection-log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-redshift-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "redshift"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Redshift connection log -> CEF intermediate (T1).
+          # NO escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Emit final-form values: severity int 0-10; times epoch-MS; every
+          # cs*/cn* custom slot paired with its *Label. One jq pass; shallow
+          # null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.event // "" | ascii_downcase) as $ev
+
+          # Failure auth events are higher severity than routine connects.
+          | ( if ($ev | test("fail|denied|error")) then 7
+              elif ($ev | test("disconnect")) then 2
+              else 3 end ) as $sev
+
+          | ( if ($ev | test("fail|denied|error")) then "FAILURE" else "SUCCESS" end ) as $outcome
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "Amazon Redshift",
+              version: "",
+              signature_id: ($r.event // "connection"),
+              name: ( "Redshift " + ($r.event // "connection event") ),
+              severity: $sev,
+              extension: ( {
+                rt:       to_epoch_ms($r.recordtime),
+                suser:    $r.username,
+                src:      $r.remotehost,
+                spt:      ( if $r.remoteport then ($r.remoteport | tonumber? // null) else null end ),
+                act:      $r.event,
+                outcome:  $outcome,
+                dproc:    $r.application_name,
+                # Custom slots (dictionary has no native home) — each paired
+                # with its label as the CEF spec requires.
+                cs1Label: "dbName",       cs1: $r.dbname,
+                cs2Label: "authMethod",   cs2: $r.authmethod,
+                cs3Label: "tlsVersion",   cs3: $r.sslversion,
+                cs4Label: "tlsCipher",    cs4: $r.sslcipher,
+                cs5Label: "clusterId",    cs5: $r.clusterid,
+                cs6Label: "sessionId",    cs6: $r.sessionid,
+                cn1Label: "pid",          cn1: $r.pid,
+                cn2Label: "durationMicros", cn2: $r.duration
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

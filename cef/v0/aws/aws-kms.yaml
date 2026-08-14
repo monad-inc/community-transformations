@@ -1,0 +1,79 @@
+name: "AWS KMS Keys to CEF"
+description: "Maps AWS Key Management Service (KMS) key inventory records from the aws-kms connector into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-kms"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "kms"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS KMS key inventory -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (derived from KeyState)
+          #   - time fields (rt / deviceCustomDate1): epoch-MILLISECONDS
+          #   - custom slots cs*/cn*/flexString* ALWAYS paired with *Label
+          # One jq pass; shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else ( ( $ts
+                     | gsub("\\.[0-9]+"; "")
+                     | gsub("[+-][0-9]{2}:[0-9]{2}$"; "Z")
+                     | fromdateiso8601 ) * 1000 )
+            end;
+
+          def bit($b): if $b == true then 1 elif $b == false then 0 else null end;
+
+          . as $r
+          | ( $r.KeyMetadata // {} ) as $km
+          | ( $r.KeyRotationStatus // {} ) as $rot
+
+          | { _cef: {
+              vendor: "Amazon Web Services",
+              product: "AWS KMS",
+              version: "",
+              # Stable, low-cardinality event type — this connector reports
+              # key inventory, so the signature is constant per data source.
+              signature_id: "aws.kms.key.inventory",
+              name: ("AWS KMS key inventory: " + ($km.KeyId // "unknown")),
+              # KeyState drives operational severity: an enabled key is
+              # routine (2); disabled / pending-deletion keys warrant review.
+              severity: ( { "Enabled": 2,
+                            "Disabled": 5,
+                            "PendingImport": 5,
+                            "PendingReplicaDeletion": 6,
+                            "PendingDeletion": 6,
+                            "Unavailable": 7 }[$km.KeyState] // 3 ),
+              extension: ( {
+                rt:      to_epoch_ms($km.CreationDate),
+                act:     "Collect",
+                outcome: "SUCCESS",
+                cat:     "AWS KMS Key Inventory",
+                msg:     $km.Description,
+                deviceCustomDate1Label: "nextRotationDate",
+                deviceCustomDate1:      to_epoch_ms($rot.NextRotationDate),
+                cs1Label: "keyId",       cs1: $km.KeyId,
+                cs2Label: "keyArn",      cs2: $km.Arn,
+                cs3Label: "keyState",    cs3: $km.KeyState,
+                cs4Label: "keyUsage",    cs4: $km.KeyUsage,
+                cs5Label: "keySpec",     cs5: ($km.KeySpec // $km.CustomerMasterKeySpec),
+                cs6Label: "origin",      cs6: $km.Origin,
+                cn1Label: "rotationEnabled", cn1: bit($rot.KeyRotationEnabled),
+                cn2Label: "multiRegion",     cn2: bit($km.MultiRegion),
+                flexString1Label: "awsRegion",  flexString1: $r.Region,
+                flexString2Label: "keyManager", flexString2: $km.KeyManager
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

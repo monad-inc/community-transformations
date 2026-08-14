@@ -1,0 +1,64 @@
+name: "Glean Overview Insights to CEF"
+description: "Maps Glean Overview Insights usage/adoption snapshot records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "glean-overview-insights"
+tags:
+  - "v0"
+  - "cef"
+  - "glean"
+  - "overview-insights"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Glean Overview Insights -> CEF intermediate (T1). No escaping here
+          # (the shared serializer owns it). Emit final-form values: severity
+          # integer 0-10, rt epoch-MILLISECONDS, every cs*/cn* paired with a
+          # *Label. One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          # Pair a custom slot with its label only when the value is present, so
+          # a missing field never emits a dangling label or a "null" string.
+          def pair($slot; $label; $v): if $v == null or $v == "" then {} else {($slot): $v, ($slot+"Label"): $label} end;
+          # spair: same, but stringifies a non-null numeric before pairing.
+          def spair($slot; $label; $v): if $v == null then {} else {($slot): ($v|tostring), ($slot+"Label"): $label} end;
+
+          . as $r
+          | ($r.monthlyActiveUserTimeseries.countInfo[-1].organization
+             // $r.weeklyActiveUserTimeseries.countInfo[-1].organization) as $org
+          | ($r.departments // [] | join(",")) as $depts
+          | { _cef: {
+              vendor: "Glean",
+              product: "Glean Overview Insights",
+              version: "",
+              signature_id: "overview.insights.snapshot",
+              name: "Glean Overview Insights Snapshot",
+              # Informational analytics snapshot -> low severity bucket.
+              severity: 2,
+              extension: ( ( {
+                  rt:      to_epoch_ms($r.lastUpdatedTs),
+                  outcome: "SUCCESS",
+                  act:     "overview.insights.snapshot",
+                  dvchost: $org
+                }
+                + pair("cn1"; "monthlyActiveUsers";        $r.monthlyActiveUsers)
+                + pair("cn2"; "weeklyActiveUsers";         $r.weeklyActiveUsers)
+                + pair("cn3"; "totalSignups";              $r.totalSignups)
+                + pair("cs1";  "organization";              $org)
+                + spair("cs2"; "employeeCount";             $r.employeeCount)
+                + spair("cs3"; "searchSessionSatisfaction"; $r.searchSessionSatisfaction)
+                + pair("cs4";  "departments";               $depts)
+                + spair("cs5"; "numSearches";               $r.searchSummary.numSearches)
+                + spair("cs6"; "numChats";                  $r.chatSummary.numChats)
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

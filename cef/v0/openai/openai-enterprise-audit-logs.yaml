@@ -1,0 +1,73 @@
+name: "OpenAI Enterprise Audit Logs to CEF"
+description: "Maps OpenAI Enterprise audit log events to the CEF intermediate contract ({_cef}); the shared CEF serializer renders the final CEF:0 string. Carries actor, source IP, project, API key, and failure details."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "openai-enterprise-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "openai"
+  - "audit-logs"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # -----------------------------------------------------------------
+          # OpenAI Enterprise Audit Logs -> CEF T1 mapping (emits {_cef})
+          # Semantic mapping only; NO escaping (the shared serializer owns it).
+          # times are emitted as epoch-ms; custom slots paired with labels.
+          # -----------------------------------------------------------------
+
+          . as $r
+          | ($r.type // "unknown") as $etype
+          | ($etype | split(".")) as $seg
+          | ($seg[0]) as $head
+          | ($seg[-1]) as $tail
+          | ($r.actor // {}) as $act
+          | ($act.session // {}) as $sess
+          | ($act.api_key // {}) as $ak
+          | ($sess.user // $ak.user // {}) as $u
+          | ($ak.service_account // {}) as $sa
+          | ($sess.ip_address // null) as $ip
+          | ($u.email // null) as $email
+          | ($u.id // $sa.id // $ak.id // null) as $uid
+          | ($r.project // {}) as $proj
+          | ($r[$etype] // {}) as $payload
+          | ($tail == "failed") as $failed
+
+          # severity 0-10: failures highest, then destructive ops, auth, else routine
+          | (if $failed then 6
+             elif ($tail | test("^(deleted|removed|revoked|archived|disabled|deactivated|detached)$")) then 5
+             elif ($head == "login" or $head == "logout") then 3
+             else 4 end) as $sev
+
+          | { "_cef": {
+                "vendor": "OpenAI",
+                "product": "OpenAI Enterprise Audit Logs",
+                "version": "",
+                "signature_id": $etype,
+                "name": $etype,
+                "severity": $sev,
+                "extension": ({
+                  "rt": (if ($r.effective_at | type) == "number" then ($r.effective_at * 1000) else null end),
+                  "suser": ($email // $sa.id // $ak.id // $uid),
+                  "suid": $uid,
+                  "src": $ip,
+                  "act": $etype,
+                  "outcome": (if $failed then "FAILURE" else "SUCCESS" end),
+                  "reason": ($payload.error_message // null),
+                  "externalId": $r.id,
+                  "cs1": ($proj.id // null),
+                  "cs1Label": (if ($proj.id // "") != "" then "projectId" else null end),
+                  "cs2": ($proj.name // null),
+                  "cs2Label": (if ($proj.name // "") != "" then "projectName" else null end),
+                  "cs3": ($ak.id // null),
+                  "cs3Label": (if ($ak.id // "") != "" then "apiKeyId" else null end),
+                  "cs4": ($payload.error_code // null),
+                  "cs4Label": (if ($payload.error_code // "") != "" then "errorCode" else null end)
+                } | with_entries(select((.value != null) and (.value != ""))))
+              } }

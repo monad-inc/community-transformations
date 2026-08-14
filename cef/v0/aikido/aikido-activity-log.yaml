@@ -1,0 +1,62 @@
+name: "Aikido Activity Log to CEF"
+description: "Maps Aikido Security activity log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-activity-log"
+tags:
+  - "v0"
+  - "cef"
+  - "aikido"
+  - "activity-log"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Aikido Security activity log -> CEF intermediate (T1).
+          # No escaping here (the shared CEF Serializer T2 owns escaping).
+          # Emit final-form values: severity int 0-10, times epoch-MS,
+          # custom cs*/cn* slots each paired with their *Label. One jq pass;
+          # shallow null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | ($r.action // "") as $action
+          | ($r.metadata.location // {}) as $loc
+          | { _cef: {
+              vendor: "Aikido Security",
+              product: "Aikido Activity Log",
+              version: "",
+              signature_id: $action,
+              name: ($r.comment // $action),
+              severity: ( { "re_open": 4, "adjust_severity": 4,
+                            "closed": 3, "snoozed": 2, "unsnoozed": 3,
+                            "ignored": 2, "auto_ignored": 2,
+                            "autofix_pr_created": 3, "drata_push": 2,
+                            "sprinto_push": 2, "thoropass_push": 2 }[$action] // 2 ),
+              extension: ( {
+                rt:    to_epoch_ms($r.timestamp),
+                suser: $r.user_name,
+                suid:  ($r.user_id | tostring),
+                act:   $action,
+                msg:   $r.comment,
+                cn3Label: "activityId",        cn3: $r.id,
+                cs1Label: "source",           cs1: $r.source,
+                cs2Label: "codeRepoName",      cs2: $loc.code_repo_name,
+                cs3Label: "containerRepoName", cs3: $loc.container_repo_name,
+                cs4Label: "cloudName",         cs4: $loc.cloud_name,
+                cs5Label: "domainName",        cs5: $loc.domain_name,
+                cn1Label: "issueId",           cn1: $r.issue_id,
+                cn2Label: "groupedIssueId",    cn2: $r.grouped_issue_id
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,76 @@
+name: "Cloudflare Audit Logs to CEF"
+description: "Maps Cloudflare account Audit Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Audit Logs -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values (severity 0-10, times
+          # epoch-MILLISECONDS, cs*/cn* slots paired with their *Label).
+          #
+          # Input: ONE Cloudflare (classic) audit-log record per invocation:
+          #   { id, action{type,result}, actor{id,email,ip,type}, interface,
+          #     metadata{...}, newValue, oldValue, owner{id},
+          #     resource{id,type}, when }
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def sval($v): if $v == null then null else ($v | tostring) end;
+
+          # Emit a csN slot together with its label ONLY when it has a value,
+          # so no orphan cs*Label is left behind (shallow, single-level).
+          def cs($n; $label; $v):
+            if ($v == null or $v == "") then {}
+            else { ("cs" + ($n|tostring) + "Label"): $label, ("cs" + ($n|tostring)): $v } end;
+
+          . as $r
+          | ($r.action // {}) as $act
+          | ($r.actor // {}) as $ac
+          | ($r.resource // {}) as $res
+          | ($r.metadata // {}) as $md
+          | ($act.type // "") as $atype
+          | ( ($act.result == true) or (($act.result | type) == "string" and ($act.result | ascii_downcase) == "true") ) as $ok
+
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Cloudflare Audit Logs",
+              version: "",
+              signature_id: (if $atype == "" then "audit" else $atype end),
+              name: ("Cloudflare " + $atype + (if ($res.type // "") != "" then (" on " + $res.type) else "" end)),
+              # success = informational (3); failure = elevated (6).
+              severity: (if $ok then 3 else 6 end),
+              extension: ( (
+                {
+                  rt:      to_epoch_ms($r.when),
+                  suser:   $ac.email,
+                  suid:    $ac.id,
+                  src:     $ac.ip,
+                  act:     $atype,
+                  outcome: (if $ok then "SUCCESS" else "FAILURE" end)
+                }
+                + cs(1; "resourceType"; $res.type)
+                + cs(2; "resourceId";   $res.id)
+                + cs(3; "interface";    $r.interface)
+                + cs(4; "settingName";  ($md.name // $md.zone_name))
+                + cs(5; "newValue";     (sval($r.newValue)))
+                + cs(6; "oldValue";     (sval($r.oldValue)))
+              ) | with_entries(select(.value != null and .value != "")) )
+          } }

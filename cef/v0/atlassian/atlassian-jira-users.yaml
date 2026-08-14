@@ -1,0 +1,62 @@
+name: "Atlassian Jira Users to CEF"
+description: "Maps Atlassian Jira Cloud user directory records (from the atlassian-jira-users input) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-jira-users"
+tags:
+  - "v0"
+  - "cef"
+  - "atlassian"
+  - "jira"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Atlassian Jira Users -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (active user = 3, inactive = 5)
+          #   - rt: epoch-MILLISECONDS (collection time; a Jira user record
+          #         carries no timestamp of its own)
+          #   - custom slots cs*/cn* ALWAYS paired with their *Label
+          # One jq pass, per-record only; shallow with_entries null-drop.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.emailAddress // "") as $email
+          | ($r.active == true) as $is_active
+          | (($r.groups.items // []) | map(.name) | map(select(. != null))) as $groupnames
+          | (($r.applicationRoles.items // []) | map(.name // .key) | map(select(. != null))) as $roles
+          | { _cef: {
+              vendor: "Atlassian",
+              product: "Jira",
+              version: "",
+              signature_id: ("jira.user." + (if $is_active then "active" else "inactive" end)),
+              name: ("Jira user directory entry: " + ($r.displayName // $email // $r.accountId)),
+              severity: (if $is_active then 3 else 5 end),
+              extension: ( {
+                rt:        ((now | floor) * 1000),
+                duser:     ($r.displayName // $email),
+                duid:      $r.accountId,
+                dvchost:   "jira",
+                outcome:   (if $is_active then "Active" else "Inactive" end),
+                cs1Label:  "accountType",
+                cs1:       $r.accountType,
+                cs2Label:  "emailAddress",
+                cs2:       (if $email != "" then $email else null end),
+                cs3Label:  "groups",
+                cs3:       (if ($groupnames | length) > 0 then ($groupnames | join(",")) else null end),
+                cs4Label:  "applicationRoles",
+                cs4:       (if ($roles | length) > 0 then ($roles | join(",")) else null end),
+                cs5Label:  "timeZone",
+                cs5:       $r.timeZone,
+                cs6Label:  "locale",
+                cs6:       $r.locale,
+                cn1Label:  "active",
+                cn1:       (if $is_active then 1 else 0 end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

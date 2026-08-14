@@ -1,0 +1,51 @@
+name: "AWS IAM Account Aliases to CEF"
+description: "Maps AWS IAM account-alias inventory records (an AWS account and its IAM account alias) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-iam-aliases"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "iam-aliases"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS IAM Account Aliases -> CEF intermediate (T1).
+          # Input: one aws-iam-aliases record per invocation, shape:
+          #   { "AccountID": "123456789012", "Alias": "acme-production" }
+          #
+          # Inventory snapshot (no event time, no severity in source):
+          #   severity = 1 (informational inventory record)
+          #   rt       = collection time (now, epoch-ms); source has none
+          #   AccountID -> cs2 (awsAccountId)
+          #   Alias     -> cs1 (accountAlias)
+          # Do NOT escape here — the shared CEF Serializer (T2) owns escaping.
+          # ---------------------------------------------------------------
+
+          . as $r
+          | ($r.AccountID // null) as $acct
+          | ($r.Alias // null) as $alias
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "AWS IAM",
+              version: "",
+              signature_id: "iam.account.alias",
+              name: "AWS account alias inventory",
+              severity: 1,
+              extension: ( {
+                rt:         (now * 1000 | floor),
+                cs1Label:   "accountAlias",
+                cs1:        $alias,
+                cs2Label:   "awsAccountId",
+                cs2:        $acct,
+                outcome:    "SUCCESS"
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,55 @@
+name: "Cloudflare Account Members to CEF"
+description: "Maps Cloudflare account member (user) inventory records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-users"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "users"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare account members -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # severity: integer 0-10 ; times: epoch-MILLISECONDS ; custom
+          # cs*/cn* slots always paired with their *Label. One jq pass;
+          # shallow with_entries null-drop on the extension object.
+          # ---------------------------------------------------------------
+          . as $r
+          | ($r.user // {}) as $u
+          | ($r.account // {}) as $acct
+          | ($r.email // $u.email) as $mail
+          | (([$u.first_name, $u.last_name] | map(select(. != null and . != "")) | join(" "))) as $full
+          | (($r.roles // []) | map(.name) | map(select(. != null)) | join(",")) as $roles
+          | { _cef: {
+              vendor:  "Cloudflare",
+              product: "Cloudflare Account Members",
+              version: "",
+              # Stable, low-cardinality event type keyed on membership status.
+              signature_id: ("cloudflare.account.member." + ($r.status // "unknown")),
+              name: ("Cloudflare account membership " + ($r.status // "unknown") + " for " + ($mail // ($r.id // "unknown"))),
+              # accepted -> Low(2); pending -> Medium(5); else informational.
+              severity: ( { "accepted": 2, "pending": 5 }[$r.status] // 1 ),
+              extension: ( {
+                rt:        (now * 1000 | floor),
+                duser:     $mail,
+                duid:      ($u.id // $r.id),
+                dvchost:   ($acct.name),
+                outcome:   (if $r.status == "accepted" then "SUCCESS"
+                            elif $r.status == "pending" then "PENDING"
+                            else "UNKNOWN" end),
+                cs1Label:  "membershipId",       cs1: $r.id,
+                cs2Label:  "roles",              cs2: (if $roles == "" then null else $roles end),
+                cs3Label:  "accountId",          cs3: $acct.id,
+                cs4Label:  "fullName",           cs4: (if $full == "" then null else $full end),
+                cs5Label:  "mfaEnabled",         cs5: ($u.two_factor_authentication_enabled | tostring)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

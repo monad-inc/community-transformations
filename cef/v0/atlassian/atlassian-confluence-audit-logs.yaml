@@ -1,0 +1,63 @@
+name: "Atlassian Confluence Audit Logs to CEF"
+description: "Maps Atlassian Confluence audit log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "atlassian-confluence-audit-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "atlassian"
+  - "audit"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Atlassian Confluence Audit Logs -> CEF intermediate (T1).
+          # No escaping here — the shared CEF Serializer (T2) owns escaping.
+          # Emits final-form values: severity int 0-10, times epoch-ms,
+          # custom cs* slots paired with their *Label. One jq pass; shallow
+          # null-drop on the extension object (no recursive walk).
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def lc($s): ($s // "") | ascii_downcase;
+
+          . as $r
+          | ($r.author // {}) as $au
+          | (lc($r.category)) as $cat
+          # Admin/permission/user-management categories are more security-
+          # relevant; bump their severity bucket.
+          | ( if   ($cat | test("permission|security|user|group|admin")) then 6
+              elif ($r.sysAdmin == true or $r.superAdmin == true) then 5
+              else 3 end ) as $sev
+          | { _cef: {
+              vendor: "Atlassian",
+              product: "Confluence",
+              version: "",
+              signature_id: ($r.category // "Audit"),
+              name: ($r.summary // "Confluence audit event"),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.creationDate),
+                suser:   ($au.displayName // $au.publicName),
+                suid:    $au.accountId,
+                src:     $r.remoteAddress,
+                act:     $r.summary,
+                cat:     $r.category,
+                msg:     ($r.description // $r.summary),
+                outcome: "SUCCESS",
+                cs1Label: "affectedObjectName", cs1: $r.affectedObject.name,
+                cs2Label: "affectedObjectType", cs2: $r.affectedObject.objectType,
+                cs3Label: "changedValues",      cs3: ($r.changedValues | if . == null then null else tojson end),
+                cs4Label: "sysAdmin",           cs4: ($r.sysAdmin | if . == null then null else tostring end)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,64 @@
+name: "Abnormal Security Threats to CEF"
+description: "Maps Abnormal Security threat (malicious email) records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "abnormal-threats"
+tags:
+  - "v0"
+  - "cef"
+  - "abnormal"
+  - "threats"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Abnormal Security threat -> CEF intermediate (T1). No escaping —
+          # the shared CEF Serializer (T2) owns all escaping. Final-form
+          # values only: severity int 0-10, times epoch-MS, custom slots
+          # cs*/cn* paired with *Label. One jq pass; shallow null-drop.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          | { _cef: {
+              vendor: "Abnormal Security",
+              product: "Abnormal Inbound Email Security",
+              version: "",
+              signature_id: ($r.attackType // "Threat"),        # low-cardinality attack class
+              name: (($r.attackType // "Email Threat") + ": " + ($r.subject // "")),
+              severity: 8,                                       # detected threat -> High
+              extension: ( {
+                rt:       to_epoch_ms($r.receivedTime),
+                start:    to_epoch_ms($r.sentTime),
+                end:      to_epoch_ms($r.remediationTimestamp),
+                suser:    $r.recipientAddress,                   # attacked mailbox
+                duser:    $r.recipientAddress,
+                src:      $r.senderIpAddress,
+                msg:      $r.subject,
+                act:      $r.remediationStatus,
+                outcome:  (if (($r.remediationStatus // "") | ascii_downcase | test("remediat")) then "REMEDIATED" else "DETECTED" end),
+                suid:     ($r.fromAddress),
+                sourceServiceName: "Abnormal Threats",
+                fileName: (($r.attachmentNames // []) | join(", ")),
+                cnt:      $r.attachmentCount,
+                # --- custom slots (always paired with *Label) ---
+                cs1Label: "attackType",       cs1: $r.attackType,
+                cs2Label: "attackStrategy",    cs2: $r.attackStrategy,
+                cs3Label: "attackVector",      cs3: $r.attackVector,
+                cs4Label: "impersonatedParty", cs4: $r.impersonatedParty,
+                cs5Label: "attackedParty",     cs5: $r.attackedParty,
+                cs6Label: "threatId",          cs6: $r.threatId,
+                externalId: $r.abxMessageIdStr,
+                cn1Label: "urlCount",          cn1: $r.urlCount,
+                deviceCustomDate1Label: "sentTime", deviceCustomDate1: to_epoch_ms($r.sentTime)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

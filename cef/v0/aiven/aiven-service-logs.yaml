@@ -1,0 +1,77 @@
+name: "Aiven Service Logs to CEF"
+description: "Maps Aiven managed-service journald log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aiven-service-logs"
+tags:
+  - "v0"
+  - "cef"
+  - "aiven"
+  - "system"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Aiven Service Logs -> CEF intermediate (T1).
+          # Input: ONE Aiven service-log record (a systemd journal entry from
+          # any Aiven managed service). No escaping here — the shared CEF
+          # Serializer (T2) owns all escaping. Emit FINAL-FORM values:
+          #   severity 0-10, times epoch-MILLISECONDS, cs* slots + *Label.
+          # One jq pass; shallow null-drop on the extension object only.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
+
+          . as $r
+          | ( (.PRIORITY // "") | if type == "number" then tostring else . end ) as $prio
+          | ( { "0": "emergency", "1": "alert", "2": "critical", "3": "error",
+                "4": "warning", "5": "notice", "6": "informational", "7": "debug" }[$prio] ) as $sevname
+          # journald/syslog PRIORITY (0 emerg .. 7 debug) -> CEF severity 0-10.
+          | ( { "0": 10, "1": 10, "2": 9, "3": 8, "4": 6, "5": 4, "6": 3, "7": 1 }[$prio] // 0 ) as $sev
+          | ( $r.SYSTEMD_UNIT // "" ) as $unit
+          | ( if $unit != "" then ($unit | sub("\\.service$"; "") | sub("-[0-9].*$"; "")) else null end ) as $svc
+          | ( ($r.MESSAGE // "") | capture("user=(?<user>[^,]*),db=(?<db>[^,]*),app=(?<app>[^,]*),client=(?<client>[^ ]*)") ? // {} ) as $pg
+          | ( if ($pg.user // "") != "" then $pg.user else null end ) as $puser
+          | ( if is_ip($pg.client // "") then $pg.client else null end ) as $pclient
+          | ( ($r.MESSAGE // "") | test("authentication|password"; "i") ) as $is_auth
+          | ( ($r.MESSAGE // "") | test("fatal|fail|denied|error"; "i") or ($prio == "0" or $prio == "1" or $prio == "2" or $prio == "3") ) as $is_fail
+
+          | { _cef: {
+              vendor: "Aiven",
+              product: "Aiven Service Logs",
+              version: "",
+              signature_id: ("aiven." + ($svc // "service-log")),
+              name: ("Aiven " + ($svc // "service") + " log message"),
+              severity: $sev,
+              extension: ( {
+                rt:      to_epoch_ms($r.timestamp),
+                dvchost: $r.HOSTNAME,
+                suser:   $puser,
+                src:     $pclient,
+                msg:     $r.MESSAGE,
+                cat:     $svc,
+                outcome: ( if $is_auth then (if $is_fail then "FAILURE" else "SUCCESS" end) else null end ),
+                cs1Label: "syslogSeverity", cs1: $sevname,
+                cs2Label: "sessionId",      cs2: $r.SESSION_ID,
+                cs3Label: "systemdUnit",    cs3: ( if $unit != "" then $unit else null end ),
+                cs4Label: "database",       cs4: ( if ($pg.db // "") != "" then $pg.db else null end )
+              }
+              # Drop a cs* value with no data together with its orphaned label.
+              | ( if .cs1 == null then del(.cs1, .cs1Label) else . end )
+              | ( if .cs2 == null then del(.cs2, .cs2Label) else . end )
+              | ( if .cs3 == null then del(.cs3, .cs3Label) else . end )
+              | ( if .cs4 == null then del(.cs4, .cs4Label) else . end )
+              | with_entries(select(.value != null and .value != "")) )
+          } }

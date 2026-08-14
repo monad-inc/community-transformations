@@ -1,0 +1,65 @@
+name: "AWS Organizations Account Inventory to CEF"
+description: "Maps AWS Organizations account inventory records (the ListAccounts / DescribeAccount Account object) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aws-organizations"
+tags:
+  - "v0"
+  - "cef"
+  - "aws"
+  - "organizations"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # AWS Organizations Account inventory -> CEF intermediate (T1).
+          # Do NOT escape anything here - the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values:
+          #   - severity: integer 0-10 (derived from account Status)
+          #   - rt: epoch-MILLISECONDS
+          #   - custom slots cs* ALWAYS paired with their *Label
+          #
+          # Input: ONE AWS Organizations Account record per invocation
+          #   .Id/.Arn/.Email/.Name/.Status/.JoinedMethod/.JoinedTimestamp
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+
+          . as $r
+          # arn:aws:organizations::<mgmt-acct-id>:account/<org-id>/<acct-id>
+          | ( ($r.Arn // "") | split("/") ) as $arn_parts
+          | ( if ($arn_parts | length) > 1 then $arn_parts[1] else null end ) as $org_id
+          | ( ($r.Arn // "") | split(":") ) as $arn_colon
+          | ( if ($arn_colon | length) > 4 and ($arn_colon[4] != "") then $arn_colon[4] else null end ) as $mgmt_id
+
+          | { _cef: {
+              vendor: "AWS",
+              product: "AWS Organizations",
+              version: "",
+              signature_id: "organizations.account.inventory",
+              name: ("AWS Organizations account inventory: " + ($r.Name // $r.Id // "unknown")),
+              # Account lifecycle status -> 0-10 severity bucket. A healthy
+              # ACTIVE account is low; SUSPENDED / PENDING_CLOSURE warrant
+              # analyst attention.
+              severity: ( { "ACTIVE": 2, "PENDING_CLOSURE": 5, "SUSPENDED": 6 }[$r.Status] // 2 ),
+              extension: ( {
+                rt:        to_epoch_ms($r.JoinedTimestamp),
+                externalId: $r.Id,
+                suser:     $r.Email,
+                act:       "account-inventory",
+                outcome:   $r.Status,
+                cs1Label:  "accountArn",           cs1: $r.Arn,
+                cs2Label:  "accountName",           cs2: $r.Name,
+                cs3Label:  "organizationId",        cs3: $org_id,
+                cs4Label:  "joinedMethod",          cs4: $r.JoinedMethod,
+                cs5Label:  "managementAccountId",   cs5: $mgmt_id
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

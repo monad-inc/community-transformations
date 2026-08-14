@@ -1,0 +1,58 @@
+name: "Aikido Issues to CEF"
+description: "Maps Aikido Security issue export records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "aikido-issues"
+tags:
+  - "v0"
+  - "cef"
+  - "aikido"
+  - "vulnerability"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Aikido Issues -> CEF intermediate (T1). No escaping here — the
+          # shared CEF Serializer (T2) owns all escaping. Final-form values:
+          # severity int 0-10, times epoch-ms, cs*/cn* slots paired w/ labels.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else null end;
+          . as $r
+          | ($r.severity // "" | ascii_downcase) as $sev
+          | ($r.code_repo_name // $r.container_repo_name // $r.cloud_name // $r.domain_name // $r.virtual_machine_name) as $asset
+          | { _cef: {
+              vendor: "Aikido Security",
+              product: "Aikido",
+              version: "",
+              signature_id: (($r.rule_id // ($r.type + "-issue")) | tostring),
+              name: ($r.rule // "Aikido security issue"),
+              severity: ( { "critical": 10, "high": 8, "medium": 5, "low": 3 }[$sev] // 0 ),
+              extension: ( {
+                rt:        to_epoch_ms($r.first_detected_at),
+                end:       to_epoch_ms($r.closed_at),
+                outcome:   (if $r.status == "closed" then "Closed" elif $r.status != null then ($r.status | ascii_upcase[0:1] + ($r.status[1:])) else null end),
+                cat:       ($r.type),
+                msg:       ($r.rule),
+                filePath:  ($r.affected_file),
+                fname:     (if $r.affected_file != null then ($r.affected_file | split("/") | last) else null end),
+                cs1Label:  "cveId",            cs1: ($r.cve_id),
+                cs2Label:  "affectedPackage",  cs2: ($r.affected_package),
+                cs3Label:  "installedVersion", cs3: ($r.installed_version),
+                cs4Label:  "asset",            cs4: ($asset),
+                cs5Label:  "attackSurface",    cs5: ($r.attack_surface),
+                cs6Label:  "exploitability",   cs6: ($r.exploitability),
+                cn1Label:  "severityScore",    cn1: ($r.severity_score),
+                cn2Label:  "cvssScore",        cn2: ($r.original_cvss_severity_score),
+                cn3Label:  "slaDays",          cn3: ($r.sla_days),
+                flexString1Label: "issueId",   flexString1: (($r.id | tostring)),
+                flexString2Label: "status",    flexString2: ($r.status)
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

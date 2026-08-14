@@ -1,0 +1,73 @@
+name: "Cloudflare Page Shield Connections to CEF"
+description: "Maps Cloudflare Page Shield connection records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "cloudflare-page-shield-connections"
+tags:
+  - "v0"
+  - "cef"
+  - "cloudflare"
+  - "page-shield-connections"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Cloudflare Page Shield connection -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2)
+          # owns all escaping. Emit FINAL-FORM values: severity int 0-10,
+          # times epoch-MILLISECONDS, custom cs* slots paired with *Label.
+          # One jq pass; shallow null-drop on the extension object.
+          # ---------------------------------------------------------------
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
+            end;
+          def truthy($v): ($v == true) or (($v|type) == "string" and ($v|ascii_downcase) == "true");
+          def cats($a): if ($a // []) | length > 0 then ($a | join(", ")) else null end;
+          def boolstr($v): if $v == null then null else ($v | tostring) end;
+
+          . as $r
+          | (truthy($r.domain_reported_malicious) or truthy($r.url_reported_malicious)) as $mal
+          | { _cef: {
+              vendor: "Cloudflare",
+              product: "Page Shield",
+              version: "",
+              signature_id: (if $mal then "page_shield.connection.malicious" else "page_shield.connection.detected" end),
+              name: (if $mal
+                     then ("Malicious Page Shield connection to " + ($r.host // "unknown host"))
+                     else ("Page Shield connection to " + ($r.host // "unknown host")) end),
+              severity: (if $mal then 8 else 3 end),
+              extension: ( {
+                rt:      to_epoch_ms($r.last_seen_at // $r.added_at),
+                start:   to_epoch_ms($r.first_seen_at),
+                end:     to_epoch_ms($r.last_seen_at),
+                request: $r.url,
+                dhost:   $r.host,
+                act:     "detect",
+                outcome: (if $mal then "MALICIOUS" else "OBSERVED" end),
+                reason:  ( [ cats($r.malicious_url_categories), cats($r.malicious_domain_categories) ]
+                           | map(select(. != null)) | if length > 0 then join("; ") else null end ),
+                msg:     (if $mal
+                          then ("Cloudflare Page Shield flagged an outbound connection to " + ($r.url // $r.host // "an external resource") + " as malicious.")
+                          else ("Cloudflare Page Shield observed an outbound connection to " + ($r.url // $r.host // "an external resource") + ".")
+                          end),
+                cs1: $r.id,
+                cs1Label: (if $r.id != null then "connectionId" else null end),
+                cs2: $r.first_page_url,
+                cs2Label: (if $r.first_page_url != null then "firstPageUrl" else null end),
+                cs3: boolstr($r.url_reported_malicious),
+                cs3Label: (if $r.url_reported_malicious != null then "urlReportedMalicious" else null end),
+                cs4: boolstr($r.domain_reported_malicious),
+                cs4Label: (if $r.domain_reported_malicious != null then "domainReportedMalicious" else null end),
+                cs5: boolstr($r.url_contains_cdn_cgi_path),
+                cs5Label: (if $r.url_contains_cdn_cgi_path != null then "urlContainsCdnCgiPath" else null end),
+                cn1: (($r.page_urls // []) | length),
+                cn1Label: "pageUrlCount"
+              } | with_entries(select(.value != null and .value != "")) )
+          } }

@@ -1,0 +1,65 @@
+name: "Semgrep Project Metadata to CEF"
+description: "Maps a Semgrep Project Metadata (repository/project inventory) record into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+# author is ALWAYS "Monad" — never a person. You are a contributor.
+author: "Monad"
+contributors:
+  - "https://github.com/behobu"
+inputs:
+  - "semgrep-project-details"
+tags:
+  - "v0"
+  - "cef"
+  - "semgrep"
+  - "project"
+config:
+  operations:
+    - operation: "jq"
+      arguments:
+        key: ""
+        query: |
+          # ---------------------------------------------------------------
+          # Semgrep Project Metadata -> CEF intermediate (T1).
+          # Do NOT escape anything here — the shared CEF Serializer (T2) owns
+          # all escaping. Emit FINAL-FORM values (severity 0-10, times as
+          # epoch-MILLISECONDS, custom slots paired with their *Label).
+          # One jq pass, per-record only.
+          # ---------------------------------------------------------------
+
+          # Semgrep timestamps ("2020-11-18 23:28:12.391807+00:00") aren't
+          # strict ISO-8601; normalize before fromdateiso8601, then *1000.
+          def to_epoch_ms($ts):
+            if $ts == null then null
+            elif ($ts | type) == "number"
+              then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
+            else ( ( $ts
+                     | gsub("\\.[0-9]+"; "")
+                     | sub(" "; "T")
+                     | sub("[+-][0-9][0-9]:?[0-9][0-9]$"; "Z")
+                     | (if test("Z$") then . else . + "Z" end)
+                     | fromdateiso8601 ) * 1000 )
+            end;
+
+          def present($v): $v != null and $v != "";
+
+          . as $r
+          | { "_cef": {
+              "vendor":       "Semgrep",
+              "product":      "Semgrep Projects",
+              "version":      "",
+              "signature_id": "semgrep.project.metadata",
+              "name":         "Semgrep project metadata",
+              "severity":     2,                        # informational inventory
+              "extension": (
+                ( { "act": "project-metadata-collected" }
+                  + (if present($r.latest_scan_at) then { "rt": to_epoch_ms($r.latest_scan_at) } else {} end)
+                  + (if present($r.created_at)     then { "start": to_epoch_ms($r.created_at) } else {} end)
+                  + (if present($r.url)            then { "request": $r.url } else {} end)
+                  + (if $r.id != null              then { "cn1Label": "projectId", "cn1": $r.id } else {} end)
+                  + (if present($r.name)           then { "cs1Label": "projectName", "cs1": $r.name } else {} end)
+                  + (if present($r.primary_branch) then { "cs2Label": "primaryBranch", "cs2": $r.primary_branch } else {} end)
+                  + (if present($r.default_branch) then { "cs3Label": "defaultBranch", "cs3": $r.default_branch } else {} end)
+                  + (if ($r.tags | type) == "array" and ($r.tags | length) > 0
+                       then { "cs4Label": "tags", "cs4": ($r.tags | join(",")) } else {} end)
+                )
+              )
+          } }
