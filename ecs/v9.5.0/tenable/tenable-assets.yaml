@@ -5,6 +5,7 @@ contributors:
   - "https://github.com/behobu"
 inputs:
   - "tenable-assets"
+  - "tenable-assets-cron"
 tags:
   - "v9.5.0"
   - "ecs"

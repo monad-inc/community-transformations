@@ -5,6 +5,7 @@
     - "https://github.com/behobu"
   inputs:
     - "crowdstrike-vulnerabilities"
+    - "crowdstrike-vulnerabilities-cron"
   tags:
     - "v1.2.0"
     - "ocsf"
