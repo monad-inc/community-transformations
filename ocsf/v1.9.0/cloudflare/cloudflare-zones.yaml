@@ -23,11 +23,35 @@ config:
           # Cloudflare API -> activity_id 2 (Collect).
           # ---------------------------------------------------------------
 
-          def to_epoch($ts):
-            if $ts == null then null
-            elif ($ts | type) == "number" then $ts
-            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
-            end;
+
+          def to_epoch_ms($ts):
+            def _num_ms($n):
+              if   $n >= 1e17 then ($n / 1000000 | floor)
+              elif $n >= 1e14 then ($n / 1000 | floor)
+              elif $n >= 1e11 then ($n | floor)
+              else ($n * 1000 | floor) end;
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then _num_ms($ts)
+            elif ($ts | type) == "object" then
+              (if ($ts.seconds // null) == null then null
+               else ($ts.seconds * 1000 + ((($ts.nanos // 0) / 1000000) | floor)) end)
+            elif ($ts | type) == "string" then
+              if ($ts | test("^-?[0-9]+(\\.[0-9]+)?$")) then _num_ms($ts | tonumber)
+              else
+                ([$ts | ascii_upcase | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T ](?<t>[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?:[.,](?<f>[0-9]+))?)? ?(?<z>Z|UTC|[+-][0-9]{2}(?::?[0-9]{2})?)?$")] | first) as $m
+                | if $m == null then null
+                  else
+                    (($m.t // "00:00:00") | if length == 5 then . + ":00" else . end) as $t
+                    | (($m.z // "Z") | if . == "Z" or . == "UTC" then 0
+                        else (.[1:] | gsub(":"; "")) as $o
+                          | ((if (.[0:1]) == "-" then -1 else 1 end)
+                             * (($o[0:2] | tonumber) * 3600 + ((if ($o | length) >= 4 then $o[2:4] else "00" end) | tonumber) * 60))
+                        end) as $off
+                    | ((($m.d + "T" + $t + "Z") | fromdateiso8601) - $off) * 1000
+                      + (((($m.f // "") + "000")[0:3]) | tonumber)
+                  end
+              end
+            else null end;
 
           . as $r
           | ($r.account // {}) as $acct
@@ -40,9 +64,9 @@ config:
               "activity_id":  2,
               "severity_id":  1,
 
-              "time":       to_epoch($r.modified_on // $r.created_on),
-              "start_time": to_epoch($r.created_on),
-              "end_time":   to_epoch($r.activated_on),
+              "time":       to_epoch_ms($r.modified_on // $r.created_on),
+              "start_time": to_epoch_ms($r.created_on),
+              "end_time":   to_epoch_ms($r.activated_on),
 
               "metadata": {
                 "version": "1.9.0",
@@ -96,8 +120,8 @@ config:
                       (if $r.paused    then "paused" else empty end),
                       (if $plan.name   then ("plan:" + $plan.name) else empty end) ]
                   ),
-                  "created_time": to_epoch($r.created_on),
-                  "modified_time": to_epoch($r.modified_on)
+                  "created_time": to_epoch_ms($r.created_on),
+                  "modified_time": to_epoch_ms($r.modified_on)
                 } | with_entries(select(.value != null))
               ],
 

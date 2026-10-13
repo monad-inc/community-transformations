@@ -16,6 +16,35 @@ config:
       arguments:
         key: ""
         query: |
+          def to_epoch_ms($ts):
+            def _num_ms($n):
+              if   $n >= 1e17 then ($n / 1000000 | floor)
+              elif $n >= 1e14 then ($n / 1000 | floor)
+              elif $n >= 1e11 then ($n | floor)
+              else ($n * 1000 | floor) end;
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then _num_ms($ts)
+            elif ($ts | type) == "object" then
+              (if ($ts.seconds // null) == null then null
+               else ($ts.seconds * 1000 + ((($ts.nanos // 0) / 1000000) | floor)) end)
+            elif ($ts | type) == "string" then
+              if ($ts | test("^-?[0-9]+(\\.[0-9]+)?$")) then _num_ms($ts | tonumber)
+              else
+                ([$ts | ascii_upcase | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T ](?<t>[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?:[.,](?<f>[0-9]+))?)? ?(?<z>Z|UTC|[+-][0-9]{2}(?::?[0-9]{2})?)?$")] | first) as $m
+                | if $m == null then null
+                  else
+                    (($m.t // "00:00:00") | if length == 5 then . + ":00" else . end) as $t
+                    | (($m.z // "Z") | if . == "Z" or . == "UTC" then 0
+                        else (.[1:] | gsub(":"; "")) as $o
+                          | ((if (.[0:1]) == "-" then -1 else 1 end)
+                             * (($o[0:2] | tonumber) * 3600 + ((if ($o | length) >= 4 then $o[2:4] else "00" end) | tonumber) * 60))
+                        end) as $off
+                    | ((($m.d + "T" + $t + "Z") | fromdateiso8601) - $off) * 1000
+                      + (((($m.f // "") + "000")[0:3]) | tonumber)
+                  end
+              end
+            else null end;
+
           . as $r
           | ($r.severity // "" | ascii_downcase) as $sev
           | ($r.status // "" | ascii_downcase) as $st
@@ -24,7 +53,7 @@ config:
               "category_uid": 2,
               "activity_id": 1,
               "type_uid": 200201,
-              "time": ($r.first_detected_at // 0),
+              "time": (to_epoch_ms($r.first_detected_at) // 0),
               "severity_id": (
                 { "critical": 5, "high": 4, "medium": 3, "low": 2 }[$sev] // 0
               ),
@@ -37,8 +66,8 @@ config:
                 "title": ($r.rule // "Aikido issue"),
                 "desc": ($r.rule // null),
                 "types": [ $r.type ] | map(select(. != null)),
-                "created_time": ($r.first_detected_at // null),
-                "first_seen_time": ($r.first_detected_at // null),
+                "created_time": to_epoch_ms($r.first_detected_at),
+                "first_seen_time": to_epoch_ms($r.first_detected_at),
                 "src_url": (
                   if $r.group_id != null
                   then "https://app.aikido.dev/feature/issues/" + ($r.group_id | tostring)
@@ -56,7 +85,7 @@ config:
                   "severity": ($r.severity // null),
                   "is_exploit_available": ($r.exploitability != null and $r.exploitability != "no_known_exploit"),
                   "is_fix_available": (($r.patched_versions // []) | length > 0),
-                  "first_seen_time": ($r.first_detected_at // null),
+                  "first_seen_time": to_epoch_ms($r.first_detected_at),
                   "remediation": (
                     if ($r.patched_versions // []) | length > 0
                     then { "desc": ("Upgrade to a patched version: " + (($r.patched_versions // []) | join(", "))) }
