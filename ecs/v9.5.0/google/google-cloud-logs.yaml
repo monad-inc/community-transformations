@@ -1,5 +1,5 @@
 name: "Google Cloud Audit Logs to ECS v9.5.0"
-description: "Transforms Google Cloud (Cloud Audit) Logs into Elastic Common Schema (ECS) v9.5.0, populating the event, cloud, user, source, user_agent, service, and related field sets."
+description: "Transforms Google Cloud Logs records (Cloud Audit Logs, App Engine request logs, and plain log entries) into Elastic Common Schema (ECS) v9.5.0, populating the event, cloud, user, source, user_agent, http, url, error, log, and related field sets."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -18,76 +18,149 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # Google Cloud Audit Logs -> ECS v9.5.0 (nested). One record/call.
-          # event.category: api  (cloud management API activity)
+          # Google Cloud Logs -> ECS v9.5.0 (nested). One record/call.
+          # Input is the connector's Go JSON encoding of a Cloud Logging
+          # LogEntry (not the REST camelCase shape):
+          #   insert_id, log_name, resource{type,labels}
+          #   timestamp / receive_timestamp = {seconds, nanos}
+          #   severity = LogSeverity number (0 DEFAULT … 800 EMERGENCY)
+          #   Payload.ProtoPayload{type_url, value}  (decoded AuditLog /
+          #     RequestLog with snake_case keys when proto parsing is on; a
+          #     base64 string when it is off)
+          #   Payload.TextPayload / Payload.JsonPayload for other entries
+          # RFC 3339 string timestamps and string severities (synthetic data)
+          # are accepted too.
           # ---------------------------------------------------------------
-          def is_ip($s): ($s|type)=="string" and ($s|test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or ($s|test(":")));
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test("^[0-9A-Fa-f:]+:[0-9A-Fa-f:.]*$"));
+
+          def iso($t):
+            if $t == null then null
+            elif ($t | type) == "object" then
+              if ($t.seconds // null) == null then null
+              else
+                ((($t.nanos // 0) / 1000000) | floor) as $ms
+                | ($t.seconds | todate | rtrimstr("Z")) + "." + ("00" + ($ms | tostring))[-3:] + "Z"
+              end
+            elif ($t | type) == "string" then $t
+            else null end;
+
+          def sev_name($s):
+            if ($s | type) == "string" then ($s | ascii_downcase)
+            elif ($s | type) == "number" then
+              ({"0":"default","100":"debug","200":"info","300":"notice","400":"warning",
+                "500":"error","600":"critical","700":"alert","800":"emergency"}[$s | tostring])
+            else null end;
 
           . as $r
-          | ($r.protoPayload // {}) as $pp
-          | ($pp.requestMetadata // {}) as $rm
-          | ($pp.authenticationInfo // {}) as $ai
           | (($r.resource // {}).labels // {}) as $lbl
-          | ($pp.methodName // "") as $mn
-          | ($mn | ascii_downcase) as $mnl
-          | (if   ($mnl | test("insert|create")) then "creation"
-             elif ($mnl | test("delete|remove")) then "deletion"
-             elif ($mnl | test("update|patch|set|write")) then "change"
-             elif ($mnl | test("get|list|read|aggregatedlist|search|batchget")) then "access"
-             else "info" end) as $etype
-          | (($pp.status // {}).code // 0) as $status_code
+          | ($r.Payload // {}) as $pl
+          | ($pl.ProtoPayload // {}) as $pp
+          | ($pp.type_url // "") as $turl
+          | (if ($pp.value | type) == "object" then $pp.value else {} end) as $v
+          | ($v != {} and ($turl | endswith("google.cloud.audit.AuditLog"))) as $is_audit
+          | ($v != {} and ($turl | endswith("google.appengine.logging.v1.RequestLog"))) as $is_reqlog
+          | ($v.request_metadata // {}) as $rm
+          | ($v.authentication_info // {}) as $ai
+          | (($r.log_name // "") | split("/logs/")) as $ln
+          | ($lbl.project_id // ($ln[0] | ltrimstr("projects/") | select(. != "")) // null) as $project
+
+          | (if $is_audit then $v.method_name
+             elif $is_reqlog then ([$v.method, $v.resource] | map(select(. != null)) | join(" "))
+             else null end) as $action
+          | (if $is_audit then $v.service_name elif $is_reqlog then ($v.host // $v.app_id) else null end) as $service
+          | (if $is_audit then $rm.caller_ip elif $is_reqlog then $v.ip else null end) as $caller
+          | (if $is_audit then $rm.caller_supplied_user_agent elif $is_reqlog then $v.user_agent else null end) as $ua
+          | (if $is_audit then $v.resource_name elif $is_reqlog then $v.resource else null end) as $target
+          | (if $is_audit then (($v.status // {}).code // 0)
+             elif $is_reqlog then ($v.status // null)
+             else null end) as $code
+
+          | (if $code == null then "unknown"
+             elif $is_reqlog then (if $code < 400 then "success" else "failure" end)
+             elif $code == 0 then "success" else "failure" end) as $outcome
+
+          | (if $is_audit then
+               ((($v.method_name // "") | split(".") | last) // "" | ascii_downcase) as $verb
+               | [ (if   ($verb | test("^(insert|create|add|import|generate)")) then "creation"
+                    elif ($verb | test("^(get|list|read|search|aggregatedlist|batchget|lookup|query|testiampermissions|export)")) then "access"
+                    elif ($verb | test("^(update|patch|set|write|replace|modify|enable|disable|move|rename|start|stop|reset|resize|attach|detach)")) then "change"
+                    elif ($verb | test("^(delete|remove|destroy|purge|undelete)")) then "deletion"
+                    else "info" end),
+                   (if $code == 7 then "denied" else empty end) ]
+             elif $is_reqlog then [ (if ($code // 0) >= 500 then "error" else "access" end) ]
+             else null end) as $etype
+
           | {
-              "@timestamp": $r.timestamp,
+              "@timestamp": iso($r.timestamp),
               "ecs": { "version": "9.5.0" },
 
               "event": {
                 "kind": "event",
-                "category": ["api"],
-                "type": [$etype],
-                "outcome": (if $status_code == 0 then "success" else "failure" end),
-                "action": $mn,
-                "id": $r.insertId,
-                "provider": $pp.serviceName,
-                "created": $r.receiveTimestamp,
-                "code": ($status_code | tostring)
+                "category": (if $is_audit then ["api"] elif $is_reqlog then ["web"] else null end),
+                "type": $etype,
+                "outcome": $outcome,
+                "action": $action,
+                "id": $r.insert_id,
+                "provider": $service,
+                "code": (if $code == null then null else ($code | tostring) end),
+                "created": iso($r.receive_timestamp)
               },
 
               "cloud": {
                 "provider": "gcp",
-                "project": { "id": $lbl.project_id },
+                "project": { "id": $project },
+                "region": ($lbl.region // $lbl.location),
                 "availability_zone": $lbl.zone,
-                "service": { "name": $pp.serviceName },
+                "service": { "name": $service },
                 "instance": { "id": $lbl.instance_id }
               },
 
-              "user": {
-                "name": $ai.principalEmail,
-                "email": $ai.principalEmail
-              },
+              "user": (if $ai.principal_email then {
+                "name": $ai.principal_email,
+                "email": $ai.principal_email,
+                "id": $ai.principal_subject
+              } else null end),
 
               "source": {
-                "ip": (if is_ip($rm.callerIp) then $rm.callerIp else null end),
-                "address": $rm.callerIp
+                "ip": (if is_ip($caller) then $caller else null end),
+                "address": $caller
               },
 
-              "user_agent": {
-                "original": $rm.callerSuppliedUserAgent
-              },
+              "user_agent": { "original": $ua },
 
-              "service": {
-                "name": $pp.serviceName
-              },
+              "http": (if $is_reqlog then {
+                "request": { "method": $v.method },
+                "response": { "status_code": $code }
+              } else null end),
+
+              "url": (if $is_reqlog then { "domain": $v.host, "path": $v.resource } else null end),
+
+              "error": (if $is_audit and $outcome == "failure" then {
+                "code": ($code | tostring),
+                "message": ($v.status // {}).message
+              } else null end),
 
               "log": {
-                "level": ($r.severity | ascii_downcase?),
-                "logger": $r.logName
+                "level": sev_name($r.severity),
+                "logger": $r.log_name
               },
 
-              "message": ($mn + " on " + ($pp.resourceName // "")),
+              "message": (
+                if $is_audit then ($action // "") + (if $target then " on " + $target else "" end)
+                elif $is_reqlog then $action + (if $code != null then " -> \($code)" else "" end)
+                elif $pl.TextPayload then $pl.TextPayload
+                elif $pl.JsonPayload then ($pl.JsonPayload.message // ($pl.JsonPayload | tostring))
+                else null end
+              ),
 
               "related": {
-                "ip": ([ (if is_ip($rm.callerIp) then $rm.callerIp else empty end) ] | unique),
-                "user": ([ $ai.principalEmail ] | map(select(. != null)) | unique)
+                "ip": [ (if is_ip($caller) then $caller else empty end) ],
+                "user": [ $ai.principal_email | select(. != null) ]
               }
             }
-          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end)
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null and . != {}))
+              else . end)

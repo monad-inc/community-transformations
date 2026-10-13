@@ -1,103 +1,227 @@
-name: "Google Cloud Audit Logs to OCSF"
-description: "Transforms Google Cloud Audit Logs into OCSF Schema"
+name: "Google Cloud Audit Logs to OCSF v1.1.0"
+description: "Transforms Google Cloud Logs records (Cloud Audit Logs, App Engine request logs, and plain log entries) into the OCSF v1.1.0 API Activity (6003) class."
 author: "Monad"
 contributors:
   - "https://github.com/Credgate"
+  - "https://github.com/behobu"
 inputs:
   - "google-cloud-logs"
 tags:
-  - "v1.0.0"
+  - "v1.1.0"
   - "ocsf"
   - "google"
   - "gcp"
-  - "audit"
-  - "logs"
+  - "api-activity"
 config:
   operations:
     - operation: "jq"
       arguments:
         key: ""
         query: |
-          {
-            # Required OCSF Fields
-            "category_uid": 6,
-            "class_uid": 6003,
-            "activity_id": 0,
-            "type_uid": 0,
-            "time": (.timestamp | fromdateiso8601),
-          
-            # Severity mapping
-            "severity_id": (
-              if .severity == "DEFAULT" then 0 
-              elif .severity == "DEBUG" then 1 
-              elif .severity == "INFO" then 2 
-              elif .severity == "NOTICE" then 3 
-              elif .severity == "WARNING" then 4 
-              elif .severity == "ERROR" then 5 
-              elif .severity == "CRITICAL" then 6 
-              elif .severity == "ALERT" then 6 
-              elif .severity == "EMERGENCY" then 6 
-              else 99 
-              end
-            ),
-            "severity": .severity,
-          
-            # Actor information
-            "actor": {
-              "user": {
-                "ip_addr": .protoPayload.requestMetadata.callerIp,
-                "user_agent": .protoPayload.requestMetadata.callerSuppliedUserAgent
-              }
-            },
-          
-            # Cloud context
-            "cloud": {
-              "provider": "GCP",
-              "account": {
-                "name": .resource.labels.project_id
+          # ---------------------------------------------------------------
+          # OCSF API Activity (class_uid=6003) — v1.1.0
+          # Input: one google-cloud-logs record per call. The connector emits
+          # the Go JSON encoding of a Cloud Logging LogEntry, not the REST
+          # camelCase shape:
+          #   insert_id, log_name, resource{type,labels}
+          #   timestamp / receive_timestamp = {seconds, nanos}
+          #   severity = LogSeverity number (0 DEFAULT … 800 EMERGENCY)
+          #   Payload.ProtoPayload{type_url, value}  (value is the decoded
+          #     AuditLog / RequestLog with snake_case keys when "Enable Proto
+          #     Payload Parsing" is on, or a base64 string when it is off)
+          #   Payload.TextPayload / Payload.JsonPayload for non-proto entries
+          # RFC 3339 string timestamps and string severities (synthetic data)
+          # are accepted too.
+          # ---------------------------------------------------------------
+          def to_ms($t):
+            if $t == null then null
+            elif ($t | type) == "object" then
+              if ($t.seconds // null) == null then null
+              else (($t.seconds * 1000) + ((($t.nanos // 0) / 1000000) | floor)) end
+            elif ($t | type) == "number" then $t
+            elif ($t | type) == "string" then
+              ((($t | capture("\\.(?<f>[0-9]+)") // {f: "0"}).f + "000")[0:3] | tonumber) as $ms
+              | (($t | sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)?$"; "Z") | fromdateiso8601?) // null)
+              | if . == null then null else (. * 1000 + $ms) end
+            else null end;
+
+          def sev_num($s):
+            if ($s | type) == "number" then $s
+            elif ($s | type) == "string" then
+              ({"DEFAULT":0,"DEBUG":100,"INFO":200,"NOTICE":300,"WARNING":400,
+                "ERROR":500,"CRITICAL":600,"ALERT":700,"EMERGENCY":800}[$s | ascii_upcase] // 0)
+            else 0 end;
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test("^[0-9A-Fa-f:]+:[0-9A-Fa-f:.]*$"));
+
+          . as $r
+          | (($r.resource // {}).labels // {}) as $lbl
+          | ($r.Payload // {}) as $pl
+          | ($pl.ProtoPayload // {}) as $pp
+          | ($pp.type_url // "") as $turl
+          # With proto parsing off, value is opaque base64 protobuf: map the
+          # LogEntry envelope only.
+          | (if ($pp.value | type) == "object" then $pp.value else {} end) as $v
+          | ($v != {} and ($turl | endswith("google.cloud.audit.AuditLog"))) as $is_audit
+          | ($v != {} and ($turl | endswith("google.appengine.logging.v1.RequestLog"))) as $is_reqlog
+          | ($v.request_metadata // {}) as $rm
+          | ($v.authentication_info // {}) as $ai
+          | (($r.log_name // "") | split("/logs/")) as $ln
+          | ($lbl.project_id // ($ln[0] | ltrimstr("projects/") | select(. != "")) // null) as $project
+          | (($ln[1] // "") | gsub("%2F"; "/")) as $log_id
+
+          # --- operation, caller, status per payload kind ---
+          | (if $is_audit then $v.method_name
+             elif $is_reqlog then ([$v.method, $v.resource] | map(select(. != null)) | join(" "))
+             else null end) as $op
+          | ($op // ($log_id | select(. != "")) // "unknown") as $operation
+          | (if $is_audit then $v.service_name
+             elif $is_reqlog then ($v.host // $v.app_id)
+             else null end) as $service
+          | (if $is_audit then $rm.caller_ip elif $is_reqlog then $v.ip else null end) as $caller
+          | (if $is_audit then $rm.caller_supplied_user_agent elif $is_reqlog then $v.user_agent else null end) as $ua
+          | (if $is_audit then ($v.resource_name // null)
+             elif $is_reqlog then $v.resource
+             else null end) as $target
+
+          | (if $is_reqlog then
+               (($v.method // "") | ascii_upcase) as $m
+               | if   $m == "POST" then 1
+                 elif ($m == "GET" or $m == "HEAD") then 2
+                 elif ($m == "PUT" or $m == "PATCH") then 3
+                 elif $m == "DELETE" then 4
+                 else 99 end
+             elif $is_audit then
+               ((($v.method_name // "") | split(".") | last) // "" | ascii_downcase) as $verb
+               | if   ($verb | test("^(insert|create|add|import|generate)")) then 1
+                 elif ($verb | test("^(get|list|read|search|aggregatedlist|batchget|lookup|query|testiampermissions|export)")) then 2
+                 elif ($verb | test("^(update|patch|set|write|replace|modify|enable|disable|move|rename|start|stop|reset|resize|attach|detach)")) then 3
+                 elif ($verb | test("^(delete|remove|destroy|purge|undelete)")) then 4
+                 else 99 end
+             else 99 end) as $activity_id
+
+          | (if $is_audit then (($v.status // {}).code // 0)
+             elif $is_reqlog then ($v.status // null)
+             else null end) as $code
+          | (if $code == null then 0
+             elif $is_reqlog then (if $code < 400 then 1 else 2 end)
+             elif $code == 0 then 1 else 2 end) as $status_id
+
+          | sev_num($r.severity) as $sev
+          | (if   $sev >= 800 then 6
+             elif $sev >= 600 then 5
+             elif $sev >= 500 then 4
+             elif $sev >= 400 then 3
+             else 1 end) as $severity_id
+
+          | {
+              # --- Classification (REQUIRED) ---
+              "category_uid": 6,
+              "class_uid":    6003,
+              "activity_id":  $activity_id,
+              "type_uid":     (6003 * 100 + $activity_id),
+              "severity_id":  $severity_id,
+
+              # --- Time (REQUIRED; epoch milliseconds) ---
+              "time": to_ms($r.timestamp),
+
+              # --- Status ---
+              "status_id": $status_id,
+              "status": ({"0":"Unknown","1":"Success","2":"Failure"}[$status_id | tostring]),
+              "status_code": (if $code == null then null else ($code | tostring) end),
+              "status_detail": (if $is_audit then ($v.status // {}).message else null end),
+
+              # --- Metadata (REQUIRED) ---
+              "metadata": {
+                "profiles": ["cloud"],
+                "version": "1.1.0",
+                "product": {
+                  "vendor_name": "Google",
+                  "name": "Google Cloud Logging"
+                },
+                "uid": $r.insert_id,
+                "log_name": $r.log_name,
+                "logged_time": to_ms($r.receive_timestamp),
+                "event_code": $turl,
+                "labels": [ ($r.labels // {}) | to_entries[] | "\(.key)=\(.value)" ]
               },
-              "zone": .resource.labels.zone
-            },
-          
-            # API information
-            "api": {
-              "operation": .protoPayload.methodName,
-              "service": {
-                "name": .protoPayload.serviceName
-              }
-            },
-          
-            # Source endpoint
-            "src_endpoint": {
-              "ip": .protoPayload.requestMetadata.callerIp
-            },
-          
-            # Resources array
-            "resources": [
-              {
-                "type": .resource.type,
-                "name": .protoPayload.resourceName,
-                "attributes": {
-                  "instance_id": .resource.labels.instance_id,
-                  "project_id": .resource.labels.project_id,
-                  "zone": .resource.labels.zone
+
+              # --- Cloud (cloud profile) ---
+              "cloud": {
+                "provider": "GCP",
+                "account": { "uid": $project },
+                "region": ($lbl.region // $lbl.location),
+                "zone": $lbl.zone
+              },
+
+              # --- Actor (REQUIRED) ---
+              "actor": {
+                "user": (if $ai.principal_email then {
+                  "name": $ai.principal_email,
+                  "email_addr": $ai.principal_email,
+                  "uid": $ai.principal_subject
+                } else null end),
+                "invoked_by": ($service // ($r.resource // {}).type)
+              },
+
+              # --- API (REQUIRED; operation required) ---
+              "api": {
+                "operation": $operation,
+                "service": { "name": $service },
+                "response": (if $code != null then {
+                  "code": $code,
+                  "error_message": (if $is_audit then ($v.status // {}).message else null end)
+                } else null end)
+              },
+
+              # --- Source endpoint (REQUIRED) ---
+              "src_endpoint": (
+                { "ip": (if is_ip($caller) then $caller else null end),
+                  "name": (if $caller != null and (is_ip($caller) | not) then $caller else null end) }
+                | if .ip == null and .name == null then { "name": "unknown" } else . end
+              ),
+
+              # --- HTTP request (http_response is not in 6003 until v1.2.0;
+              #     the App Engine HTTP status is carried in api.response.code) ---
+              "http_request": {
+                "user_agent": $ua,
+                "http_method": (if $is_reqlog then $v.method else null end),
+                "url": (if $is_reqlog then { "hostname": $v.host, "path": $v.resource } else null end)
+              },
+
+              # --- Resources ---
+              "resources": [
+                {
+                  "type": ($r.resource // {}).type,
+                  "name": $target,
+                  "uid": ($lbl.instance_id // $lbl.bucket_name // $lbl.module_id),
+                  "labels": [ $lbl | to_entries[] | "\(.key)=\(.value)" ]
                 }
-              }
-            ],
-          
-            # Metadata
-            "metadata": {
-              "labels": [
-                "log_name=" + .logName,
-                "insert_id=" + .insertId
               ],
-              "product": {
-                "name": "Google Cloud Platform",
-                "vendor_name": "Google"
-              },
-              "version": "1.0.0"
-            },
-          
-            # Raw data
-            "raw_data": (. | tostring)
-          }
+
+              # --- Message ---
+              "message": (
+                if $is_audit then
+                  ($operation + (if $target then " on " + $target else "" end))
+                elif $is_reqlog then
+                  ($operation + (if $code != null then " -> \($code)" else "" end))
+                elif $pl.TextPayload then $pl.TextPayload
+                elif $pl.JsonPayload then ($pl.JsonPayload.message // ($pl.JsonPayload | tostring))
+                else null end
+              ),
+
+              # --- Observables ---
+              "observables": [
+                (if is_ip($caller) then {"name": "src_endpoint.ip", "type_id": 2, "value": $caller} else empty end),
+                (if $ai.principal_email then {"name": "actor.user.email_addr", "type_id": 5, "value": $ai.principal_email} else empty end)
+              ],
+
+              # --- Original record ---
+              "raw_data": ($r | tostring)
+            }
+          | walk(
+              if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
+              elif type == "array" then map(select(. != null and . != {}))
+              else . end)
