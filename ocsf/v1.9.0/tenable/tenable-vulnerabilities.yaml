@@ -5,6 +5,7 @@ contributors:
   - "https://github.com/behobu"
 inputs:
   - "tenable-vulnerabilities"
+  - "tenable-vulnerabilities-cron"
 tags:
   - "v1.9.0"
   - "ocsf"

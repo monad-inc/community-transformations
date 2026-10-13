@@ -3,8 +3,10 @@ description: "Transforms Tenable Asset Inventory into OCSF Schema"
 author: "Monad"
 contributors:
   - "https://github.com/Credgate"
+  - "https://github.com/behobu"
 inputs:
   - "tenable-assets"
+  - "tenable-assets-cron"
 tags:
   - "v1.1.0"
   - "ocsf"
