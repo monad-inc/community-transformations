@@ -68,7 +68,7 @@ config:
             elif $s == "critical" then 5
             else 0 end;
           def sev_caption($id):
-            {"0":"Unknown","1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Other";
+            { "0": "Unknown", "1": "Informational", "2": "Low", "3": "Medium", "4": "High", "5": "Critical", "6": "Fatal", "99": "Other" }[$id | tostring] // "Other";
 
           . as $r |
           (.alerts // []) as $alerts |

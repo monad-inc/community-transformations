@@ -71,7 +71,7 @@ config:
             elif $s == "critical" then 5
             else 99 end;
           def sev_caption($id):
-            {"1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Other";
+            { "0": "Unknown", "1": "Informational", "2": "Low", "3": "Medium", "4": "High", "5": "Critical", "6": "Fatal", "99": "Other" }[$id | tostring] // "Other";
 
           # Tenable finding state -> OCSF status_id (+ caption for the sibling).
           def state_to_status_id:

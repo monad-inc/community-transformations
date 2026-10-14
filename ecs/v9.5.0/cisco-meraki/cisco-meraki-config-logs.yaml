@@ -22,10 +22,7 @@ config:
           # one trailing walk-based prune (the only recursive pass).
           # ---------------------------------------------------------------
           def nonempty($v): ($v != null) and (($v | type) != "string" or ($v | length) > 0);
-          def prune: walk(
-            if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
-            elif type == "array" then map(select(. != null))
-            else . end);
+          def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           . as $r
           | (if (nonempty($r.oldValue) | not) and nonempty($r.newValue) then "creation"

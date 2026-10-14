@@ -40,14 +40,7 @@ config:
 
           # A subject can be a bare hostname or a wildcard/partial domain; ES
           # host.name is a keyword, so no ip guard is needed here.
-          def prune:
-            walk(
-              if type == "object" then
-                with_entries(select(.value != null and .value != {} and .value != []))
-              elif type == "array" then
-                map(select(. != null))
-              else . end
-            );
+          def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           . as $r
           | ( $r.payload ) as $p

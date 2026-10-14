@@ -36,18 +36,14 @@ config:
 
           # Serialize a nested value to a compact JSON string (or drop it if
           # null/empty) so the aws.* namespace stays mapping-safe.
-          def json_str: if (. == null or . == [] or . == {}) then null else (. | tojson) end;
+          def json_str:
+            if . == null or . == {} or . == [] then null
+            elif type == "string" then .
+            else tojson end;
 
           # Single end-of-pipeline recursive prune (the one permitted
           # recursive pass): ES rejects nulls and the doc is deeply nested.
-          def prune:
-            walk(
-              if type == "object" then
-                with_entries(select(.value != null and .value != {} and .value != []))
-              elif type == "array" then
-                map(select(. != null))
-              else . end
-            );
+          def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           . as $r
           | ( $r.KeyMetadata // {} ) as $km
