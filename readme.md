@@ -109,6 +109,22 @@ Before submitting, ensure your transformation:
 4. Produces the expected output format
 5. Performs efficiently with larger datasets
 
+## Shared jq Helpers
+
+The Monad jq operation has no shared library, so each transformation carries its own copy of the helper functions it uses.
+`helpers/helpers.jq` is the canonical source for the common ones: `to_epoch_ms`, `to_iso`, `is_ip`, `prune`, `prune_blank`, `sev_caption`, and `json_str`.
+
+- If your transformation needs one of these, copy its definition from `helpers/helpers.jq` exactly.
+- Don't define a different function under one of these names; give a local variant its own name.
+- To change a helper, edit `helpers/helpers.jq` and `helpers/tests.json`, then run the sync and check commands below (Go 1.26+) and review the transform diffs in the same pull request.
+
+```bash
+go -C tools run ./cmd/helpers sync    # rewrite drifted copies to the canonical definitions
+go -C tools run ./cmd/helpers check   # fail on any drifted copy; run the helper test cases
+```
+
+To try a helper locally, include the file with jq or gojq: `jq -L helpers 'include "helpers"; to_epoch_ms(.time)'`.
+
 ## Repository Organization
 
 When adding a new transformation:
