@@ -21,13 +21,37 @@ config:
           # Input: one AWS Inspector (Inspector2) Finding record per call.
           # ---------------------------------------------------------------
 
-          def to_epoch($ts):
-            if $ts == null then null
-            elif ($ts | type) == "number" then ($ts | floor)
-            else ($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601)
-            end;
 
           # Prune null / "" / {} but KEEP arrays (osint: [] must survive).
+          def to_epoch_ms($ts):
+            def _num_ms($n):
+              if   $n >= 1e17 then ($n / 1000000 | floor)
+              elif $n >= 1e14 then ($n / 1000 | floor)
+              elif $n >= 1e11 then ($n | floor)
+              else ($n * 1000 | floor) end;
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then _num_ms($ts)
+            elif ($ts | type) == "object" then
+              (if ($ts.seconds // null) == null then null
+               else ($ts.seconds * 1000 + ((($ts.nanos // 0) / 1000000) | floor)) end)
+            elif ($ts | type) == "string" then
+              if ($ts | test("^-?[0-9]+(\\.[0-9]+)?$")) then _num_ms($ts | tonumber)
+              else
+                ([$ts | ascii_upcase | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T ](?<t>[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?:[.,](?<f>[0-9]+))?)? ?(?<z>Z|UTC|[+-][0-9]{2}(?::?[0-9]{2})?)?$")] | first) as $m
+                | if $m == null then null
+                  else
+                    (($m.t // "00:00:00") | if length == 5 then . + ":00" else . end) as $t
+                    | (($m.z // "Z") | if . == "Z" or . == "UTC" then 0
+                        else (.[1:] | gsub(":"; "")) as $o
+                          | ((if (.[0:1]) == "-" then -1 else 1 end)
+                             * (($o[0:2] | tonumber) * 3600 + ((if ($o | length) >= 4 then $o[2:4] else "00" end) | tonumber) * 60))
+                        end) as $off
+                    | ((($m.d + "T" + $t + "Z") | fromdateiso8601) - $off) * 1000
+                      + (((($m.f // "") + "000")[0:3]) | tonumber)
+                  end
+              end
+            else null end;
+
           def prune:
             walk(
               if type == "object" then
@@ -81,9 +105,9 @@ config:
               severity_id:  $sev,
               status_id:    $stat,
 
-              time: to_epoch($r.updatedAt // $r.lastObservedAt // $r.firstObservedAt),
-              start_time: to_epoch($r.firstObservedAt),
-              end_time:   to_epoch($r.lastObservedAt),
+              time: to_epoch_ms($r.updatedAt // $r.lastObservedAt // $r.firstObservedAt),
+              start_time: to_epoch_ms($r.firstObservedAt),
+              end_time:   to_epoch_ms($r.lastObservedAt),
 
               message: $r.description,
 
@@ -113,10 +137,10 @@ config:
                 title: ($r.title // ($pvd.vulnerabilityId // "AWS Inspector finding")),
                 desc: $r.description,
                 types: [ $r.type ],
-                created_time: to_epoch($r.firstObservedAt),
-                first_seen_time: to_epoch($r.firstObservedAt),
-                last_seen_time: to_epoch($r.lastObservedAt),
-                modified_time: to_epoch($r.updatedAt),
+                created_time: to_epoch_ms($r.firstObservedAt),
+                first_seen_time: to_epoch_ms($r.firstObservedAt),
+                last_seen_time: to_epoch_ms($r.lastObservedAt),
+                modified_time: to_epoch_ms($r.updatedAt),
                 src_url: ($pvd.sourceUrl // null)
               },
 
@@ -128,8 +152,8 @@ config:
                   is_fix_available: ( ($r.fixAvailable // "NO") | (. == "YES" or . == "PARTIAL") ),
                   is_exploit_available: ( ($r.exploitAvailable // "NO") == "YES" ),
                   references: ($pvd.referenceUrls // []),
-                  first_seen_time: to_epoch($r.firstObservedAt),
-                  last_seen_time: to_epoch($r.lastObservedAt),
+                  first_seen_time: to_epoch_ms($r.firstObservedAt),
+                  last_seen_time: to_epoch_ms($r.lastObservedAt),
                   remediation: ( if ($r.remediation.recommendation.text // null) != null
                                  then { desc: $r.remediation.recommendation.text,
                                         references: ( [ $r.remediation.recommendation.Url ]
@@ -140,8 +164,8 @@ config:
                            uid: $pvd.vulnerabilityId,
                            title: $r.title,
                            references: ($pvd.referenceUrls // []),
-                           created_time: to_epoch($pvd.vendorCreatedAt),
-                           modified_time: to_epoch($pvd.vendorUpdatedAt),
+                           created_time: to_epoch_ms($pvd.vendorCreatedAt),
+                           modified_time: to_epoch_ms($pvd.vendorUpdatedAt),
                            cvss: $cvss,
                            epss: ( if ($r.epss.score // null) != null
                                    then { score: ($r.epss.score | tostring) } else null end )

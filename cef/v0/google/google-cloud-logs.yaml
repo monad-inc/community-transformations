@@ -1,5 +1,5 @@
 name: "Google Cloud Audit Logs to CEF"
-description: "Maps Google Cloud (Cloud Audit) Log records into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
+description: "Maps Google Cloud Logs records (Cloud Audit Logs, App Engine request logs, and plain log entries) into the normalized {_cef:{...}} CEF intermediate. Chain the shared CEF Serializer (utility/cef/cef-serializer.yaml) after this to render the CEF:0 string."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -18,43 +18,120 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # Google Cloud Audit Logs -> CEF intermediate (T1). No escaping.
+          # Google Cloud Logs -> CEF intermediate (T1). No escaping.
           # severity: int 0-10; times epoch-MS; custom slots paired w/ labels.
+          # Input is the connector's Go JSON encoding of a Cloud Logging
+          # LogEntry (not the REST camelCase shape):
+          #   insert_id, log_name, resource{type,labels}
+          #   timestamp / receive_timestamp = {seconds, nanos}
+          #   severity = LogSeverity number (0 DEFAULT … 800 EMERGENCY)
+          #   Payload.ProtoPayload{type_url, value}  (decoded AuditLog /
+          #     RequestLog with snake_case keys when proto parsing is on; a
+          #     base64 string when it is off)
+          #   Payload.TextPayload / Payload.JsonPayload for other entries
+          # RFC 3339 string timestamps and string severities (synthetic data)
+          # are accepted too.
           # ---------------------------------------------------------------
-          def to_epoch_ms($ts):
-            if $ts == null then null
-            elif ($ts | type) == "number" then (if $ts > 1e12 then $ts else ($ts * 1000) end | floor)
-            else (($ts | gsub("\\.[0-9]+Z?$"; "Z") | fromdateiso8601) * 1000)
-            end;
+          def to_ms($t):
+            if $t == null then null
+            elif ($t | type) == "object" then
+              if ($t.seconds // null) == null then null
+              else (($t.seconds * 1000) + ((($t.nanos // 0) / 1000000) | floor)) end
+            elif ($t | type) == "number" then (if $t > 1e12 then $t else ($t * 1000) end | floor)
+            elif ($t | type) == "string" then
+              ((($t | capture("\\.(?<f>[0-9]+)") // {f: "0"}).f + "000")[0:3] | tonumber) as $ms
+              | (($t | sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)?$"; "Z") | fromdateiso8601?) // null)
+              | if . == null then null else (. * 1000 + $ms) end
+            else null end;
+
+          def sev_num($s):
+            if ($s | type) == "number" then $s
+            elif ($s | type) == "string" then
+              ({"DEFAULT":0,"DEBUG":100,"INFO":200,"NOTICE":300,"WARNING":400,
+                "ERROR":500,"CRITICAL":600,"ALERT":700,"EMERGENCY":800}[$s | ascii_upcase] // 0)
+            else 0 end;
+
+          def is_ip($s):
+            ($s | type) == "string"
+            and ($s | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") or test("^[0-9A-Fa-f:]+:[0-9A-Fa-f:.]*$"));
+
+          # A custom slot and its label, emitted together or not at all.
+          def slot($k; $label; $v):
+            if $v == null or $v == "" then {} else { ($k + "Label"): $label, ($k): $v } end;
 
           . as $r
-          | ($r.protoPayload // {}) as $pp
-          | ($pp.requestMetadata // {}) as $rm
           | (($r.resource // {}).labels // {}) as $lbl
-          | (($pp.status // {}).code // 0) as $status_code
+          | ($r.Payload // {}) as $pl
+          | ($pl.ProtoPayload // {}) as $pp
+          | ($pp.type_url // "") as $turl
+          | (if ($pp.value | type) == "object" then $pp.value else {} end) as $v
+          | ($v != {} and ($turl | endswith("google.cloud.audit.AuditLog"))) as $is_audit
+          | ($v != {} and ($turl | endswith("google.appengine.logging.v1.RequestLog"))) as $is_reqlog
+          | ($v.request_metadata // {}) as $rm
+          | ($v.authentication_info // {}) as $ai
+          | (($r.log_name // "") | split("/logs/")) as $ln
+          | ($lbl.project_id // ($ln[0] | ltrimstr("projects/") | select(. != "")) // null) as $project
+          | (($ln[1] // "") | gsub("%2F"; "/")) as $log_id
+
+          | (if $is_audit then $v.method_name
+             elif $is_reqlog then ([$v.method, $v.resource] | map(select(. != null)) | join(" "))
+             else null end) as $action
+          | (if $is_audit then $v.service_name elif $is_reqlog then ($v.host // $v.app_id) else null end) as $service
+          | (if $is_audit then $rm.caller_ip elif $is_reqlog then $v.ip else null end) as $caller
+          | (if $is_audit then $rm.caller_supplied_user_agent elif $is_reqlog then $v.user_agent else null end) as $ua
+          | (if $is_audit then $v.resource_name elif $is_reqlog then $v.resource else null end) as $target
+          | (if $is_audit then (($v.status // {}).code // 0)
+             elif $is_reqlog then ($v.status // null)
+             else null end) as $code
+          | sev_num($r.severity) as $sev
+
           | { _cef: {
               vendor: "Google",
               product: "Google Cloud Platform",
               version: "",
-              signature_id: ($pp.methodName // "gcp.audit.event"),
-              name: (($pp.methodName // "Google Cloud audit event") + " on " + ($pp.resourceName // "")),
+              signature_id: (
+                if $is_audit then ($v.method_name // "gcp.audit.event")
+                elif $is_reqlog then "gcp.appengine.request"
+                elif $log_id != "" then $log_id
+                else "gcp.log.entry" end),
+              name: (
+                if $is_audit then (($action // "Google Cloud audit event") + (if $target then " on " + $target else "" end))
+                elif $is_reqlog then ($action + (if $code != null then " -> \($code)" else "" end))
+                elif $pl.TextPayload then $pl.TextPayload
+                elif $pl.JsonPayload then ($pl.JsonPayload.message // "Google Cloud log entry")
+                else "Google Cloud log entry" end),
               severity: (
-                { "DEFAULT": 2, "DEBUG": 2, "INFO": 2, "NOTICE": 2,
-                  "WARNING": 5, "ERROR": 7, "CRITICAL": 8, "ALERT": 8,
-                  "EMERGENCY": 10 }[$r.severity] // 0
-              ),
-              extension: ( {
-                rt:      to_epoch_ms($r.timestamp),
-                suser:   ($pp.authenticationInfo // {}).principalEmail,
-                src:     $rm.callerIp,
-                act:     $pp.methodName,
-                outcome: (if $status_code == 0 then "SUCCESS" else "FAILURE" end),
-                requestClientApplication: $rm.callerSuppliedUserAgent,
-                deviceExternalId: $r.insertId,
-                cs1Label: "projectId",   cs1: $lbl.project_id,
-                cs2Label: "resourceName", cs2: $pp.resourceName,
-                cs3Label: "serviceName",  cs3: $pp.serviceName,
-                cs4Label: "logName",      cs4: $r.logName,
-                cn1Label: "statusCode",   cn1: ($status_code | tostring)
-              } | with_entries(select(.value != null and .value != "")) )
+                if   $sev >= 800 then 10
+                elif $sev >= 600 then 8
+                elif $sev >= 500 then 7
+                elif $sev >= 400 then 5
+                else 2 end),
+              extension: (
+                {
+                  rt:      to_ms($r.timestamp),
+                  suser:   $ai.principal_email,
+                  src:     (if is_ip($caller) then $caller else null end),
+                  shost:   (if $caller != null and (is_ip($caller) | not) then $caller else null end),
+                  act:     $action,
+                  outcome: (if $code == null then null
+                            elif $is_reqlog then (if $code < 400 then "SUCCESS" else "FAILURE" end)
+                            elif $code == 0 then "SUCCESS" else "FAILURE" end),
+                  reason:  (if $is_audit then ($v.status // {}).message else null end),
+                  requestClientApplication: $ua,
+                  requestMethod: (if $is_reqlog then $v.method else null end),
+                  dhost: (if $is_reqlog then $v.host else null end),
+                  deviceExternalId: $r.insert_id,
+                  msg: (if ($is_audit or $is_reqlog) then null
+                        elif $pl.TextPayload then null
+                        elif $pl.JsonPayload then ($pl.JsonPayload | tostring)
+                        else null end)
+                }
+                + slot("cs1"; "projectId"; $project)
+                + slot("cs2"; "resourceName"; $target)
+                + slot("cs3"; "serviceName"; $service)
+                + slot("cs4"; "logName"; $r.log_name)
+                + slot("cs5"; "resourceType"; ($r.resource // {}).type)
+                + slot("cn1"; "statusCode"; $code)
+                | with_entries(select(.value != null and .value != ""))
+              )
           } }

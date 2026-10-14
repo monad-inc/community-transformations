@@ -31,12 +31,35 @@ config:
           # CrowdStrike stamps ISO-8601 timestamps with a trailing Z and, on
           # some fields, fractional seconds. OCSF `time`/`*_time` are integer
           # epoch SECONDS, so strip the fraction + Z before strptime.
-          def to_epoch($ts):
-            if $ts == null then null
-            elif ($ts | type) == "number" then $ts
-            else ($ts | ascii_upcase | gsub("\\.[0-9]+Z?$"; "") | gsub("Z$"; "")
-                  | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
-            end;
+
+          def to_epoch_ms($ts):
+            def _num_ms($n):
+              if   $n >= 1e17 then ($n / 1000000 | floor)
+              elif $n >= 1e14 then ($n / 1000 | floor)
+              elif $n >= 1e11 then ($n | floor)
+              else ($n * 1000 | floor) end;
+            if $ts == null or $ts == "" then null
+            elif ($ts | type) == "number" then _num_ms($ts)
+            elif ($ts | type) == "object" then
+              (if ($ts.seconds // null) == null then null
+               else ($ts.seconds * 1000 + ((($ts.nanos // 0) / 1000000) | floor)) end)
+            elif ($ts | type) == "string" then
+              if ($ts | test("^-?[0-9]+(\\.[0-9]+)?$")) then _num_ms($ts | tonumber)
+              else
+                ([$ts | ascii_upcase | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T ](?<t>[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?:[.,](?<f>[0-9]+))?)? ?(?<z>Z|UTC|[+-][0-9]{2}(?::?[0-9]{2})?)?$")] | first) as $m
+                | if $m == null then null
+                  else
+                    (($m.t // "00:00:00") | if length == 5 then . + ":00" else . end) as $t
+                    | (($m.z // "Z") | if . == "Z" or . == "UTC" then 0
+                        else (.[1:] | gsub(":"; "")) as $o
+                          | ((if (.[0:1]) == "-" then -1 else 1 end)
+                             * (($o[0:2] | tonumber) * 3600 + ((if ($o | length) >= 4 then $o[2:4] else "00" end) | tonumber) * 60))
+                        end) as $off
+                    | ((($m.d + "T" + $t + "Z") | fromdateiso8601) - $off) * 1000
+                      + (((($m.f // "") + "000")[0:3]) | tonumber)
+                  end
+              end
+            else null end;
 
           . as $r
           | {
@@ -51,7 +74,7 @@ config:
               "type_name": "Device Inventory Info: Collect",
               "severity_id": 1,
               "severity": "Informational",
-              "time": to_epoch($r.agent_local_time),
+              "time": to_epoch_ms($r.agent_local_time),
               "status": "Success",
               "status_id": 1,
 
@@ -111,9 +134,9 @@ config:
                 "mac": $r.mac_address,
                 "instance_uid": $r.instance_id,
                 "vendor_name": "CrowdStrike",
-                "first_seen_time": to_epoch($r.first_seen),
-                "last_seen_time": to_epoch($r.last_seen),
-                "modified_time": to_epoch($r.modified_timestamp),
+                "first_seen_time": to_epoch_ms($r.first_seen),
+                "last_seen_time": to_epoch_ms($r.last_seen),
+                "modified_time": to_epoch_ms($r.modified_timestamp),
                 "is_managed": ($r.provision_status == "Provisioned"),
 
                 "network_interfaces": ([
