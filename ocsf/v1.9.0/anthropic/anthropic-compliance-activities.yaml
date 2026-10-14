@@ -60,13 +60,7 @@ config:
               end
             else null end;
 
-                    def prune:
-            walk(
-              if type == "object" then
-                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
-              elif type == "array" then
-                map(select(. != null and . != ""))
-              else . end);
+                    def prune_blank: walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           . as $r
           | ($r.actor // {}) as $a
@@ -154,5 +148,5 @@ config:
                 workos_event_id: $a.workos_event_id
               } | with_entries(select(.value != null)))
             }
-          | prune
+          | prune_blank
           | .osint = []
