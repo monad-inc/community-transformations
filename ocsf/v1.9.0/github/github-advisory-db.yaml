@@ -69,7 +69,7 @@ config:
             elif $s == "critical"  then 5
             else 0 end;                       # "unknown"/absent -> Unknown
           def sev_caption($id):
-            {"2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Unknown";
+            { "0": "Unknown", "1": "Informational", "2": "Low", "3": "Medium", "4": "High", "5": "Critical", "6": "Fatal", "99": "Other" }[$id | tostring] // "Other";
 
           # Derive the CVSS version string ("3.1", "4.0", ...) from the vector
           # prefix "CVSS:<ver>/..."; default to "3.1" when only a bare score

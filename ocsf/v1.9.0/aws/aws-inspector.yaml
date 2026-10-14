@@ -52,7 +52,8 @@ config:
               end
             else null end;
 
-          def prune:
+          # Not the canonical prune: keeps [] values so the required osint array survives.
+          def prune_keep_arrays:
             walk(
               if type == "object" then
                 with_entries(select(.value != null and .value != "" and .value != {}))
@@ -193,4 +194,4 @@ config:
 
               raw_data: ($r | tostring)
             }
-          | prune
+          | prune_keep_arrays

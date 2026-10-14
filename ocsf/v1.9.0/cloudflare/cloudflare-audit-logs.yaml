@@ -62,13 +62,7 @@ config:
               end
             else null end;
 
-          def prune:
-            walk(
-              if type == "object" then
-                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
-              elif type == "array" then map(select(. != null))
-              else . end
-            );
+          def prune_blank: walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           . as $r
           | ($r.action // {}) as $act
@@ -162,7 +156,7 @@ config:
               ] | map(select(. != null)) ),
 
               "raw_data": ($r | tostring)
-            } | prune)
+            } | prune_blank)
 
           # osint is a REQUIRED attribute of API Activity but has no source
           # here; attach an empty array after the prune so it survives.

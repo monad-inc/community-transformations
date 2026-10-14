@@ -27,10 +27,7 @@ config:
           | ( { "-1": "revoked", "0": "invited", "1": "accepted", "2": "confirmed" }[($m.status // -99 | tostring)] // "unknown" ) as $status
 
           # single recursive prune (the one permitted recursive pass)
-          | def prune: walk(
-              if   type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
-              elif type == "array"  then map(select(. != null))
-              else . end);
+          | def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
 
           {
             "@timestamp": (now | todateiso8601),

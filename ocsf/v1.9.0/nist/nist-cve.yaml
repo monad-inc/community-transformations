@@ -65,7 +65,7 @@ config:
             elif $x == "critical" then 5
             else 0 end;
           def sev_caption($id):
-            {"0":"Unknown","1":"Informational","2":"Low","3":"Medium","4":"High","5":"Critical"}[$id|tostring] // "Unknown";
+            { "0": "Unknown", "1": "Informational", "2": "Low", "3": "Medium", "4": "High", "5": "Critical", "6": "Fatal", "99": "Other" }[$id | tostring] // "Other";
 
           # NVD vulnStatus -> OCSF status_id (+ caption).
           def status_to_id($s):

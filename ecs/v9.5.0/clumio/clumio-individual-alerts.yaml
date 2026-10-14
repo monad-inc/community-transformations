@@ -21,7 +21,10 @@ config:
           # event.kind=alert; category=configuration/type=info (data-protection
           # health alert). One jq pass, bind-once, single end-of-pipeline prune.
           # ---------------------------------------------------------------
-          def json_str($v): if $v == null then null else ($v | tojson) end;
+          def json_str($v):
+            if $v == null or $v == {} or $v == [] then null
+            elif ($v | type) == "string" then $v
+            else ($v | tojson) end;
 
           . as $r
           | ($r.primary_entity // {}) as $pe
