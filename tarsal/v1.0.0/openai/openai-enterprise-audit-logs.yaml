@@ -1,5 +1,5 @@
-name: "Sentry User Events to Tarsal"
-description: "Transforms Sentry User Events into Tarsal Schema"
+name: "OpenAI Enterprise Audit Logs to Tarsal"
+description: "Transforms OpenAI Enterprise Audit Logs into Tarsal Schema"
 author: "Monad"
 contributors:
   - "https://github.com/saikapuluru99"

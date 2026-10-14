@@ -3,6 +3,7 @@ description: "Transforms incoming data's schema to rename Azure Sentinel reserve
 author: "Monad"
 contributors:
   - "https://github.com/mon-aneesh"
+inputs: []
 tags:
   - "v1.1.0"
   - "microsoft"
