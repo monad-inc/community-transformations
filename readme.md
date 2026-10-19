@@ -109,6 +109,13 @@ Before submitting, ensure your transformation:
 4. Produces the expected output format
 5. Performs efficiently with larger datasets
 
+Every pull request runs the `Validate` workflow, which you can also run locally (Go 1.26+):
+
+```bash
+go -C tools run ./cmd/validate        # metadata, file placement, and jq parse/compile under the platform's gojq
+go -C tools run ./cmd/helpers check   # shared helper copies match helpers/helpers.jq
+```
+
 ## Shared jq Helpers
 
 The Monad jq operation has no shared library, so each transformation carries its own copy of the helper functions it uses.

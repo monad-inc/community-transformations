@@ -1,0 +1,45 @@
+name: Validate
+
+# Every transform on main is synced to the Monad platform within the hour, so
+# a transform that fails to load reaches customers without any other gate.
+# These checks mirror what the platform does with a transform: index the
+# YAML, read its metadata, and parse and compile its jq with the gojq
+# version the jq operation runs (pinned in tools/go.mod).
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate transforms
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+          cache-dependency-path: tools/go.sum
+
+      - name: Vet tools
+        run: go -C tools vet ./...
+
+      - name: Validate transforms
+        run: go -C tools run ./cmd/validate
+
+      - name: Check jq helpers
+        run: go -C tools run ./cmd/helpers check
