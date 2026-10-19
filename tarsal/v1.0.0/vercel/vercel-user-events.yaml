@@ -3,6 +3,7 @@ description: "Transforms Vercel User Events into Tarsal Schema"
 author: "Monad"
 contributors:
   - "https://github.com/saikapuluru99"
+  - "https://github.com/behobu"
 inputs:
   - "vercel-user-events"
 tags:
@@ -15,11 +16,14 @@ config:
       arguments:
         key: ""
         query: |
+          # Vercel user events (GET /v3/events) carry no IP address field.
+          # The actor's email is on user (when the principal is a user) or
+          # principal.
           {
             "data": . + {
                 "t_parse_time": now | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 "t_event_time": (.createdAt / 1000) | strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                "t_ip_address": .source_ip_address,
-                "t_email_address": .event_data.resource_properties?.email?.updated // null
+                "t_ip_address": null,
+                "t_email_address": .user?.email // .principal?.email // null
             }
           }
