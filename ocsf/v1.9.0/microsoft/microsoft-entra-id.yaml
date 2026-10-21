@@ -1,5 +1,5 @@
-name: "Microsoft Entra ID Sign-in Logs to OCSF v1.9.0"
-description: "Transforms Microsoft Entra ID (Azure AD) sign-in log records into the OCSF v1.9.0 Authentication class (class_uid 3002)."
+name: "Microsoft Entra ID Sign-in and Audit Logs to OCSF v1.9.0"
+description: "Transforms Microsoft Entra ID Log Analytics rows into OCSF v1.9.0: sign-in tables (SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs, AADManagedIdentitySignInLogs) into the Authentication class (3002) and AuditLogs rows into the API Activity class (6003)."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -10,7 +10,10 @@ tags:
   - "ocsf"
   - "microsoft"
   - "entra-id"
+  - "iam"
   - "authentication"
+  - "application activity"
+  - "api activity"
 config:
   operations:
     - operation: "jq"
@@ -18,13 +21,29 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # OCSF Authentication (class_uid=3002) — v1.9.0
-          # Input: one Microsoft Entra ID (Azure AD) sign-in log record per
-          # invocation, as emitted by the Monad `microsoft-entra-id` input
-          # (Microsoft Graph auditLogs/signIns resource shape).
+          # Microsoft Entra ID -> OCSF v1.9.0
+          #   sign-in rows -> Authentication (class_uid=3002), Logon
+          #   AuditLogs    -> API Activity   (class_uid=6003)
+          #
+          # Input: ONE Log Analytics row per invocation, as emitted by the
+          # Monad `microsoft-entra-id` input. The input runs KQL against the
+          # table chosen in its Category setting (AuditLogs, SigninLogs,
+          # AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs,
+          # AADManagedIdentitySignInLogs). Each row is a map keyed by the
+          # PascalCase column name; null and empty columns are dropped,
+          # datetime columns are RFC 3339 strings, and every row carries
+          # TimeGenerated, Type (the table name) and IngestionTime.
+          #
+          # Dynamic columns (Status, LocationDetails, DeviceDetail, ...) arrive
+          # as JSON objects from SigninLogs but as JSON-encoded STRINGS from
+          # the non-interactive / service-principal / managed-identity tables,
+          # so every such column is read through dyn().
           # ---------------------------------------------------------------
 
-
+          # OCSF timestamp_t is epoch MILLISECONDS. Use this helper for every
+          # time / *_time field; it accepts epoch s/ms/us/ns numbers, numeric
+          # strings, {seconds,nanos}, and ISO 8601 with any UTC offset, and
+          # returns null (not an error) on unparseable input.
           def to_epoch_ms($ts):
             def _num_ms($n):
               if   $n >= 1e17 then ($n / 1000000 | floor)
@@ -54,172 +73,340 @@ config:
               end
             else null end;
 
-          . as $r
-          | ( $r.status // {} ) as $st
-          | ( $r.deviceDetail // {} ) as $dd
-          | ( $r.location // {} ) as $loc
-          # Entra sign-in success is signalled by status.errorCode == 0.
-          | ( ($st.errorCode // 0) == 0 ) as $ok
-          # multiFactorAuthentication requirement -> is_mfa true.
-          | ( ($r.authenticationRequirement // "") == "multiFactorAuthentication" ) as $mfa
-          | {
-              # --- Classification (REQUIRED) ---
-              category_uid: 3,
-              category_name: "Identity & Access Management",
-              class_uid: 3002,
-              class_name: "Authentication",
-              activity_id: 1,
-              activity_name: "Logon",
-              type_uid: 300201,
-              type_name: "Authentication: Logon",
-
-              # --- Severity: success is informational; a failed sign-in is
-              #     surfaced as Medium so downstream detection can key on it ---
-              severity_id: ( if $ok then 1 else 3 end ),
-              severity: ( if $ok then "Informational" else "Medium" end ),
-
-              # --- Status ---
-              status_id: ( if $ok then 1 else 2 end ),
-              status: ( if $ok then "Success" else "Failure" end ),
-              status_code: (($st.errorCode // 0) | tostring),
-              status_detail: ($st.failureReason // $st.additionalDetails),
-
-              # --- Time (REQUIRED) ---
-              time: to_epoch_ms($r.createdDateTime),
-
-              # --- Auth details ---
-              is_mfa: $mfa,
-              # Entra sign-in logs don't report the underlying auth protocol
-              # (NTLM/Kerberos/etc.); the MFA requirement is carried by is_mfa.
-              auth_protocol_id: 0,
-              auth_protocol: "Unknown",
-              logon_type: ($r.clientAppUsed),
-
-              # --- User (REQUIRED) ---
-              user: {
-                type_id: 1,
-                type: "User",
-                name: ($r.userPrincipalName),
-                uid: ($r.userId),
-                full_name: ($r.userDisplayName),
-                email_addr: ($r.userPrincipalName)
-              },
-
-              # --- Service (satisfies the class at_least_one[service,dst_endpoint]) ---
-              service: {
-                name: ($r.resourceDisplayName),
-                uid: ($r.resourceId)
-              },
-
-              # --- Source endpoint ---
-              src_endpoint: {
-                ip: ($r.ipAddress),
-                location: {
-                  city: ($loc.city),
-                  region: ($loc.state),
-                  country: ($loc.countryOrRegion),
-                  lat: ($loc.geoCoordinates.latitude),
-                  long: ($loc.geoCoordinates.longitude)
-                }
-              },
-
-              # --- Device ---
-              device: {
-                type_id: 0,
-                uid: ($dd.deviceId),
-                name: ($dd.displayName),
-                os: (
-                  if ($dd.operatingSystem // "") != ""
-                  then {
-                    name: $dd.operatingSystem,
-                    type_id: (
-                      ($dd.operatingSystem | ascii_downcase) as $os
-                      | if   ($os | test("windows")) then 100
-                        elif ($os | test("ipados")) then 302
-                        elif ($os | test("ios")) then 301
-                        elif ($os | test("mac")) then 300
-                        elif ($os | test("android")) then 201
-                        elif ($os | test("linux")) then 200
-                        else 0 end
-                    )
-                  }
-                  else null end
-                ),
-                is_compliant: ($dd.isCompliant),
-                is_managed: ($dd.isManaged)
-              },
-
-              # --- Session ---
-              session: {
-                uid: ($r.correlationId),
-                is_remote: true
-              },
-
-              # --- Cloud (Entra ID is an Azure cloud IAM service) ---
-              cloud: {
-                provider: "Microsoft Azure",
-                account: {
-                  uid: ($r.resourceTenantId // $r.homeTenantId),
-                  type: "Azure AD Tenant"
-                }
-              },
-
-              # --- OSINT: the sign-in source address as an observed indicator.
-              #     The Authentication class carries an osint context array;
-              #     populate it with the client IP seen on this event. ---
-              osint: [
-                {
-                  type_id: 1,
-                  value: ($r.ipAddress // "unknown")
-                }
-              ],
-
-              # --- Metadata (REQUIRED) ---
-              metadata: {
-                "profiles": ["cloud", "osint", "host", "security_control"],
-                version: "1.9.0",
-                uid: ($r.id),
-                correlation_uid: ($r.correlationId),
-                original_time: ($r.createdDateTime),
-                product: {
-                  vendor_name: "Microsoft",
-                  name: "Microsoft Entra ID"
-                }
-              },
-
-              # --- Observables ---
-              observables: (
-                [ ( if $r.userPrincipalName != null
-                    then { name: "user.name", type: "User Name", type_id: 4, value: $r.userPrincipalName }
-                    else empty end ),
-                  ( if $r.ipAddress != null
-                    then { name: "src_endpoint.ip", type: "IP Address", type_id: 2, value: $r.ipAddress }
-                    else empty end ) ]
-              ),
-
-              # --- Recommended ---
-              message: (
-                "Sign-in for " + ($r.userPrincipalName // "unknown")
-                + " to " + ($r.resourceDisplayName // "resource")
-                + ( if $ok then " succeeded" else " failed" end )
-              ),
-              risk_level: ($r.riskLevelDuringSignIn),
-
-              # --- Pass-through / audit ---
-              unmapped: {
-                appId: ($r.appId),
-                appDisplayName: ($r.appDisplayName),
-                conditionalAccessStatus: ($r.conditionalAccessStatus),
-                resourceTenantId: ($r.resourceTenantId),
-                homeTenantId: ($r.homeTenantId),
-                isInteractive: ($r.isInteractive)
-              },
-              raw_data: (. | tostring)
-            }
-          # Single shallow prune of top-level nulls; keeps required objects.
-          | walk(
+          # A Log Analytics dynamic column: object/array as-is, or a JSON
+          # string that is parsed; anything unparseable becomes null.
+          def dyn($v):
+            if ($v | type) == "string" then (($v | fromjson?) // null)
+            else $v end;
+          def dobj($v): (dyn($v)) | if type == "object" then . else {} end;
+          def darr($v): (dyn($v)) | if type == "array" then . else [] end;
+          def nonempty($v): if $v == null or $v == "" then null else $v end;
+          def is_email($v): ($v | type) == "string" and ($v | test("^[^@\\s]+@[^@\\s]+$"));
+          def to_int($v):
+            if ($v | type) == "number" then $v
+            elif ($v | type) == "string" and ($v | test("^-?[0-9]+$")) then ($v | tonumber)
+            else null end;
+          def risk_id($v):
+            { "none": 0, "low": 1, "medium": 2, "high": 3 }[($v // "") | ascii_downcase];
+          def os_type_id($os):
+            ($os | ascii_downcase) as $o
+            | if   ($o | test("windows")) then 100
+              elif ($o | test("ipados")) then 302
+              elif ($o | test("ios")) then 301
+              elif ($o | test("mac")) then 300
+              elif ($o | test("android")) then 201
+              elif ($o | test("linux")) then 200
+              else 0 end;
+          # Prune null / "" / {} / [] leaves, bottom-up.
+          def prune:
+            walk(
               if type == "object" then
-                with_entries(select(.value != null and .value != {} and .value != []))
-              elif type == "array" then map(select(. != null))
-              else . end
-            )
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then map(select(. != null and . != "" and . != {}))
+              else . end);
+
+          . as $r
+          | ($r.Type // "") as $table
+          | ( $table == "AuditLogs"
+              or ($table == "" and ($r.InitiatedBy != null or $r.ActivityDisplayName != null)) ) as $is_audit
+          | { provider: "Azure",
+              account: ( ($r.AADTenantId // $r.ResourceTenantId // $r.HomeTenantId) as $tid
+                         | if $tid == null then null
+                           else { uid: $tid, type_id: 6, type: "Azure AD Account" } end ) } as $cloud
+
+          | if $is_audit then
+              # =========================================================
+              # AuditLogs -> API Activity (6003)
+              # =========================================================
+              dobj($r.InitiatedBy) as $ib
+              | ($ib.user // {}) as $iu
+              | ($ib.app // {}) as $ia
+              | ( [ darr($r.AdditionalDetails)[] | select((.key // "") | ascii_downcase == "user-agent") | .value ]
+                  | first // null ) as $ua
+              | ( ($r.AADOperationType // "") | ascii_downcase ) as $optype
+              | ( ($r.OperationName // $r.ActivityDisplayName // "") | ascii_downcase ) as $opname
+              | ( if   $optype == "add" or $optype == "create" then 1
+                  elif $optype == "update" then 3
+                  elif $optype == "delete" then 4
+                  elif $optype != "" then 99
+                  elif ($opname | test("^(add|create|register)\\b")) then 1
+                  elif ($opname | test("^(update|set|change|reset|enable|disable|restore)\\b")) then 3
+                  elif ($opname | test("^(delete|remove|hard delete)\\b")) then 4
+                  else 99 end ) as $act
+              | ( ($r.Result // "") | ascii_downcase ) as $res
+              | ( if $res == "success" then 1
+                  elif ($res == "failure" or $res == "timeout") then 2
+                  else 0 end ) as $sid
+              | ( if ($iu | length) > 0 then
+                    { user: { type_id: 1, type: "User",
+                              uid: $iu.id,
+                              name: ($iu.userPrincipalName // $iu.displayName),
+                              display_name: $iu.displayName,
+                              email_addr: (if is_email($iu.userPrincipalName) then $iu.userPrincipalName else null end) } }
+                  elif ($ia | length) > 0 then
+                    { application: { name: $ia.displayName, uid: $ia.appId },
+                      user: { type_id: 4, type: "Service",
+                              uid: $ia.servicePrincipalId,
+                              name: ($ia.servicePrincipalName // $ia.displayName) } }
+                  else
+                    { application: { name: ($r.Identity // $r.LoggedByService // "unknown") } }
+                  end ) as $actor
+              | {
+                  category_uid: 6,
+                  category_name: "Application Activity",
+                  class_uid: 6003,
+                  class_name: "API Activity",
+                  activity_id: $act,
+                  activity_name: ({ "1": "Create", "3": "Update", "4": "Delete" }[$act | tostring]
+                                  // nonempty($r.AADOperationType) // "Other"),
+                  type_uid: (6003 * 100 + $act),
+                  type_name: ("API Activity: " + ({ "1": "Create", "3": "Update", "4": "Delete" }[$act | tostring] // "Other")),
+                  severity_id: (if $sid == 2 then 3 else 1 end),
+                  status_id: $sid,
+                  status: ({ "0": "Unknown", "1": "Success", "2": "Failure" }[$sid | tostring]),
+                  status_code: nonempty($r.ResultType),
+                  status_detail: (nonempty($r.ResultReason) // nonempty($r.ResultDescription)),
+
+                  time: to_epoch_ms($r.ActivityDateTime // $r.TimeGenerated),
+                  duration: $r.DurationMs,
+
+                  actor: $actor,
+                  api: {
+                    operation: ($r.OperationName // $r.ActivityDisplayName // "unknown"),
+                    version: $r.OperationVersion,
+                    service: { name: $r.LoggedByService },
+                    group: { name: $r.Category },
+                    request: (if $r.CorrelationId != null then { uid: $r.CorrelationId } else null end)
+                  },
+                  # The initiator's address when a user acted; an app-initiated
+                  # change carries no IP, so the endpoint is named for the app.
+                  src_endpoint: (
+                    if $iu.ipAddress != null then { ip: $iu.ipAddress }
+                    else { name: ($ia.displayName // $iu.userPrincipalName // $r.Identity // "unknown") } end ),
+                  dst_endpoint: { svc_name: $r.LoggedByService },
+                  http_request: (if $ua != null then { user_agent: $ua } else null end),
+                  resources: [
+                    darr($r.TargetResources)[]
+                    | select(.id != null or .displayName != null or .userPrincipalName != null)
+                    | { uid: .id,
+                        name: (.displayName // .userPrincipalName),
+                        type: .type,
+                        data: ( { userPrincipalName: .userPrincipalName,
+                                  groupType: .groupType,
+                                  modifiedProperties: .modifiedProperties,
+                                  administrativeUnits: .administrativeUnits }
+                                | with_entries(select(.value != null and .value != [])) ) }
+                  ],
+                  cloud: $cloud,
+                  message: ( ($r.ActivityDisplayName // $r.OperationName // "Directory operation")
+                             + " by " + ($actor.user.name // $actor.application.name // "unknown")
+                             + " (" + ($r.Result // "unknown") + ")" ),
+
+                  metadata: {
+                    profiles: ["cloud"],
+                    version: "1.9.0",
+                    uid: $r.Id,
+                    correlation_uid: $r.CorrelationId,
+                    original_time: $r.ActivityDateTime,
+                    logged_time: to_epoch_ms($r.TimeGenerated),
+                    log_name: ($r.Type // "AuditLogs"),
+                    log_provider: "Azure Log Analytics",
+                    tenant_uid: $r.AADTenantId,
+                    product: {
+                      vendor_name: "Microsoft",
+                      name: "Microsoft Entra ID",
+                      feature: { name: $r.LoggedByService }
+                    }
+                  },
+
+                  observables: [
+                    ( if $actor.user.name != null then { name: "actor.user.name", type: "User Name", type_id: 4, value: $actor.user.name } else empty end ),
+                    ( if $actor.user.email_addr != null then { name: "actor.user.email_addr", type: "Email Address", type_id: 5, value: $actor.user.email_addr } else empty end ),
+                    ( if $iu.ipAddress != null then { name: "src_endpoint.ip", type: "IP Address", type_id: 2, value: $iu.ipAddress } else empty end )
+                  ],
+
+                  # Columns with no OCSF home (mapped columns are removed).
+                  unmapped: ( $r | del(.ActivityDateTime, .TimeGenerated, .DurationMs, .InitiatedBy,
+                      .OperationName, .ActivityDisplayName, .OperationVersion, .LoggedByService, .Category,
+                      .CorrelationId, .Id, .Type, .AADTenantId, .Result, .ResultType, .ResultReason,
+                      .ResultDescription, .TargetResources, .AADOperationType) ),
+                  raw_data: ($r | tostring)
+                }
+
+            else
+              # =========================================================
+              # Sign-in tables -> Authentication (3002), Logon
+              # =========================================================
+              dobj($r.Status) as $st
+              | dobj($r.LocationDetails) as $loc
+              | dobj($r.DeviceDetail) as $dd
+              # Success = Status.errorCode 0; tables without Status (service
+              # principal / managed identity) carry the same code in ResultType.
+              | ( to_int($st.errorCode) // to_int($r.ResultType)
+                  // ( ($r.ResultType // "") | ascii_downcase
+                       | if . == "success" then 0 elif . == "failure" then -1 else null end ) ) as $code
+              | ( if $code == null then 0 elif $code == 0 then 1 else 2 end ) as $sid
+              | ( $table == "AADServicePrincipalSignInLogs" or $table == "AADManagedIdentitySignInLogs"
+                  or ($r.UserPrincipalName == null and $r.UserId == null and $r.ServicePrincipalId != null) ) as $is_sp
+              | ( ($r.AuthenticationProtocol // "") | ascii_downcase ) as $proto
+              | ( if   $proto == "oauth2" or $proto == "ropc" or $proto == "devicecode" then 6
+                  elif $proto == "saml20" then 5
+                  elif $proto == "" or $proto == "none" or $proto == "unknownfuturevalue" then 0
+                  else 99 end ) as $proto_id
+              | ( if ($r.IsInteractive == true) then 2 else 99 end ) as $logon_id
+              | ( if   $table == "AADServicePrincipalSignInLogs" then "Service Principal"
+                  elif $table == "AADManagedIdentitySignInLogs" then "Managed Identity"
+                  elif $logon_id == 2 then "Interactive"
+                  else "Non-Interactive" end ) as $logon
+              | ( if $is_sp then
+                    { type_id: 4, type: "Service",
+                      uid: ($r.ServicePrincipalId // $r.AppId),
+                      name: ($r.ServicePrincipalName // $r.Identity // $r.AppId) }
+                  else
+                    { type_id: 1, type: "User",
+                      uid: $r.UserId,
+                      name: ($r.UserPrincipalName // $r.SignInIdentifier // $r.AlternateSignInName // $r.Identity // "unknown"),
+                      full_name: $r.UserDisplayName,
+                      display_name: $r.UserDisplayName,
+                      email_addr: (if is_email($r.UserPrincipalName) then $r.UserPrincipalName else null end),
+                      org: { uid: $r.HomeTenantId, name: $r.HomeTenantName } }
+                  end ) as $user
+              | ( { city: $loc.city, region: $loc.state, country: $loc.countryOrRegion,
+                    lat: $loc.geoCoordinates.latitude, long: $loc.geoCoordinates.longitude }
+                  | with_entries(select(.value != null and .value != "")) ) as $geo
+              | ( if ($dd.deviceId // "") != "" or ($dd.displayName // "") != ""
+                     or ($dd.operatingSystem // "") != "" then
+                    { type_id: 0,
+                      uid: nonempty($dd.deviceId),
+                      name: nonempty($dd.displayName),
+                      # Unregistered devices have no id/name; the sign-in IP
+                      # identifies the device as seen by Entra.
+                      ip: (if ($dd.deviceId // "") == "" and ($dd.displayName // "") == "" then $r.IPAddress else null end),
+                      os: (if ($dd.operatingSystem // "") != "" then { name: $dd.operatingSystem, type_id: os_type_id($dd.operatingSystem) } else null end),
+                      is_compliant: $dd.isCompliant,
+                      is_managed: $dd.isManaged }
+                    | if .uid == null and .name == null and .ip == null then null else . end
+                  else null end ) as $device
+              | [ darr($r.AuthenticationDetails)[]
+                  | select(.succeeded == true and (.authenticationMethod // "") != ""
+                           and .authenticationMethod != "Previously satisfied")
+                  | .authenticationMethod as $m | ($m | ascii_downcase) as $lm
+                  | ( if   ($lm | test("password")) then 11
+                      elif ($lm | test("text message|sms")) then 1
+                      elif ($lm | test("phone call")) then 3
+                      elif ($lm | test("notification")) then 5
+                      elif ($lm | test("oath|verification code|otp")) then 7
+                      elif ($lm | test("fido|passkey|security key")) then 10
+                      elif ($lm | test("email")) then 8
+                      else 99 end ) as $fid
+                  | { factor_type_id: $fid,
+                      factor_type: ({ "1": "SMS", "3": "Phone Call", "5": "Push Notification", "7": "OTP",
+                                      "8": "Email", "10": "WebAuthn", "11": "Password" }[$fid | tostring] // $m) } ] as $factors
+              | [ darr($r.ConditionalAccessPolicies)[]
+                  | select((.result // "") != "notEnabled" and (.result // "") != "notApplied")
+                  | { decision: .result,
+                      policy: { uid: .id, name: .displayName, is_applied: true } } ] as $cap
+              | {
+                  category_uid: 3,
+                  category_name: "Identity & Access Management",
+                  class_uid: 3002,
+                  class_name: "Authentication",
+                  activity_id: 1,
+                  activity_name: "Logon",
+                  type_uid: 300201,
+                  type_name: "Authentication: Logon",
+
+                  # A failed sign-in is surfaced as Medium for detection.
+                  severity_id: (if $sid == 2 then 3 else 1 end),
+                  status_id: $sid,
+                  status: ({ "0": "Unknown", "1": "Success", "2": "Failure" }[$sid | tostring]),
+                  status_code: (if $code != null and $code >= 0 then ($code | tostring) else nonempty($r.ResultType) end),
+                  status_detail: (nonempty($st.failureReason) // nonempty($r.ResultDescription) // nonempty($st.additionalDetails)),
+
+                  time: to_epoch_ms($r.CreatedDateTime // $r.TimeGenerated),
+                  duration: $r.DurationMs,
+
+                  is_mfa: (if $is_sp then null else (($r.AuthenticationRequirement // "") == "multiFactorAuthentication") end),
+                  auth_protocol_id: $proto_id,
+                  auth_protocol: (if $proto_id == 99 then $r.AuthenticationProtocol
+                                  else { "0": "Unknown", "5": "SAML", "6": "OAUTH 2.0" }[$proto_id | tostring] end),
+                  auth_factors: $factors,
+                  logon_type_id: $logon_id,
+                  logon_type: $logon,
+                  risk_level_id: risk_id($r.RiskLevelDuringSignIn),
+                  risk_level: ({ "0": "Info", "1": "Low", "2": "Medium", "3": "High" }[(risk_id($r.RiskLevelDuringSignIn) // -1) | tostring]),
+                  risk_details: nonempty($r.RiskDetail),
+
+                  user: $user,
+                  # The client application that requested the token.
+                  actor: { application: { name: $r.AppDisplayName, uid: $r.AppId } },
+                  # The resource signed in to (satisfies at_least_one[service,dst_endpoint]).
+                  service: {
+                    name: ($r.ResourceDisplayName // "Microsoft Entra ID"),
+                    uid: ($r.ResourceIdentity // $r.ResourceId // $r.ResourceServicePrincipalId)
+                  },
+                  src_endpoint: {
+                    ip: $r.IPAddress,
+                    location: (if ($geo | has("city") or has("region") or has("country")) then $geo else null end),
+                    autonomous_system: (if to_int($r.AutonomousSystemNumber) != null then { number: to_int($r.AutonomousSystemNumber) } else null end)
+                  },
+                  device: $device,
+                  http_request: (if $r.UserAgent != null then { user_agent: $r.UserAgent } else null end),
+                  session: {
+                    uid: $r.SessionId,
+                    issuer: $r.TokenIssuerName,
+                    uid_alt: $r.UniqueTokenIdentifier
+                  },
+                  authorizations: $cap,
+                  cloud: $cloud,
+
+                  message: (
+                    ($logon + " sign-in by " + ($user.name // "unknown")
+                     + " to " + ($r.ResourceDisplayName // "resource")
+                     + (if $r.AppDisplayName != null then " via " + $r.AppDisplayName else "" end))
+                    + ({ "0": " (result unknown)", "1": " succeeded", "2": " failed" }[$sid | tostring])
+                  ),
+
+                  metadata: {
+                    profiles: ["cloud"],
+                    version: "1.9.0",
+                    uid: $r.Id,
+                    correlation_uid: $r.CorrelationId,
+                    original_time: $r.CreatedDateTime,
+                    logged_time: to_epoch_ms($r.TimeGenerated),
+                    log_name: ($r.Type // "SigninLogs"),
+                    log_provider: "Azure Log Analytics",
+                    tenant_uid: ($r.AADTenantId // $r.ResourceTenantId // $r.HomeTenantId),
+                    product: { vendor_name: "Microsoft", name: "Microsoft Entra ID" }
+                  },
+
+                  observables: [
+                    ( if $user.name != null and $user.name != "unknown" then { name: "user.name", type: "User Name", type_id: 4, value: $user.name } else empty end ),
+                    ( if $user.email_addr != null then { name: "user.email_addr", type: "Email Address", type_id: 5, value: $user.email_addr } else empty end ),
+                    ( if $r.IPAddress != null then { name: "src_endpoint.ip", type: "IP Address", type_id: 2, value: $r.IPAddress } else empty end )
+                  ],
+
+                  # Columns with no OCSF home (mapped columns are removed).
+                  unmapped: (
+                    ( $r | del(.CreatedDateTime, .TimeGenerated, .DurationMs, .Status, .ResultType,
+                        .ResultDescription, .AuthenticationRequirement, .AuthenticationProtocol,
+                        .AuthenticationDetails, .IsInteractive, .RiskLevelDuringSignIn, .RiskDetail,
+                        .UserId, .UserPrincipalName, .UserDisplayName, .HomeTenantId, .HomeTenantName,
+                        .ServicePrincipalId, .ServicePrincipalName, .AppDisplayName, .AppId,
+                        .ResourceDisplayName, .ResourceIdentity, .ResourceId, .IPAddress, .LocationDetails,
+                        .AutonomousSystemNumber, .UserAgent, .SessionId, .TokenIssuerName,
+                        .UniqueTokenIdentifier, .ConditionalAccessPolicies, .Id, .CorrelationId, .Type,
+                        .AADTenantId) )
+                    + { DeviceDetail: ($dd | del(.deviceId, .displayName, .operatingSystem, .isCompliant, .isManaged)),
+                        Status: ($st | del(.errorCode, .failureReason)) } ),
+                  raw_data: ($r | tostring)
+                }
+            end
+          | prune
+          # Declare the profiles whose attributes this event carries: device
+          # belongs to the host profile; policy decisions and risk to the
+          # security_control profile.
+          | .metadata.profiles = ( ["cloud"]
+              + (if has("device") then ["host"] else [] end)
+              + (if (has("authorizations") or has("risk_level_id") or has("risk_level") or has("risk_details"))
+                 then ["security_control"] else [] end) )

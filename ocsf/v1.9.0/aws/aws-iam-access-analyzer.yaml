@@ -1,5 +1,5 @@
 name: "AWS IAM Access Analyzer Findings to OCSF v1.9.0"
-description: "Transforms AWS IAM Access Analyzer external-access finding records into the OCSF v1.9.0 IAM Analysis Finding class (class_uid 2008)."
+description: "Transforms AWS IAM Access Analyzer finding summaries (external, internal, and unused access) into the OCSF v1.9.0 IAM Analysis Finding class (class_uid 2008)."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -20,27 +20,45 @@ config:
           # =================================================================
           # AWS IAM Access Analyzer -> OCSF v1.9.0 IAM Analysis Finding (2008)
           #
-          # Input: ONE Access Analyzer Finding record per invocation, as
-          # returned by ListFindings / GetFinding and emitted by the Monad
-          # `aws-iam-access-analyzer` input connector.
+          # Input: ONE finding per invocation, as emitted by the Monad
+          # `aws-iam-access-analyzer` input connector: a json.Marshal of the
+          # AWS SDK for Go v2 accessanalyzer types.FindingSummaryV2
+          # (ListFindingsV2). The SDK structs carry no json tags, so keys are
+          # PascalCase and the record holds only:
+          #   Id, AnalyzedAt, CreatedAt, UpdatedAt (RFC 3339, ns precision),
+          #   ResourceOwnerAccount, ResourceType, Status, Error,
+          #   FindingType, Resource (ARN).
+          # A summary has no principal, action, condition, isPublic, or
+          # sources — those exist only on GetFindingV2 details, which the
+          # connector does not fetch. A camelCase record is normalized to
+          # PascalCase first.
           #
           # Field mappings:
-          #   .analyzedAt / .updatedAt / .createdAt -> time
-          #   .id                    -> finding_info.uid, metadata.uid
-          #   .resource              -> osint.value, resource ARN references
-          #   .status                -> activity_id / status / status_id
-          #   .isPublic              -> severity_id
-          #   .action[]              -> access_analysis_result.granted_privileges
-          #   .principal             -> access_analysis_result.accessors
-          #   .resourceOwnerAccount  -> cloud.account.uid
-          #   .analyzerArn (region)  -> cloud.region
-          # The IAM Analysis Finding class requires at_least_one of
-          # access_analysis_result / permission_analysis_results / ... ; this
-          # is a resource-centric (who-can-access) finding, so it populates
-          # access_analysis_result.
+          #   AnalyzedAt / UpdatedAt / CreatedAt -> time (first non-null)
+          #   Id                       -> finding_info.uid, metadata.uid
+          #   FindingType              -> finding_info.types / title, severity_id,
+          #                               metadata.product.feature.name, and which
+          #                               analysis object is emitted (below)
+          #   Status                   -> status_code / status_id / activity_id
+          #   Error                    -> status_detail / message
+          #   Resource / ResourceType  -> resources[0].uid / type, finding_info.title
+          #   Resource ARN partition/region -> cloud.cloud_partition / cloud.region
+          #   ResourceOwnerAccount     -> cloud.account.uid, resources[0].owner
+          #
+          # The class requires at_least_one of access_analysis_result /
+          # permission_analysis_results / identity_activity_metrics /
+          # applications. Access findings (ExternalAccess, InternalAccess) are
+          # resource-centric, so they carry access_analysis_result with
+          # access_type from FindingType and an EMPTY accessors list (the
+          # summary does not name the principal). Unused-access findings are
+          # identity-centric and carry an empty permission_analysis_results
+          # entry. Nothing is invented to fill them.
           # =================================================================
 
-
+          # OCSF timestamp_t is epoch MILLISECONDS. Use this helper for every
+          # time / *_time field; it accepts epoch s/ms/us/ns numbers, numeric
+          # strings, {seconds,nanos}, and ISO 8601 with any UTC offset, and
+          # returns null (not an error) on unparseable input.
           def to_epoch_ms($ts):
             def _num_ms($n):
               if   $n >= 1e17 then ($n / 1000000 | floor)
@@ -73,121 +91,138 @@ config:
           def prune:
             walk(
               if type == "object" then
-                with_entries(select(.value != null and .value != {} and .value != []))
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
               elif type == "array" then
                 map(select(. != null))
               else . end
             );
 
-          . as $r
-          | ( $r.status // "ACTIVE" ) as $status
-          # A resolved/archived finding is a Close; an unchanged create time is
-          # a Create; anything else is an Update.
-          | ( if ($status == "RESOLVED" or $status == "ARCHIVED") then 3
-              elif ($r.createdAt // "") == ($r.updatedAt // "x") then 1
-              else 2 end ) as $activity_id
-          # Public exposure is High; scoped external access is Medium; a
-          # closed finding drops to Low.
-          | ( if ($status == "RESOLVED" or $status == "ARCHIVED") then 2
-              elif ($r.isPublic // false) == true then 4
-              else 3 end ) as $severity_id
+          # camelCase -> PascalCase keys (only when the record is not already
+          # in the connector's PascalCase shape).
+          def pascal_keys:
+            with_entries(.key |= ((.[0:1] | ascii_upcase) + .[1:]));
+
+          (if (has("Id") | not) and has("id") then pascal_keys else . end) as $r
+          | ($r.Status // "") as $status
+          | ($r.FindingType // "") as $ftype
+          | (to_epoch_ms($r.CreatedAt)) as $created
+          | (to_epoch_ms($r.UpdatedAt)) as $updated
+          | ($status == "RESOLVED" or $status == "ARCHIVED") as $closed
+
+          # A resolved/archived finding is a Close; a finding whose update
+          # time equals its create time is a Create; anything else an Update.
+          | ( if $closed then 3
+              elif ($created != null and $updated != null and $updated > $created) then 2
+              else 1 end ) as $activity_id
+
+          # The summary carries no severity. Derive one from the finding
+          # type: external access Medium, internal / unused access Low; a
+          # closed finding is Informational; an unknown type is Unknown.
+          | ( if $closed then 1
+              elif $ftype == "ExternalAccess" then 3
+              elif $ftype == "InternalAccess" or ($ftype | startswith("Unused")) then 2
+              else 0 end ) as $severity_id
+
           | ( { "ACTIVE": 1, "ARCHIVED": 5, "RESOLVED": 4 }[$status] // 0 ) as $status_id
-          # Analyzer ARN carries the region (arn:aws:access-analyzer:REGION:...);
-          # the resource ARN for S3 buckets has none, so prefer the analyzer.
-          | ( ($r.analyzerArn // "") | split(":") ) as $aarn
-          | ( if ($aarn | length) > 3 and ($aarn[3] != "") then $aarn[3] else null end ) as $region
-          | ( [ ($r.principal // {}) | to_entries[] | { "name": .value, "type": .key } ] ) as $accessors
+
+          | ( { "ExternalAccess": "External access",
+                "InternalAccess": "Internal access",
+                "UnusedIAMRole": "Unused IAM role",
+                "UnusedIAMUserAccessKey": "Unused IAM user access key",
+                "UnusedIAMUserPassword": "Unused IAM user password",
+                "UnusedPermission": "Unused permissions" }[$ftype] // (if $ftype != "" then $ftype else "Access Analyzer finding" end) ) as $label
+
+          | ( if $ftype == "ExternalAccess" then "External Access Analyzer"
+              elif $ftype == "InternalAccess" then "Internal Access Analyzer"
+              elif ($ftype | startswith("Unused")) then "Unused Access Analyzer"
+              else null end ) as $feature
+
+          # arn:<partition>:<service>:<region>:<account>:<resource>
+          | ( ($r.Resource // "") | split(":") ) as $arn
+          | ( if ($arn | length) > 3 and $arn[0] == "arn" then $arn[1] else null end ) as $partition
+          | ( if ($arn | length) > 3 and $arn[0] == "arn" and $arn[3] != "" then $arn[3] else null end ) as $region
 
           | {
               "category_uid": 2,
               "class_uid": 2008,
-              "type_uid": (200800 + $activity_id),
+              "type_uid": (2008 * 100 + $activity_id),
               "activity_id": $activity_id,
               "severity_id": $severity_id,
 
-              "time": (to_epoch_ms($r.analyzedAt) // to_epoch_ms($r.updatedAt) // to_epoch_ms($r.createdAt)),
+              "time": (to_epoch_ms($r.AnalyzedAt) // $updated // $created // (now * 1000 | floor)),
 
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": ["cloud"],
                 "version": "1.9.0",
-                "uid": $r.id,
+                "uid": $r.Id,
                 "product": {
                   "vendor_name": "AWS",
-                  "name": "IAM Access Analyzer",
-                  "feature": { "name": "External Access Analyzer" }
+                  "name": "AWS IAM Access Analyzer",
+                  "feature": (if $feature != null then { "name": $feature } else null end)
                 }
               },
 
               "cloud": {
                 "provider": "AWS",
                 "region": $region,
-                "account": { "uid": $r.resourceOwnerAccount, "type_id": 10 }
+                "cloud_partition": $partition,
+                "account": { "uid": $r.ResourceOwnerAccount, "type_id": 10 }
               },
 
-              # The class requires an osint array; the analyzed resource ARN
-              # is the indicator this finding is about.
-              "osint": [{
-                "value": ($r.resource // $r.id),
-                "type_id": 99,
-                "type": "Resource ARN"
-              }],
-
               "finding_info": {
-                "uid": $r.id,
-                "title": ("External access to " + ($r.resourceType // "resource") + " " + ($r.resource // $r.id)),
-                "desc": (if ($r.isPublic // false) == true
-                         then "Access Analyzer found a policy granting public access to this resource."
-                         else "Access Analyzer found a policy granting an external principal access to this resource."
-                         end),
-                "created_time": to_epoch_ms($r.createdAt),
-                "modified_time": to_epoch_ms($r.updatedAt),
-                "first_seen_time": to_epoch_ms($r.createdAt),
-                "last_seen_time": to_epoch_ms($r.analyzedAt),
-                "types": [ ($r.resourceType // null) ],
-                "src_url": null,
+                "uid": $r.Id,
+                "title": ($label + ": " + ($r.Resource // $r.ResourceType // $r.Id // "unknown resource")),
+                "desc": ($label + " finding for "
+                         + (if $r.ResourceType != null then $r.ResourceType + " " else "" end)
+                         + ($r.Resource // "an unidentified resource")
+                         + (if $r.ResourceOwnerAccount != null then " in account " + $r.ResourceOwnerAccount else "" end)
+                         + "."),
+                "types": (if $ftype != "" then [ $ftype ] else null end),
+                "created_time": $created,
+                "modified_time": $updated,
+                "first_seen_time": $created,
+                "last_seen_time": to_epoch_ms($r.AnalyzedAt),
                 "analytic": {
+                  "name": ("IAM Access Analyzer" + (if $ftype != "" then " " + $ftype else "" end)),
                   "type_id": 1,
-                  "name": "IAM Access Analyzer",
                   "type": "Rule"
                 }
               },
 
-              "access_analysis_result": {
-                "access_type": (if ($r.isPublic // false) == true then "PUBLIC_ACCESS" else "EXTERNAL_ACCESS" end),
-                "access_level": (if ($r.isPublic // false) == true then "PUBLIC" else "EXTERNAL" end),
-                "granted_privileges": ($r.action // null),
-                "accessors": (if ($accessors | length) > 0 then $accessors else null end),
-                "condition_keys": (if (($r.condition // {}) | length) > 0
-                                   then [ ($r.condition | to_entries[] | { "name": .key, "value": .value }) ]
-                                   else null end)
-              },
-
-              "status": $status,
+              # Vendor value in status_code; OCSF `status` must match the
+              # status_id caption, so it is left to consumers to derive.
+              "status_code": (if $status != "" then $status else null end),
               "status_id": $status_id,
-              "message": (if ($r.error // null) != null
-                          then ("Access Analyzer finding error: " + $r.error)
-                          else ("External access finding for " + ($r.resource // $r.id)) end),
+              "status_detail": $r.Error,
+              "message": (if $r.Error != null
+                          then ("Access Analyzer finding error: " + $r.Error)
+                          else ($label + " finding for " + ($r.Resource // $r.ResourceType // "resource")) end),
 
-              "resources": [
+              "resources": (if $r.Resource != null then [
                 {
-                  "uid": $r.resource,
-                  "type": $r.resourceType,
-                  "cloud_partition": "aws",
-                  "owner": { "account": { "uid": $r.resourceOwnerAccount, "type_id": 10 } }
+                  "uid": $r.Resource,
+                  "type": $r.ResourceType,
+                  "region": $region,
+                  "cloud_partition": $partition,
+                  "owner": { "account": { "uid": $r.ResourceOwnerAccount, "type_id": 10 } }
                 }
-              ],
+              ] else null end),
 
               "observables": [
-                { "name": "finding_info.uid", "type_id": 8, "value": $r.id },
-                { "name": "osint.value", "type_id": 99, "value": $r.resource }
+                (if $r.Resource != null then { "name": "resources.uid", "type_id": 10, "value": $r.Resource } else empty end),
+                (if $r.ResourceOwnerAccount != null then { "name": "cloud.account.uid", "type_id": 35, "value": $r.ResourceOwnerAccount } else empty end)
               ],
 
-              "unmapped": {
-                "sources": $r.sources,
-                "resourceControlPolicyRestriction": $r.resourceControlPolicyRestriction,
-                "analyzerArn": $r.analyzerArn
-              },
-
-              "raw_data": ($r | tostring)
+              "raw_data": (. | tostring)
             }
           | prune
+          # Satisfy the class at_least_one with the analysis object matching
+          # the finding type (added after prune so the empty lists survive).
+          | if ($ftype | startswith("Unused"))
+            then .permission_analysis_results = [ {} ]
+            else .access_analysis_result = (
+                   { "accessors": [] }
+                   + (if $ftype == "ExternalAccess" then { "access_type": "External" }
+                      elif $ftype == "InternalAccess" then { "access_type": "Internal" }
+                      else {} end) )
+            end

@@ -55,8 +55,13 @@ config:
             else null end;
 
           . as $r
-          | ($r.monthlyActiveUserTimeseries.countInfo[-1].organization
-             // $r.weeklyActiveUserTimeseries.countInfo[-1].organization) as $org
+          # CountInfo names its aggregation unit `org` (department or
+          # company); "" means unset, so treat it as absent.
+          | ([ $r.monthlyActiveUserTimeseries.countInfo[-1].org,
+               $r.weeklyActiveUserTimeseries.countInfo[-1].org ]
+             | map(select(. != null and . != "")) | first) as $org
+          # lastUpdatedTs is unix SECONDS; ingest time only when it is absent.
+          | (to_epoch_ms($r.lastUpdatedTs) // (now * 1000 | floor)) as $t
           | {
               # --- Classification (REQUIRED) ---
               "category_uid": 6,
@@ -68,7 +73,7 @@ config:
               "status_id":    1,
 
               # --- Time (REQUIRED) ---
-              "time": to_epoch_ms($r.lastUpdatedTs),
+              "time": $t,
 
               # --- Metadata (REQUIRED: product + version) ---
               "metadata": {

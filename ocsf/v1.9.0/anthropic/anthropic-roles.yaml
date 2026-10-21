@@ -1,5 +1,5 @@
 name: "Anthropic Organization Roles to OCSF v1.9.0"
-description: "Transforms Anthropic Admin API organization user/role records into the OCSF v1.9.0 User Inventory Info (5003) class."
+description: "Transforms Anthropic Compliance API organization role records into the OCSF v1.9.0 Cloud Resources Inventory Info (5023) class, one role resource per event."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -10,6 +10,7 @@ tags:
   - "ocsf"
   - "anthropic"
   - "discovery"
+  - "inventory"
 config:
   operations:
     - operation: "jq"
@@ -17,14 +18,20 @@ config:
         key: ""
         query: |
           # ---------------------------------------------------------------
-          # OCSF User Inventory Info (class_uid=5003) — v1.9.0
-          # Input: one Anthropic Admin API organization user record per
-          # invocation (GET /v1/organizations/users):
-          #   { id, added_at, email, name, role, type }
-          # activity_id=2 (Collect): user inventory proactively collected
-          # from the Anthropic Admin API.
+          # OCSF Cloud Resources Inventory Info (class_uid=5023) — v1.9.0
+          # Input: one Anthropic organization role per invocation, as emitted
+          # by the `anthropic-roles` input connector from the Compliance API
+          # (GET /v1/compliance/organizations/{org_uuid}/roles), with the
+          # connector-added organization_uuid:
+          #   { id, name, description, created_at, updated_at,
+          #     organization_uuid }
+          # The connector re-emits the full role list every run, so each
+          # event is an inventory snapshot of one role definition (a SaaS
+          # resource of type "role"), not a user or a membership change.
+          # activity_id=2 (Collect): proactively collected from the API.
+          # The Anthropic organization is the cloud org context, so the
+          # cloud profile is declared and cloud.org carries its uuid.
           # ---------------------------------------------------------------
-
 
           def to_epoch_ms($ts):
             def _num_ms($n):
@@ -56,67 +63,59 @@ config:
             else null end;
 
           . as $r
-          | ( $r.role // "" ) as $role
-          # Admin-tier org roles map to the OCSF Admin user type.
-          | ( if ($role | IN("admin","owner","primary_owner","membership_admin"))
-              then 2 else 1 end ) as $utype_id
-
+          | (to_epoch_ms($r.updated_at // $r.created_at)) as $t
           | {
               # --- Classification (REQUIRED) ---
               "category_uid": 5,
-              "class_uid":    5003,
+              "class_uid":    5023,
               "activity_id":  2,
-              "type_uid":     500302,
+              "type_uid":     (5023 * 100 + 2),
               "severity_id":  1,
+              "status_id":    1,
 
-              # --- Time (REQUIRED) — when the user joined the org ---
-              "time": to_epoch_ms($r.added_at),
+              # --- Time (REQUIRED) — last change to the role definition;
+              # ingest time only when the record carries no timestamp ---
+              "time": ($t // (now * 1000 | floor)),
 
               # --- Metadata (REQUIRED) ---
               "metadata": {
-                "version": "1.9.0",
-                "profiles": [ "cloud", "osint" ],
+                "version":  "1.9.0",
+                "profiles": [ "cloud" ],
                 "product": {
                   "vendor_name": "Anthropic",
-                  "name": "Anthropic Admin API"
+                  "name": "Anthropic Compliance API"
                 }
               },
 
-              # --- User (REQUIRED) ---
-              "user": {
-                "name":       ($r.email // $r.name),
-                "uid":        $r.id,
-                "full_name":  $r.name,
-                "email_addr": $r.email,
-                "type_id":    $utype_id,
-                "type":       (if $utype_id == 2 then "Admin" else "User" end),
-                # Organization role captured as a group membership.
-                "groups": [ { "name": $role, "type": "Organization Role" } ]
+              # --- Cloud (cloud profile) — the Anthropic organization ---
+              "cloud": {
+                "provider": "Anthropic",
+                "org": (if $r.organization_uuid != null
+                        then { "uid": $r.organization_uuid } else null end)
               },
 
-              # --- OSINT (REQUIRED by class) — the user email as an indicator ---
-              "osint": [ {
-                "value":   $r.email,
-                "type_id": 9
+              # --- The inventoried role (satisfies at_least_one) ---
+              "resources": [ {
+                "uid":           $r.id,
+                "name":          $r.name,
+                "type":          "role",
+                "provider":      "Anthropic",
+                "created_time":  to_epoch_ms($r.created_at),
+                "modified_time": to_epoch_ms($r.updated_at),
+                "data":          (if ($r.description // "") != ""
+                                  then { "description": $r.description } else null end)
               } ],
 
-              # --- Cloud (REQUIRED by class) — Anthropic SaaS environment ---
-              "cloud": {
-                "provider": "Anthropic"
-              },
+              "message": ("Anthropic organization role " + ($r.name // $r.id // "unknown")
+                          + (if $r.organization_uuid != null then " in organization " + $r.organization_uuid else "" end)),
 
-              # --- Recommended ---
-              "status_id": 1,
-              "message":   (($r.name // $r.email // "user") + " has organization role " + $role),
-
-              "observables": [
-                { "name": "user.email_addr", "type_id": 5, "value": $r.email },
-                { "name": "user.uid",        "type_id": 31, "value": $r.id }
-              ],
+              "observables": (
+                  (if $r.id   != null then [ { "name": "resources.uid",  "type_id": 10, "value": $r.id } ] else [] end)
+                + (if $r.name != null then [ { "name": "resources.name", "type_id": 38, "value": $r.name } ] else [] end)),
 
               # --- Original record for audit ---
-              "unmapped": { "role": $role, "type": $r.type },
               "raw_data": ($r | tostring)
             }
-          # Drop null/empty leaves while keeping required objects populated.
+          # Drop null/empty leaves; cloud.provider and the role resource keep
+          # the required objects populated.
           | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != [] and .value != {})) else . end )

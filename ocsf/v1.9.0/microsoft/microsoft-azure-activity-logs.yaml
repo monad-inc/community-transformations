@@ -64,15 +64,15 @@ config:
             else $f end;
 
           . as $r
-          | ( $r.identity.claims // {} ) as $claims
+          | ( $r.identity.claims // $r.claims // {} ) as $claims
           | ( strv($r.operationName) // "" ) as $op
           | ( $op | ascii_downcase ) as $opl
-          | ( strv($r.resultType) // $r.status // "" ) as $result
+          | ( strv($r.resultType) // strv($r.status) // "" ) as $result
           | ( $r.caller
               // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]
               // $claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"] ) as $caller
           | ( $claims["http://schemas.microsoft.com/identity/claims/objectidentifier"] ) as $caller_uid
-          | ( $r.callerIpAddress // $claims.ipaddr ) as $caller_ip
+          | ( $r.callerIpAddress // $r.httpRequest.clientIpAddress // $claims.ipaddr ) as $caller_ip
 
           # ---- activity_id (API Activity: 1 Create, 2 Read, 3 Update,
           #      4 Delete, 99 Other, 0 Unknown) --------------------------
@@ -146,12 +146,16 @@ config:
               status_detail: (strv($r.resultSignature)),
               message: ($r.properties.message // $op),
 
+              # resource_details needs name or uid; the REST EventData may omit
+              # resourceId, so fall back to the authorization scope.
               resources: [
-                { uid: $r.resourceId, type: "azure-resource" }
+                ($r.resourceId // $r.authorization.scope) as $rid
+                | select($rid != null)
+                | { uid: $rid, type: (strv($r.resourceType) // "azure-resource") }
               ],
 
               unmapped: {
-                category: $r.category,
+                category: strv($r.category),
                 correlationId: $r.correlationId,
                 tenantId: $r.tenantId,
                 level: $r.level

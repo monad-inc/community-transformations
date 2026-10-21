@@ -1,8 +1,9 @@
-name: "Monad Organization Logs to OCSF"
-description: "Transforms Monad Organization Logs into OCSF Schema"
+name: "Monad Organization Logs to OCSF v1.1.0"
+description: "Transforms Monad Organization Logs into OCSF v1.1.0 Schema"
 author: "Monad"
 contributors:
   - "https://github.com/Credgate"
+  - "https://github.com/behobu"
 inputs:
   - "monad-logs"
 tags:
@@ -46,6 +47,18 @@ config:
               end
             else null end;
 
+          # API log v1.1.0 (current producer) nests request/response/actor;
+          # flatten it to the legacy v1.0.0 field names this mapping reads.
+          (if (.request | type) == "object" then
+             { id: .request.request_id, timestamp: .timestamp,
+               user_email: (.actor.email // .actor.name),
+               resource: .request.resource, method: .request.method,
+               status: .response.status, client_info: .request.user_agent,
+               client_ip: (.request.ip | if type == "string" then (split(",")[0] | gsub("^\\s+|\\s+$"; "")) else . end),
+               log_version: .version }
+           else . end)
+          # Pipeline logs carry no HTTP request and are not API Activity.
+          | if .method == null then . else
           {
             "activity_id": (
               if .method == "GET" then 2      # Read
@@ -84,7 +97,8 @@ config:
                 "version": .log_version,
                 "vendor_name": "Monad"
               },
-              "version": "1.0.0"
+              "profiles": ["cloud"],
+              "version": "1.1.0"
             },
             "cloud": {
               "provider": "Monad"
@@ -102,3 +116,4 @@ config:
             "category_uid": 6,
             "class_uid": 6003
           }
+          end

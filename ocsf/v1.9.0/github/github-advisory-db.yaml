@@ -79,7 +79,39 @@ config:
             then ($vec | ltrimstr("CVSS:") | split("/")[0])
             else "3.1" end;
 
-          . as $r |
+          # The github-advisory-db input emits the advisory-database repo's
+          # OSV JSON files (id/aliases/published/modified/severity[]/affected[]/
+          # database_specific), not the REST /advisories shape. Map OSV onto
+          # the REST field names used below; REST-shaped records pass through.
+          def from_osv:
+            if (has("schema_version") or has("affected")) and (has("ghsa_id") | not) then
+              . as $o |
+              {
+                ghsa_id: $o.id,
+                cve_id: ([($o.aliases // [])[] | select(startswith("CVE-"))] | first),
+                summary: $o.summary,
+                description: $o.details,
+                severity: ($o.database_specific.severity // null | if . == null then null else ascii_downcase end),
+                published_at: $o.published,
+                updated_at: $o.modified,
+                github_reviewed_at: $o.database_specific.github_reviewed_at,
+                nvd_published_at: $o.database_specific.nvd_published_at,
+                html_url: (if $o.id != null then "https://github.com/advisories/" + $o.id else null end),
+                references: [($o.references // [])[] | .url | select(. != null)],
+                cwes: [($o.database_specific.cwe_ids // [])[] | {cwe_id: .}],
+                vulnerabilities: [($o.affected // [])[] |
+                  ([(.ranges // [])[] | .events[]?]) as $ev |
+                  { package: { name: .package.name, ecosystem: .package.ecosystem },
+                    vulnerable_version_range: (
+                      [ ($ev[] | select(.introduced != null and .introduced != "0") | ">= " + .introduced),
+                        ($ev[] | select(.fixed != null) | "< " + .fixed),
+                        ($ev[] | select(.last_affected != null) | "<= " + .last_affected) ]
+                      | if length > 0 then join(", ") else null end),
+                    first_patched_version: ([$ev[] | .fixed | select(. != null)] | first) }]
+              }
+            else . end;
+
+          from_osv as $r |
           ($r.references // []) as $refs |
           ($r.vulnerabilities // []) as $vulns |
           ($r.cwes // []) as $cwes |

@@ -1,5 +1,5 @@
 name: "Cloudflare Access Login Events to OCSF v1.9.0"
-description: "Transforms Cloudflare Access authentication (login) records into the OCSF v1.9.0 Authentication (3002) class."
+description: "Transforms Cloudflare Access login events (GraphQL accessLoginRequestsAdaptiveGroups) into the OCSF v1.9.0 Authentication (3002) class."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -10,6 +10,7 @@ tags:
   - "ocsf"
   - "cloudflare"
   - "iam"
+  - "authentication"
 config:
   operations:
     - operation: "jq"
@@ -18,9 +19,13 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF Authentication (class_uid=3002) — v1.9.0
-          # Input: one Cloudflare Access authentication-log record per call.
-          # Fields: user_email, ip_address, app_uid, app_domain, action,
-          #         connection, allowed, created_at, ray_id, country.
+          # Input: one Cloudflare Access login event per call — the raw
+          # `dimensions` object of a GraphQL accessLoginRequestsAdaptiveGroups
+          # row: datetime, isSuccessfulLogin / hasWarpEnabled /
+          # hasGatewayEnabled / hasExistingJWT (0/1), cfRayId, ipAddress,
+          # userUuid, identityProvider, country, deviceId, approvingPolicyId,
+          # mtlsStatus / mtlsCertSerialId / mtlsCommonName, serviceTokenId.
+          # Empty strings mean "not applicable" and are dropped.
           # ---------------------------------------------------------------
           def to_epoch_ms($ts):
             def _num_ms($n):
@@ -51,77 +56,105 @@ config:
               end
             else null end;
 
-                    def truthy($v):
-            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+          # The GraphQL flags are 0/1 integers; also accept booleans / strings.
+          def flag($v):
+            $v == true or $v == 1 or (($v | type) == "string" and (($v | ascii_downcase) == "true" or $v == "1"));
+
+          # "" -> null so the prune pass drops not-applicable fields.
+          def nz($v): if $v == "" then null else $v end;
 
           . as $r
-          | ($r.action // "" | ascii_downcase) as $act
-          | (if $act == "login" then 1
-             elif $act == "logout" or $act == "logoff" then 2
-             else 0 end) as $activity
-          | (truthy($r.allowed)) as $ok
-          | ($r.app_domain // "" | split("/")[0]) as $app_host
-          | ($r.connection // "" | ascii_downcase) as $conn
+          | flag($r.isSuccessfulLogin) as $ok
+          | nz($r.userUuid) as $user_uid
+          | nz($r.serviceTokenId) as $svc_token
+          | nz($r.identityProvider) as $idp
+          | ($idp // "" | ascii_downcase) as $idp_lc
+          # user is required and needs one of [account, name, uid]. A
+          # service-token login has no user UUID; an anonymous attempt
+          # (e.g. identityProvider "nonidentity") has neither.
+          | ( if $user_uid != null then { uid: $user_uid, type_id: 1, type: "User" }
+              elif $svc_token != null then { uid: $svc_token, type_id: 4, type: "Service" }
+              else { name: "Unknown", type_id: 0, type: "Unknown" } end ) as $user
+          # Every row is a login attempt against Cloudflare Access.
+          | 1 as $activity
           | {
               category_uid: 3,
               class_uid:    3002,
-              type_uid:     (3002 * 100 + $activity),
               activity_id:  $activity,
+              type_uid:     (3002 * 100 + $activity),
               severity_id:  (if $ok then 1 else 3 end),
               status_id:    (if $ok then 1 else 2 end),
               status:       (if $ok then "Success" else "Failure" end),
 
-              time: to_epoch_ms($r.created_at),
+              time: to_epoch_ms($r.datetime),
 
               metadata: {
-                "profiles": ["cloud", "osint"],
+                # device (host profile) and policy (security_control
+                # profile) are only valid when their profile is declared.
+                profiles: (["cloud"]
+                           + (if nz($r.deviceId) != null then ["host"] else [] end)
+                           + (if nz($r.approvingPolicyId) != null then ["security_control"] else [] end)),
                 version: "1.9.0",
                 product: {
                   vendor_name: "Cloudflare",
                   name: "Cloudflare Access"
                 },
-                log_name: "access_requests"
+                uid: nz($r.cfRayId),
+                log_name: "accessLoginRequestsAdaptiveGroups"
               },
-
-              user: {
-                name: $r.user_email,
-                email_addr: $r.user_email,
-                type_id: 1
-              },
-
-              auth_protocol_id: (if $conn == "saml" then 5
-                                 elif $conn == "onetimepin" then 99
-                                 else 99 end),
-              auth_protocol: $r.connection,
-
-              dst_endpoint: {
-                hostname: (if $app_host == "" then null else $app_host end),
-                domain:   (if $app_host == "" then null else $app_host end),
-                uid:      $r.app_uid
-              },
-
-              src_endpoint: {
-                ip: $r.ip_address,
-                location: { country: $r.country }
-              },
-
-              osint: [
-                { type_id: 2, value: $r.ip_address }
-              ],
 
               cloud: { provider: "Cloudflare" },
 
-              observables: (
-                [ (if $r.user_email then { name: "user.email_addr", type_id: 5, value: $r.user_email } else empty end),
-                  (if $r.ip_address then { name: "src_endpoint.ip", type_id: 2, value: $r.ip_address } else empty end),
-                  (if $app_host != "" then { name: "dst_endpoint.hostname", type_id: 1, value: $app_host } else empty end) ]
-              ),
+              # The service authenticated to (satisfies the class's
+              # at_least_one [service, dst_endpoint] constraint; the source
+              # row carries no application identifier).
+              service: { name: "Cloudflare Access" },
 
+              user: $user,
+
+              # The identity provider used; actor needs one of its
+              # at_least_one attributes, so the login's user is repeated.
+              actor: (if $idp != null then { user: $user, idp: { name: $idp } } else null end),
+
+              auth_protocol_id: (if $idp_lc == "saml" then 5
+                                 elif $idp_lc == "oidc" then 4
+                                 elif $idp_lc == "onetimepin" then 99
+                                 else null end),
+              auth_protocol: (if $idp_lc == "saml" then "SAML"
+                              elif $idp_lc == "oidc" then "OpenID"
+                              elif $idp_lc == "onetimepin" then "One-time PIN"
+                              else null end),
+
+              src_endpoint: {
+                ip: nz($r.ipAddress),
+                location: (if nz($r.country) != null then { country: $r.country } else null end)
+              },
+
+              device: (if nz($r.deviceId) != null then { uid: $r.deviceId, type_id: 0 } else null end),
+
+              policy: (if nz($r.approvingPolicyId) != null
+                       then { uid: $r.approvingPolicyId, is_applied: true } else null end),
+
+              message: ("Cloudflare Access login "
+                        + (if $ok then "succeeded" else "failed" end)
+                        + (if $idp != null then " via " + $idp else "" end)),
+
+              observables: [
+                (if nz($r.ipAddress) != null then { name: "src_endpoint.ip", type_id: 2, value: $r.ipAddress } else empty end),
+                (if $user_uid != null then { name: "user.uid", type_id: 31, value: $user_uid } else empty end),
+                (if nz($r.deviceId) != null then { name: "device.uid", type_id: 47, value: $r.deviceId } else empty end)
+              ],
+
+              # No OCSF home: the mTLS cert fields lack the issuer that OCSF
+              # certificate requires; the WARP/Gateway/JWT flags are posture.
               unmapped: {
-                ray_id: $r.ray_id,
-                action: $r.action,
-                connection: $r.connection,
-                country: $r.country
+                hasWarpEnabled: $r.hasWarpEnabled,
+                hasGatewayEnabled: $r.hasGatewayEnabled,
+                hasExistingJWT: $r.hasExistingJWT,
+                mtlsStatus: $r.mtlsStatus,
+                mtlsCertSerialId: $r.mtlsCertSerialId,
+                mtlsCommonName: $r.mtlsCommonName,
+                serviceTokenId: $r.serviceTokenId
               },
 
               raw_data: ($r | tostring)

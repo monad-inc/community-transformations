@@ -61,7 +61,11 @@ config:
 
           . as $r
           | ( $r.message
-              | capture("^(?<ts>[^,]*),(?<serverhost>[^,]*),(?<username>[^,]*),(?<host>[^,]*),(?<connectionid>[^,]*),(?<queryid>[^,]*),(?<operation>[^,]*),(?<database>[^,]*),(?<object>.*),(?<retcode>[^,]*)$")
+              # RDS for MySQL appends an 11th field, connection_type (SOCKET,
+              # TCP/IP, SSL/TLS, ...); RDS for MariaDB stops at retcode. The
+              # leading YYYYMMDD HH:MM:SS anchor skips non-audit lines (e.g.
+              # PostgreSQL error-log lines) instead of mis-parsing them.
+              | capture("^(?<ts>[0-9]{8} [0-9]{2}:[0-9]{2}:[0-9]{2}),(?<serverhost>[^,]*),(?<username>[^,]*),(?<host>[^,]*),(?<connectionid>[^,]*),(?<queryid>[^,]*),(?<operation>[^,]*),(?<database>[^,]*),(?<object>.*),(?<retcode>-?[0-9]+)(?:,(?<connection_type>[A-Za-z][A-Za-z/ ]*))?$")
             ) as $m
 
           # Strip the single quotes MariaDB wraps around the object/query and
@@ -97,6 +101,8 @@ config:
 
               metadata: {
                 version: "1.9.0",
+                # cloud and osint are profile attributes; validate2 rejects them undeclared.
+                profiles: ["cloud", "osint"],
                 product: {
                   vendor_name: "AWS",
                   name: "Amazon RDS",
@@ -151,7 +157,8 @@ config:
                 serverhost: $m.serverhost,
                 connectionid: $m.connectionid,
                 queryid: $m.queryid,
-                retcode: $ret
+                retcode: $ret,
+                connection_type: $m.connection_type
               },
 
               raw_data: ($r.message | tostring)
