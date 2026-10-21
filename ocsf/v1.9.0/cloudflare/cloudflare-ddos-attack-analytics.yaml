@@ -18,14 +18,17 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF Network Activity (class_uid=4001) — v1.9.0
-          # Input: one Cloudflare DDoS Attack Analytics group row per
-          # invocation (dosdAttackAnalyticsGroups: dimensions{} + sum{}).
+          # Input: one dosdAttackAnalyticsGroups row per invocation, emitted
+          # flat by the connector (no dimensions/sum wrapper): attackId,
+          # attackType, attackVector, bits, packets, droppedBits,
+          # droppedPackets, startDatetime, endDatetime, sourceIp, sourcePort,
+          # destinationIp, destinationPort, ipProtocol, ipProtocolName,
+          # mitigationType/Reason/Scope, ruleId, ruleName, rulesetId,
+          # rulesetOverrideId, tcpFlags(+Names), commonTcpFlags(+Names).
           # A DDoS attack Cloudflare detected and mitigated is modeled as
           # aggregated inbound traffic (activity_id=6 Traffic) that a
-          # security control denied/dropped.
+          # security control dropped.
           # ---------------------------------------------------------------
-
-
           def to_epoch_ms($ts):
             def _num_ms($n):
               if   $n >= 1e17 then ($n / 1000000 | floor)
@@ -55,81 +58,108 @@ config:
               end
             else null end;
 
+          # "" -> null so the prune pass drops not-applicable fields.
+          def nz($v): if $v == "" then null else $v end;
+          def num($v): if ($v | type) == "string" then ($v | tonumber? // null) else $v end;
+
           . as $r
-          | ($r.dimensions // {}) as $d
-          | ($r.sum // {}) as $s
+          | num($r.droppedPackets) as $dropped
+          # Rows with droppedPackets == 0 were detected but not dropped.
+          | ($dropped == null or $dropped > 0) as $was_dropped
           | {
-              "category_uid": 4,
-              "class_uid":    4001,
-              "activity_id":  6,
-              "type_uid":     400106,
-              "severity_id":  4,
-              "is_alert":     true,
-              "status_id":    1,
-              "status":       "Success",
+              category_uid: 4,
+              class_uid:    4001,
+              activity_id:  6,
+              type_uid:     (4001 * 100 + 6),
+              severity_id:  4,
+              is_alert:     true,
+              status_id:    1,
+              status:       "Success",
 
-              "time": to_epoch_ms($d.datetime),
-              "start_time": to_epoch_ms($d.startDatetime),
-              "end_time": to_epoch_ms($d.endDatetime),
+              time:       to_epoch_ms($r.startDatetime),
+              start_time: to_epoch_ms($r.startDatetime),
+              end_time:   to_epoch_ms($r.endDatetime),
 
-              "metadata": {
-                "profiles": ["cloud", "osint", "security_control"],
-                "version": "1.9.0",
-                "product": {
-                  "vendor_name": "Cloudflare",
-                  "name": "Cloudflare DDoS Protection",
-                  "feature": { "name": "DDoS Attack Analytics" }
-                }
+              metadata: {
+                # firewall_rule/policy/action_id/disposition_id/is_alert are
+                # security_control profile attributes.
+                profiles: ["cloud", "security_control"],
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Cloudflare",
+                  name: "Cloudflare DDoS Protection",
+                  feature: { name: "DDoS Attack Analytics" }
+                },
+                uid: nz($r.attackId),
+                log_name: "dosdAttackAnalyticsGroups"
               },
 
-              # OCSF 1.9.0 requires these on Network Activity.
-              "cloud": { "provider": "Cloudflare" },
-              "osint": [],
+              cloud: { provider: "Cloudflare" },
 
-              # Mitigation outcome: packets dropped by the DDoS managed ruleset.
-              "action_id": 2,
-              "action": "Denied",
-              "disposition_id": 6,
-              "disposition": "Dropped",
+              action_id:      (if $was_dropped then 2 else 3 end),
+              action:         (if $was_dropped then "Denied" else "Observed" end),
+              disposition_id: (if $was_dropped then 6 else 15 end),
+              disposition:    (if $was_dropped then "Dropped" else "Detected" end),
 
-              "dst_endpoint": {
-                "ip": $d.destinationIP,
-                "port": $d.destinationPort,
-                "location": {
-                  "city": $d.coloCity,
-                  "country": $d.coloCountry
-                }
+              src_endpoint: {
+                ip:   nz($r.sourceIp),
+                port: num($r.sourcePort)
               },
 
-              "connection_info": {
-                "direction": "Inbound",
-                "direction_id": 1,
-                "protocol_name": ( $d.attackProtocol // $d.attackProtocolName
-                                   | if . == null then null else ascii_downcase end )
+              dst_endpoint: {
+                ip:   nz($r.destinationIp),
+                port: num($r.destinationPort)
               },
 
-              "traffic": {
-                "packets": $s.packets,
-                "bytes": ( if $s.bits == null then null else ($s.bits / 8 | floor) end )
+              connection_info: {
+                direction_id:  1,
+                direction:     "Inbound",
+                protocol_num:  num($r.ipProtocol),
+                protocol_name: (nz($r.ipProtocolName) | if . == null then null else ascii_downcase end),
+                tcp_flags:     num($r.tcpFlags)
               },
 
-              "message": ( [ "Cloudflare mitigated ", ($d.attackType // "DDoS attack"),
-                             " (", ($d.attackVector // "unknown vector"), ")" ] | add ),
-
-              "unmapped": {
-                "attackId": $d.attackId,
-                "attackType": $d.attackType,
-                "attackVector": $d.attackVector,
-                "mitigationType": $d.mitigationType,
-                "action": $d.action,
-                "sourcePort": $d.sourcePort,
-                "droppedPackets": $s.droppedPackets,
-                "droppedBits": $s.droppedBits,
-                "sampleInterval": ($r.avg.sampleInterval),
-                "count": $r.count
+              # Cloudflare reports volume in bits; OCSF traffic is bytes.
+              traffic: {
+                packets: num($r.packets),
+                bytes:   (num($r.bits) | if . == null then null else (. / 8 | floor) end)
               },
 
-              "raw_data": ($r | tostring)
+              firewall_rule: (if nz($r.ruleId) != null or nz($r.ruleName) != null
+                              then { uid: nz($r.ruleId), name: nz($r.ruleName) } else null end),
+              policy: (if nz($r.rulesetId) != null then { uid: $r.rulesetId, is_applied: true } else null end),
+
+              message: ( "Cloudflare "
+                         + (if $was_dropped then "mitigated " else "detected " end)
+                         + (nz($r.attackVector) // nz($r.attackType) // "DDoS attack")
+                         + (if nz($r.destinationIp) != null then " targeting " + $r.destinationIp else "" end) ),
+
+              observables: [
+                (if nz($r.sourceIp) != null then { name: "src_endpoint.ip", type_id: 2, value: $r.sourceIp } else empty end),
+                (if nz($r.destinationIp) != null then { name: "dst_endpoint.ip", type_id: 2, value: $r.destinationIp } else empty end)
+              ],
+
+              unmapped: {
+                attackType: $r.attackType,
+                attackVector: $r.attackVector,
+                droppedBits: $r.droppedBits,
+                droppedPackets: $r.droppedPackets,
+                mitigationType: $r.mitigationType,
+                mitigationReason: $r.mitigationReason,
+                mitigationScope: $r.mitigationScope,
+                rulesetOverrideId: $r.rulesetOverrideId,
+                tcpFlagsNames: $r.tcpFlagsNames,
+                commonTcpFlags: $r.commonTcpFlags,
+                commonTcpFlagsNames: $r.commonTcpFlagsNames
+              },
+
+              raw_data: ($r | tostring)
             }
           # Drop nulls/empties so required objects stay intact but noise is pruned.
-          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {})) else . end )
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != {} and . != []))
+              else . end
+            )

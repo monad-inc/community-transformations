@@ -56,10 +56,52 @@ config:
             ($s | type) == "string"
             and ($s | test("^(\\d{1,3}\\.){3}\\d{1,3}$") or (test(":") and test("^[0-9A-Fa-f:.]+$")));
 
-          . as $r
+          # The cloudflare-http-requests input emits GraphQL httpRequestsAdaptive
+          # rows (camelCase, "datetime"/"rayName"); Logpush rows use PascalCase.
+          # Normalize GraphQL rows onto the Logpush names used below.
+          def from_graphql:
+            if has("RayID") or has("ClientRequestMethod") or has("EdgeStartTimestamp") then .
+            else {
+              RayID: .rayName,
+              EdgeStartTimestamp: (.edgeStartTimestamp // .datetime),
+              EdgeEndTimestamp: .edgeEndTimestamp,
+              ClientRequestMethod: .clientRequestHTTPMethodName,
+              ClientRequestProtocol: (.clientRequestHTTPProtocol // .clientRequestProtocol),
+              ClientRequestUserAgent: .userAgent,
+              ClientRequestReferer: .clientRequestReferer,
+              ClientRequestBytes: .clientRequestBytes,
+              ClientRequestScheme: .clientRequestScheme,
+              ClientRequestHost: .clientRequestHTTPHost,
+              ClientRequestPath: .clientRequestPath,
+              ClientRequestURI: (.clientRequestURI
+                // (if .clientRequestPath == null then null
+                    elif (.clientRequestQuery // "") == "" then .clientRequestPath
+                    elif (.clientRequestQuery | startswith("?")) then .clientRequestPath + .clientRequestQuery
+                    else .clientRequestPath + "?" + .clientRequestQuery end)),
+              EdgeResponseStatus: .edgeResponseStatus,
+              EdgeResponseBytes: .edgeResponseBytes,
+              EdgeResponseContentType: (.edgeResponseContentType // .edgeResponseContentTypeName),
+              ClientIP: .clientIP,
+              ClientSrcPort: .clientSrcPort,
+              ClientCountry: .clientCountryName,
+              OriginIP: .originIP,
+              ZoneName: .zoneName,
+              EdgeColoCode: (.edgeColoCode // .coloCode // .edgeColoName),
+              ClientASN: .clientAsn,
+              CacheCacheStatus: (.cacheCacheStatus // .cacheStatus),
+              WAFAttackScore: .wafAttackScore,
+              BotScore: .botScore,
+              JA3Hash: .ja3Hash,
+              JA4: .ja4,
+              SecurityRuleID: .securityRuleID,
+              SecurityRuleDescription: .securityRuleDescription,
+              SecurityAction: .securityAction
+            } end;
+
+          from_graphql as $r
           # HTTP method -> activity_id (RFC methods; anything else -> 99 Other)
           | ( { "CONNECT":1, "DELETE":2, "GET":3, "HEAD":4, "OPTIONS":5,
-                "POST":6, "PUT":7, "TRACE":8, "PATCH":9 }[$r.ClientRequestMethod] // 99 ) as $activity
+                "POST":6, "PUT":7, "TRACE":8, "PATCH":9 }[$r.ClientRequestMethod // ""] // 99 ) as $activity
           | ( ($r.EdgeResponseStatus // 0) | if type == "string" then tonumber else . end ) as $status
           # A terminating WAF/security block, or a 4xx/5xx, is a failure.
           | ( ($r.SecurityAction // "") | ascii_downcase ) as $sec_action

@@ -49,18 +49,25 @@ config:
             else null end;
 
           . as $r
-          | (
-              if   $r.method == "GET"    then 2   # Read
-              elif $r.method == "POST"   then 1   # Create
-              elif $r.method == "PATCH"  then 3   # Update
-              elif $r.method == "PUT"    then 3   # Update
-              elif $r.method == "DELETE" then 4   # Delete
+          # API log v1.1.0 (current producer) nests request/response/actor;
+          # legacy v1.0.0 was flat. Pipeline logs (log_type "pipeline") carry
+          # no HTTP request and are not API Activity: pass them through as-is.
+          | ($r.request // $r) as $q
+          | ($r.response.status // $r.status) as $code
+          | if $q.method == null then . else
+            (
+              if   $q.method == "GET"    then 2   # Read
+              elif $q.method == "POST"   then 1   # Create
+              elif $q.method == "PATCH"  then 3   # Update
+              elif $q.method == "PUT"    then 3   # Update
+              elif $q.method == "DELETE" then 4   # Delete
               else 99                             # Other
               end
             ) as $activity_id
           | (
-              if   ($r.status | tonumber) >= 500 then 4   # High
-              elif ($r.status | tonumber) >= 400 then 3   # Medium
+              if   $code == null then 0                    # Unknown
+              elif ($code | tonumber) >= 500 then 4   # High
+              elif ($code | tonumber) >= 400 then 3   # Medium
               else 1                                       # Informational
               end
             ) as $severity_id
@@ -76,7 +83,7 @@ config:
                 "product": {
                   "name": "Monad",
                   "vendor_name": "Monad",
-                  "version": ($r.log_version // "unknown")
+                  "version": ($r.log_version // $r.version // "unknown")
                 },
                 "version": "1.9.0"
               },
@@ -85,26 +92,28 @@ config:
               },
               "actor": {
                 "user": {
-                  "name": $r.user_email,
-                  "email_addr": $r.user_email
+                  "name": ($r.actor.name // $r.actor.email // $r.user_email),
+                  "email_addr": ($r.actor.email // $r.user_email),
+                  "uid": $r.actor.id
                 }
               },
               "api": {
-                "operation": $r.method,
+                "operation": $q.method,
                 "request": {
-                  "uid": $r.id
+                  "uid": ($q.request_id // $r.id)
                 },
                 "response": {
-                  "code": ($r.status | tonumber)
+                  "code": ($code | if . == null then null else tonumber end)
                 }
               },
               "src_endpoint": {
-                "ip": $r.client_ip
+                # request.ip is the raw X-Forwarded-For header: client first.
+                "ip": (($q.ip // $r.client_ip) | if type == "string" then (split(",")[0] | gsub("^\\s+|\\s+$"; "")) else . end)
               },
               "http_request": {
-                "http_method": $r.method,
-                "url": { "path": $r.resource },
-                "user_agent": $r.client_info
+                "http_method": $q.method,
+                "url": { "path": $q.resource },
+                "user_agent": ($q.user_agent // $r.client_info)
               },
               "osint": [],
               "unmapped": (
@@ -112,3 +121,4 @@ config:
                 | with_entries(select(.value != null))
               )
             }
+            end

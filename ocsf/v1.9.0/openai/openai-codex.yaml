@@ -109,7 +109,9 @@ config:
           # when no identity is present so the object stays valid — the miss is
           # signalled by the label + severity floor below.
           | ({ type_id: 1,
-               name: ($r["user.email"] // (if $has_id then null else "unknown" end)),
+               name: (if ($r["user.email"] // "") != "" then $r["user.email"]
+                      elif ($r["user.account_id"] // "") != "" then null
+                      else "unknown" end),
                uid: $r["user.account_id"], email_addr: $r["user.email"] }) as $user
           | ({ user: $user, application: { name: "OpenAI Codex" } }) as $actor
           | ({ type_id: 0, hostname: $r["terminal.type"] }) as $device
@@ -180,9 +182,13 @@ config:
             | (($r["mcp_server"] // "") != "") as $is_mcp
             | ( ($r["arguments"] // "") as $a
                 | if ($a | type) == "string" and $a != "" then ($a | fromjson? // {})
-                  elif ($a | type) == "object" then $a else {} end ) as $args
+                  elif ($a | type) == "object" then $a else {} end
+                # freeform tool input can parse as a JSON scalar/array; index only objects
+                | if type == "object" then . else {} end ) as $args
             | (($args["file_path"]) // ($args["path"]) // ($args["notebook_path"])) as $path
-            | (($args["command"]) // ($args["cmd"]) // ($r["arguments"])) as $cmd
+            | (($args["command"]) // ($args["cmd"]) // ($r["arguments"])
+               # shell tool sends command as an argv array; cmd_line is a string
+               | if type == "array" then (map(tostring) | join(" ")) else . end) as $cmd
             | (if $tl == "read_file" or $tl == "read" then 2
                elif $tl == "write_file" or $tl == "write" then 1
                elif ($tl | test("(apply_patch|edit|patch)")) then 3 else 0 end) as $fa

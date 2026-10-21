@@ -1,5 +1,5 @@
 name: "Abnormal Security Audit Logs to OCSF v1.9.0"
-description: "Transforms Abnormal Security portal/API audit-log records into the OCSF v1.9.0 API Activity (6003) class."
+description: "Transforms Abnormal Security portal/API audit-log records (GET /v1/auditlogs) into the OCSF v1.9.0 API Activity (6003) class."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -10,6 +10,7 @@ tags:
   - "ocsf"
   - "abnormal"
   - "application"
+  - "api activity"
 config:
   operations:
     - operation: "jq"
@@ -18,10 +19,14 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF API Activity (class_uid=6003) — v1.9.0
-          # Input: ONE Abnormal Security audit-log record per invocation,
-          # as emitted by the `abnormal-audit-logs` input connector. The
-          # record carries an abx_metadata envelope (event_type, trace_id)
-          # and an abx_body with the actual audited action.
+          # Input: ONE Abnormal Security audit-log record per invocation, as
+          # emitted by the `abnormal-audit-logs` input connector: one raw
+          # element of the GET /v1/auditlogs `auditLogs[]` array, flat
+          # camelCase:
+          #   { category, action, status, timestamp (RFC 3339), sourceIp,
+          #     tenantName, user { email },
+          #     actionDetails { requestUrl, messageId, providedReason } }
+          # `action` and every actionDetails field may be null.
           # ---------------------------------------------------------------
 
           def to_epoch_ms($ts):
@@ -54,90 +59,95 @@ config:
             else null end;
 
           . as $r
-          | ($r.abx_metadata // {}) as $m
-          | ($r.abx_body // {}) as $b
-          | ($b.action_details // {}) as $ad
-          | ($b.user // {}) as $u
-          | (($b.action // $b.category // "") | ascii_downcase) as $act
+          | ($r.actionDetails // {}) as $ad
+          | ($r.user // {}) as $u
+          | (($r.status // "") | ascii_upcase) as $st
           # Map the audited verb onto the API Activity CRUD activity_id.
-          | (if   ($act | test("delete|purge|remove|remediat")) then 4
-             elif ($act | test("create|add|new"))               then 1
-             elif ($act | test("update|change|modif|set|status")) then 3
-             elif ($act | test("login|read|get|list|search|view|export")) then 2
+          # `action` (e.g. message_purge, user_invite, key_rotation) carries
+          # the verb; when it is null fall back to the category, and only
+          # where the category itself implies one.
+          | (($r.action // "") | ascii_downcase) as $act
+          | (if $act != "" then
+               (if   ($act | test("delete|purge|remove|revoke")) then 4
+                elif ($act | test("create|add|invite|new|generate")) then 1
+                elif ($act | test("update|change|modif|set|rotat|undo|enable|disable|edit")) then 3
+                elif ($act | test("read|get|list|search|view|export|download")) then 2
+                else 99 end)
+             elif (($r.category // "") | ascii_downcase) == "configuration-change" then 3
              else 99 end) as $activity_id
           | {
               "category_uid": 6,
               "class_uid":    6003,
               "activity_id":  $activity_id,
+              "activity_name": (if $activity_id == 99 then ($r.action // $r.category) else null end),
               "type_uid":     (6003 * 100 + $activity_id),
               "severity_id":  1,
-              "status_id":    (if   (($b.status // "") | ascii_upcase) == "SUCCESS" then 1
-                               elif (($b.status // "") | ascii_upcase) == "FAILURE" then 2
-                               else 0 end),
-              "status":       (if   (($b.status // "") | ascii_upcase) == "SUCCESS" then "Success"
-                               elif (($b.status // "") | ascii_upcase) == "FAILURE" then "Failure"
-                               else ($b.status // null) end),
+              "status_id":    (if $st == "SUCCESS" then 1 elif $st == "FAILURE" then 2 else 0 end),
+              "status":       (if $st == "SUCCESS" then "Success" elif $st == "FAILURE" then "Failure" else null end),
+              "status_code":  $r.status,
 
-              "time": to_epoch_ms($b.timestamp // $m.timestamp),
+              # Time is required; fall back to ingest time only when the
+              # record carries no parseable timestamp.
+              "time": (to_epoch_ms($r.timestamp) // (now * 1000 | floor)),
 
               "metadata": {
-                "profiles": ["cloud", "osint"],
                 "version": "1.9.0",
                 "product": {
                   "vendor_name": "Abnormal Security",
                   "name": "Abnormal Security Audit Logs"
                 },
-                "uid":          $m.trace_id,
-                "event_code":   $b.category,
+                "event_code":   $r.category,
+                "tenant_uid":   $r.tenantName,
                 "log_provider": "Abnormal Security"
               },
 
-              # API Activity requires actor, api, src_endpoint, plus the
-              # base cloud/osint attributes.
               "actor": {
+                # user carries at_least_one [account, name, uid]; real
+                # records always carry user.email, "unknown" only guards a
+                # malformed record.
                 "user": {
-                  "name":       $u.email,
+                  "name":       ($u.email // "unknown"),
                   "email_addr": $u.email,
-                  "type_id":    1
+                  "type_id":    (if $u.email != null then 1 else 0 end),
+                  "org":        (if $r.tenantName != null then { "name": $r.tenantName } else null end)
                 }
               },
 
               "api": {
-                "operation": ($b.action // $b.category // "unknown"),
-                "service":   { "name": "Abnormal Security Portal API" },
-                "request":   { "uid": $m.trace_id }
+                "operation": ($r.action // $r.category // "unknown"),
+                "service":   { "name": "Abnormal Security Portal API" }
               },
 
-              "http_request": {
-                "url": { "path": $ad.request_url }
-              },
+              "http_request": (if $ad.requestUrl != null
+                               then { "url": { "path": $ad.requestUrl } } else null end),
 
-              "src_endpoint": {
-                "ip": $b.source_ip
-              },
+              "src_endpoint": { "ip": $r.sourceIp },
 
-              "cloud": {
-                "provider": "Abnormal Security"
-              },
+              # The message an action (e.g. a purge) was taken on.
+              "resources": (if $ad.messageId != null
+                            then [ { "uid": $ad.messageId, "type": "Email Message" } ] else null end),
 
-              "osint": [],
+              "observables": (
+                  (if $u.email      != null then [ { "name": "actor.user.email_addr", "type_id": 5, "value": $u.email } ] else [] end)
+                + (if $r.sourceIp   != null then [ { "name": "src_endpoint.ip", "type_id": 2, "value": $r.sourceIp } ] else [] end)
+                + (if $ad.messageId != null then [ { "name": "resources.uid", "type_id": 10, "value": $ad.messageId } ] else [] end)),
 
-              "message": (($b.action // $b.category) // ""),
+              "message": ([ $r.action // $r.category, $u.email, $r.status ]
+                          | map(select(. != null and . != "")) | join(" ")),
               "unmapped": {
-                "tenant_name":     $b.tenant_name,
-                "provided_reason": $ad.provided_reason,
-                "message_id":      $ad.message_id,
-                "event_type":      $m.event_type
+                "category":        $r.category,
+                "provided_reason": $ad.providedReason
               },
 
               "raw_data": ($r | tostring)
             }
-          # Prune null/empty leaves, then reinstate the required-but-empty osint.
+          # Prune null/empty leaves. Required objects (metadata, actor, api)
+          # keep at least one populated leaf. src_endpoint is required and
+          # network_endpoint carries at_least_one [ip, name, ...]; real
+          # records always carry sourceIp, the "unknown" name only guards a
+          # malformed record.
           | walk(
               if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
-              elif type == "array" then map(select(. != null))
               else . end
             )
-          | .osint = []
-          # src_endpoint is required; keep it present even when source_ip is absent.
-          | .src_endpoint = (.src_endpoint // {})
+          | .src_endpoint = (.src_endpoint // { "name": "unknown" })

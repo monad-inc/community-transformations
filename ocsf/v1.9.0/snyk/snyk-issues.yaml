@@ -63,14 +63,14 @@ config:
                 { "info": 1, "low": 2, "medium": 3, "high": 4, "critical": 5 }[$a.effective_severity_level] // 0
               ),
               "status": $a.status,
-              "status_id": ({ "open": 1, "resolved": 4, "ignored": 3 }[$a.status] // 99),
+              "status_id": ({ "open": 1, "resolved": 4, "ignored": 3 }[$a.status // ""] // 99),
               "message": ($a.title // ""),
               "time": (to_epoch_ms($a.updated_at) // to_epoch_ms($a.created_at) // 0),
               "cloud": {
                 "provider": "Snyk"
               },
               "osint": [
-                ( $a.problems[]? | select(.source == "NVD") | { "value": .id, "type_id": 99, "src_url": .url } )
+                ( $a.problems[]? | select((.id // "") | test("^CVE-")) | { "value": .id, "type_id": 99, "src_url": .url } )
               ],
               "metadata": {
                 "profiles": ["cloud", "osint"],
@@ -96,13 +96,13 @@ config:
                   "desc": $a.description,
                   "severity": $a.effective_severity_level,
                   "is_fix_available": ($a.coordinates[0].is_fixable_snyk // null),
-                  "references": [ $a.problems[]?.url ],
+                  "references": [ $a.problems[]?.url | select(. != null) ],
                   "cve": (
-                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
+                    ( [ $a.problems[]? | select((.id // "") | test("^CVE-")) | .id ][0] ) as $cve
                     | if $cve != null then {
                         "uid": $cve,
                         "cvss": [ $a.severities[]? | select(.score != null) | {
-                            "version": "3.1",
+                            "version": (.version // "3.1"),
                             "base_score": .score,
                             "vector_string": .vector
                         } ]
@@ -111,7 +111,7 @@ config:
                   # vulnerability carries a just_one(advisory, cve, cwe) constraint;
                   # prefer the CVE and only emit the CWE when no CVE is present.
                   "cwe": (
-                    ( [ $a.problems[]? | select(.source == "NVD") | .id ][0] ) as $cve
+                    ( [ $a.problems[]? | select((.id // "") | test("^CVE-")) | .id ][0] ) as $cve
                     | ( [ $a.classes[]?  | select(.source == "CWE") | .id ][0] ) as $cwe
                     | if ($cve == null and $cwe != null) then { "uid": $cwe } else null end
                   ),
@@ -128,3 +128,5 @@ config:
               "raw_data": ($r | tostring)
             }
             | walk( if type == "object" then with_entries(select(.value != null and .value != [] and .value != {})) else . end )
+            # osint is required once the profile is declared; drop the profile when no CVE was found.
+            | if has("osint") then . else .metadata.profiles -= ["osint"] end

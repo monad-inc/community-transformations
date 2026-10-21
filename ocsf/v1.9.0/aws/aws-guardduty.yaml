@@ -11,6 +11,7 @@ tags:
   - "ocsf"
   - "aws"
   - "findings"
+  - "detection"
 config:
   operations:
     - operation: "jq"
@@ -19,11 +20,37 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF Detection Finding (class_uid=2004) — v1.9.0
-          # Input: one Amazon GuardDuty finding record per invocation.
+          # Input: one Amazon GuardDuty finding per invocation, as emitted by
+          # the Monad aws-guardduty connector: a json.Marshal of the AWS SDK
+          # for Go v2 guardduty types.Finding (GetFindings). The SDK structs
+          # carry no json tags, so every key is PascalCase (Id, AccountId,
+          # Severity, CreatedAt, Resource.InstanceDetails, Service.Action,
+          # ...). A camelCase record (the GuardDuty REST / EventBridge shape)
+          # is normalized to PascalCase first.
+          #
+          # Field mappings:
+          #   Id / Arn                      -> finding_info.uid / uid_alt, metadata.uid
+          #   Title / Description / Type    -> finding_info.title / desc / types, message
+          #   Severity (0.0-10.0)           -> severity_id (GuardDuty bands)
+          #   CreatedAt / UpdatedAt         -> finding_info.created_time / modified_time, time
+          #   Service.EventFirstSeen/LastSeen -> start_time / end_time, first/last_seen_time
+          #   Service.Count                 -> count
+          #   Service.Archived              -> status_id (5 Archived) / activity_id (3 Close)
+          #   AccountId / Region / Partition -> cloud.*
+          #   Resource.*Details             -> resources[] (raw detail kept in resources[].data)
+          #   Service.Action.*              -> evidences[] (endpoints, api, dns query, user)
+          #   *.Blocked                     -> action_id / disposition_id (security_control
+          #                                    profile, declared only when Blocked is present)
+          #
+          # Profiles: cloud always (account/region are always present);
+          # osint is not claimed — the record carries no threat-intel indicator
+          # object, only remote addresses, which are mapped into evidences.
           # ---------------------------------------------------------------
 
-
-          # GuardDuty severity (float 0-8.9) -> OCSF severity_id (1-6)
+          # OCSF timestamp_t is epoch MILLISECONDS. Use this helper for every
+          # time / *_time field; it accepts epoch s/ms/us/ns numbers, numeric
+          # strings, {seconds,nanos}, and ISO 8601 with any UTC offset, and
+          # returns null (not an error) on unparseable input.
           def to_epoch_ms($ts):
             def _num_ms($n):
               if   $n >= 1e17 then ($n / 1000000 | floor)
@@ -53,124 +80,314 @@ config:
               end
             else null end;
 
-          def sev_id($s):
-            if $s == null then 0
-            elif $s < 1 then 1        # Informational
-            elif $s < 4 then 2        # Low
-            elif $s < 7 then 3        # Medium
-            elif $s < 9 then 4        # High
-            else 5 end;               # Critical
+          # Drop null / "" / {} / [] leaves, bottom-up.
+          def prune:
+            walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != "" and . != {} and . != []))
+              else . end
+            );
 
-          . as $r
-          | ($r.service // {}) as $svc
-          | ($svc.action // {}) as $act
-          | (($act.networkConnectionAction // {}).remoteIpDetails // {}) as $remote
-          | ($r.resource // {}) as $res
-          | (($res.instanceDetails // {}).networkInterfaces[0] // {}) as $nic
-          | ( if ($r.updatedAt != null and $r.updatedAt != $r.createdAt) then 2 else 1 end ) as $activity
-          | ($remote.ipAddressV4 // $r.arn) as $osint_val
+          # camelCase -> PascalCase keys (only used when the record is not
+          # already in the connector's PascalCase shape).
+          def pascal_keys:
+            walk(if type == "object"
+                 then with_entries(.key |= ((.[0:1] | ascii_upcase) + .[1:]))
+                 else . end);
+
+          # GuardDuty severity bands -> OCSF severity_id:
+          # <1 Informational, 1-3.9 Low, 4-6.9 Medium, 7-8.9 High, >=9 Critical.
+          def sev_id($s):
+            if ($s | type) != "number" then 0
+            elif $s < 1 then 1
+            elif $s < 4 then 2
+            elif $s < 7 then 3
+            elif $s < 9 then 4
+            else 5 end;
+
+          # GuardDuty RemoteIpDetails / LocalIpDetails -> OCSF network_endpoint.
+          # Returns null when no address is present (network_endpoint needs
+          # at_least_one of ip/uid/name/...; location needs city or country).
+          def endpoint($d; $port):
+            ($d // {}) as $d
+            | ($d.IpAddressV4 // $d.IpAddressV6) as $ip
+            | if $ip == null then null
+              else {
+                "ip": $ip,
+                "port": $port,
+                "location": (if ($d.City.CityName // $d.Country.CountryCode) != null
+                             then { "city": $d.City.CityName,
+                                    "country": $d.Country.CountryCode,
+                                    "desc": $d.Country.CountryName,
+                                    "lat": $d.GeoLocation.Lat,
+                                    "long": $d.GeoLocation.Lon }
+                             else null end),
+                "autonomous_system": (if ($d.Organization.Asn // $d.Organization.AsnOrg) != null
+                                      then { "number": (try ($d.Organization.Asn | tonumber) catch null),
+                                             "name": $d.Organization.AsnOrg }
+                                      else null end),
+                "isp": $d.Organization.Isp,
+                "isp_org": $d.Organization.Org
+              } end;
+
+          # Tags [{Key,Value}] -> key_value_object[].
+          def kv_tags($t):
+            [ ($t // [])[] | select((.Key // "") != "" and (.Value // "") != "")
+              | { "name": .Key, "value": .Value } ];
+
+          (if (has("Id") | not) and has("id") then pascal_keys else . end) as $r
+          | ($r.Service // {}) as $svc
+          | ($svc.Action // {}) as $act
+          | ($act.ActionType // "") as $atype
+          | ($r.Resource // {}) as $res
+          | ($res.InstanceDetails // {}) as $inst
+          | (to_epoch_ms($r.CreatedAt)) as $created
+          | (to_epoch_ms($r.UpdatedAt)) as $updated
+
+          # Lifecycle: an archived finding is closed; a finding updated after
+          # creation is an Update; otherwise a Create.
+          | ( if $svc.Archived == true then 3
+              elif ($updated != null and $created != null and $updated > $created) then 2
+              else 1 end ) as $activity
+
+          # Blocked flag, wherever the action carries one.
+          | ( [ $act.NetworkConnectionAction.Blocked, $act.PortProbeAction.Blocked,
+                $act.DnsRequestAction.Blocked ] | map(select(. != null)) | first ) as $blocked
+
+          # --- Common resource fields --------------------------------------
+          | { "region": $r.Region,
+              "cloud_partition": $r.Partition,
+              "owner": { "account": { "uid": $r.AccountId, "type_id": 10 } } } as $rbase
+
+          # --- Affected resources: one entry per populated *Details block ---
+          | ( [
+                ( if $res.InstanceDetails != null then
+                    $rbase + {
+                      "type": "Instance",
+                      "uid": $inst.InstanceId,
+                      "zone": $inst.AvailabilityZone,
+                      "ip": (($inst.NetworkInterfaces // [])[0].PrivateIpAddress),
+                      "hostname": (($inst.NetworkInterfaces // [])[0].PrivateDnsName),
+                      "tags": kv_tags($inst.Tags),
+                      "data": $inst
+                    } else empty end ),
+                ( ($res.S3BucketDetails // [])[]
+                  | $rbase + { "type": "S3Bucket", "uid": .Arn, "name": .Name,
+                               "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.EksClusterDetails // empty
+                  | $rbase + { "type": "EKSCluster", "uid": .Arn, "name": .Name,
+                               "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.KubernetesDetails.KubernetesWorkloadDetails // empty
+                  | $rbase + { "type": "KubernetesWorkload", "uid": .Uid, "name": .Name,
+                               "namespace": .Namespace, "data": . } ),
+                ( $res.EcsClusterDetails // empty
+                  | $rbase + { "type": "ECSCluster", "uid": .Arn, "name": .Name,
+                               "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.ContainerDetails // empty
+                  | $rbase + { "type": "Container", "uid": .Id, "name": .Name, "data": . } ),
+                ( $res.LambdaDetails // empty
+                  | $rbase + { "type": "Lambda", "uid": .FunctionArn, "name": .FunctionName,
+                               "version": .FunctionVersion, "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.RdsDbInstanceDetails // empty
+                  | $rbase + { "type": "RDSDBInstance", "uid": .DbInstanceArn,
+                               "name": .DbInstanceIdentifier, "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.RdsLimitlessDbDetails // empty
+                  | $rbase + { "type": "RDSLimitlessDB", "uid": .DbShardGroupArn,
+                               "name": .DbShardGroupIdentifier, "tags": kv_tags(.Tags), "data": . } ),
+                ( $res.AccessKeyDetails // empty
+                  | $rbase + { "type": "AccessKey", "uid": .AccessKeyId, "name": .UserName, "data": . } )
+              ]
+              # resource_details needs at_least_one of uid/name; a bare
+              # ResourceType stays in unmapped.Resource.ResourceType.
+              | map(prune | select(.uid != null or .name != null)) ) as $resources
+
+          # --- Evidence from Service.Action (keyed on ActionType) -----------
+          | ( if $atype == "NETWORK_CONNECTION" then
+                ($act.NetworkConnectionAction // {}) as $n
+                | endpoint($n.RemoteIpDetails; $n.RemotePortDetails.Port) as $remote
+                | ( endpoint($n.LocalIpDetails; $n.LocalPortDetails.Port)
+                    // ({ "instance_uid": $inst.InstanceId,
+                          "interface_uid": $n.LocalNetworkInterface,
+                          "port": $n.LocalPortDetails.Port } | prune
+                        | if (.instance_uid // .interface_uid) == null then null else . end) ) as $local
+                | ($n.ConnectionDirection // "") as $dir
+                | [ {
+                      "src_endpoint": (if $dir == "OUTBOUND" then $local else $remote end),
+                      "dst_endpoint": (if $dir == "OUTBOUND" then $remote else $local end),
+                      "connection_info": {
+                        "protocol_name": (($n.Protocol // "") | ascii_downcase),
+                        "direction_id": ({ "INBOUND": 1, "OUTBOUND": 2 }[$dir] // 0)
+                      }
+                    } ]
+              elif $atype == "PORT_PROBE" then
+                [ ($act.PortProbeAction.PortProbeDetails // [])[]
+                  | { "src_endpoint": endpoint(.RemoteIpDetails; null),
+                      "dst_endpoint": ( endpoint(.LocalIpDetails; .LocalPortDetails.Port)
+                                        // ({ "instance_uid": $inst.InstanceId,
+                                              "port": .LocalPortDetails.Port } | prune
+                                            | if .instance_uid == null then null else . end) ) } ]
+              elif $atype == "DNS_REQUEST" then
+                ($act.DnsRequestAction // {}) as $q
+                | [ { "query": (if $q.Domain != null then { "hostname": $q.Domain } else null end),
+                      # A DNS_REQUEST finding is the resource's own lookup: outbound.
+                      "connection_info": { "protocol_name": (($q.Protocol // "") | ascii_downcase),
+                                           "direction_id": 2 } } ]
+              elif $atype == "AWS_API_CALL" then
+                ($act.AwsApiCallAction // {}) as $a
+                | [ { "api": (if $a.Api != null then {
+                                "operation": $a.Api,
+                                "service": { "name": $a.ServiceName },
+                                "response": { "error": $a.ErrorCode }
+                              } else null end),
+                      "src_endpoint": ( endpoint($a.RemoteIpDetails; null)
+                                        // (if $a.DomainDetails.Domain != null
+                                            then { "domain": $a.DomainDetails.Domain } else null end) ),
+                      "http_request": { "user_agent": $a.UserAgent } } ]
+              elif $atype == "KUBERNETES_API_CALL" then
+                ($act.KubernetesApiCallAction // {}) as $k
+                | [ { "api": (if $k.Verb != null then {
+                                "operation": $k.Verb,
+                                "response": { "code": $k.StatusCode }
+                              } else null end),
+                      "src_endpoint": ( endpoint($k.RemoteIpDetails; null)
+                                        // (if (($k.SourceIps // [])[0]) != null
+                                            then { "ip": $k.SourceIps[0] } else null end) ),
+                      "http_request": { "user_agent": $k.UserAgent,
+                                        "url": (if $k.RequestUri != null then { "path": $k.RequestUri } else null end) } } ]
+              elif $atype == "RDS_LOGIN_ATTEMPT" then
+                ($act.RdsLoginAttemptAction // {}) as $l
+                | endpoint($l.RemoteIpDetails; null) as $src
+                | if (($l.LoginAttributes // []) | length) > 0
+                  then [ $l.LoginAttributes[]
+                         | { "src_endpoint": $src,
+                             "user": (if .User != null then { "name": .User } else null end) } ]
+                  else [ { "src_endpoint": $src } ] end
+              else [] end ) as $action_evidence
+
+          # Identity evidence: the IAM principal and/or Kubernetes user.
+          | ( ($res.AccessKeyDetails // {}) as $ak
+              | ($res.KubernetesDetails.KubernetesUserDetails // {}) as $ku
+              | [ ( if (($ak.UserName // "") != "" or ($ak.PrincipalId // "") != "") then
+                      { "user": { "name": $ak.UserName, "uid": $ak.PrincipalId,
+                                  "type": $ak.UserType,
+                                  "programmatic_credentials": (if ($ak.AccessKeyId // "") != ""
+                                    then [ { "uid": $ak.AccessKeyId, "type": "AWS Access Key" } ]
+                                    else null end) } }
+                    else empty end ),
+                  ( if (($ku.Username // "") != "" or ($ku.Uid // "") != "") then
+                      { "user": { "name": $ku.Username, "uid": $ku.Uid,
+                                  "groups": [ ($ku.Groups // [])[] | { "name": . } ] } }
+                    else empty end ) ] ) as $identity_evidence
+
+          | ( ($action_evidence + $identity_evidence) | map(prune) | map(select(length > 0)) ) as $evidences
+
+          | ( "https://console.aws.amazon.com/guardduty/home?region=" + ($r.Region // "")
+              + "#/findings?fId=" + ($r.Id // "") ) as $console_url
+
           | {
               # --- Classification (REQUIRED for every OCSF event) ---
               "category_uid": 2,
               "class_uid":    2004,
               "activity_id":  $activity,
               "type_uid":     (2004 * 100 + $activity),
-              "severity_id":  sev_id($r.severity),
+              "severity_id":  sev_id($r.Severity),
 
               # --- Time (REQUIRED) ---
-              "time": to_epoch_ms($r.updatedAt // $r.createdAt),
-              "start_time": to_epoch_ms($svc.eventFirstSeen),
-              "end_time":   to_epoch_ms($svc.eventLastSeen),
+              "time": ($updated // $created // to_epoch_ms($svc.EventLastSeen) // (now * 1000 | floor)),
+              "start_time": to_epoch_ms($svc.EventFirstSeen),
+              "end_time":   to_epoch_ms($svc.EventLastSeen),
 
               # --- Metadata (REQUIRED) ---
               "metadata": {
-                "profiles": ["cloud", "osint"],
+                "profiles": (["cloud"] + (if $blocked != null then ["security_control"] else [] end)),
                 "version": "1.9.0",
-                "uid": $r.id,
+                "uid": $r.Id,
                 "product": {
                   "vendor_name": "AWS",
                   "name": "Amazon GuardDuty",
-                  "feature": { "name": ($svc.serviceName // "guardduty") }
+                  "feature": { "name": ($svc.FeatureName // $svc.ServiceName // "guardduty") }
                 }
               },
 
-              # --- Cloud (REQUIRED on Detection Finding) ---
+              # --- Cloud profile ---
               "cloud": {
                 "provider": "AWS",
-                "region": $r.region,
-                "account": { "uid": $r.accountId, "type_id": 10 },
-                "zone": (($res.instanceDetails // {}).availabilityZone)
+                "region": $r.Region,
+                "cloud_partition": $r.Partition,
+                "account": { "uid": $r.AccountId, "type_id": 10 },
+                "zone": $inst.AvailabilityZone
               },
-
-              # --- OSINT (REQUIRED on Detection Finding) ---
-              "osint": [
-                { "type_id": 1, "value": $osint_val }
-              ],
 
               # --- Finding info (REQUIRED) ---
               "finding_info": {
-                "uid": $r.id,
-                "title": $r.title,
-                "desc": $r.description,
-                "types": [ $r.type ],
-                "created_time": to_epoch_ms($r.createdAt),
-                "first_seen_time": to_epoch_ms($svc.eventFirstSeen),
-                "last_seen_time": to_epoch_ms($svc.eventLastSeen),
-                "src_url": ("https://console.aws.amazon.com/guardduty/home?region=" + ($r.region // "") + "#/findings?fId=" + ($r.id // ""))
+                "uid": $r.Id,
+                "uid_alt": $r.Arn,
+                "title": $r.Title,
+                "desc": $r.Description,
+                "types": [ $r.Type ],
+                "created_time": $created,
+                "modified_time": $updated,
+                "first_seen_time": to_epoch_ms($svc.EventFirstSeen),
+                "last_seen_time": to_epoch_ms($svc.EventLastSeen),
+                "src_url": $console_url
               },
 
               # --- Recommended fields ---
-              "status_id": (if ($svc.archived == true) then 4 else 1 end),
+              "status_id": (if $svc.Archived == true then 5 else 1 end),
               "is_alert": true,
-              "confidence_id": 0,
-              "count": $svc.count,
-              "message": $r.description,
+              "count": $svc.Count,
+              "confidence_score": (if ($r.Confidence | type) == "number" then ($r.Confidence | floor) else null end),
+              "message": ($r.Title // $r.Description),
+              "action_id": (if $blocked == true then 2 elif $blocked == false then 1 else null end),
+              "disposition_id": (if $blocked == true then 2 elif $blocked == false then 1 else null end),
+              "resources": $resources,
+              "evidences": $evidences,
               "observables": (
-                [ { "name": "finding_info.uid", "type_id": 8, "value": $r.id },
-                  { "name": "cloud.account.uid", "type_id": 35, "value": $r.accountId },
-                  (if $remote.ipAddressV4 then { "name": "device.ip", "type_id": 2, "value": $remote.ipAddressV4 } else empty end)
-                ]
-              ),
-              "resources": [
-                {
-                  "type": ($res.resourceType),
-                  "uid": (($res.instanceDetails // {}).instanceId),
-                  "cloud_partition": $r.partition,
-                  "region": $r.region
-                }
-              ],
+                [ (if $r.AccountId != null then { "name": "cloud.account.uid", "type_id": 35, "value": $r.AccountId } else empty end),
+                  ($resources[] | select(.uid != null) | { "name": "resources.uid", "type_id": 10, "value": .uid }),
+                  ($evidences[] | .src_endpoint.ip // empty | { "name": "evidences.src_endpoint.ip", "type_id": 2, "value": . }),
+                  ($evidences[] | .dst_endpoint.ip // empty | { "name": "evidences.dst_endpoint.ip", "type_id": 2, "value": . }),
+                  ($evidences[] | .user.name // empty | { "name": "evidences.user.name", "type_id": 4, "value": . }),
+                  ($evidences[] | .query.hostname // empty | { "name": "evidences.query.hostname", "type_id": 1, "value": . })
+                ] | unique ),
 
-              # --- Fields with no clean OCSF home ---
+              # --- Source fields with no OCSF home ---
               "unmapped": {
-                "action": (if ((($act.networkConnectionAction // {}).blocked) == true) then "Denied" else "Allowed" end),
-                "disposition": (if ((($act.networkConnectionAction // {}).blocked) == true) then "Blocked" else "Allowed" end),
-                "priority": (
-                  if $r.severity == null then "Unknown"
-                  elif $r.severity < 4 then "Low"
-                  elif $r.severity < 7 then "Medium"
-                  elif $r.severity < 9 then "High"
-                  else "Critical" end
-                ),
-                "actionType": ($act.actionType),
-                "connectionDirection": (($act.networkConnectionAction // {}).connectionDirection),
-                "protocol": (($act.networkConnectionAction // {}).protocol),
-                "blocked": (($act.networkConnectionAction // {}).blocked),
-                "remoteIp": ($remote.ipAddressV4),
-                "remoteCountry": (($remote.country // {}).countryName),
-                "remoteCity": (($remote.city // {}).cityName),
-                "remoteAsnOrg": (($remote.organization // {}).asnOrg),
-                "localPort": ((($act.networkConnectionAction // {}).localPortDetails // {}).port),
-                "remotePort": ((($act.networkConnectionAction // {}).remotePortDetails // {}).port),
-                "privateIp": ($nic.privateIpAddress),
-                "publicIp": ($nic.publicIp),
-                "vpcId": ($nic.vpcId),
-                "subnetId": ($nic.subnetId),
-                "instanceType": (($res.instanceDetails // {}).instanceType),
-                "detectorId": ($svc.detectorId),
-                "resourceRole": ($svc.resourceRole)
+                "Severity": $r.Severity,
+                "SchemaVersion": $r.SchemaVersion,
+                "AssociatedAttackSequenceArn": $r.AssociatedAttackSequenceArn,
+                "Service": {
+                  "DetectorId": $svc.DetectorId,
+                  "ResourceRole": $svc.ResourceRole,
+                  "AdditionalInfo": $svc.AdditionalInfo,
+                  "Detection": $svc.Detection,
+                  "Evidence": $svc.Evidence,
+                  "RuntimeDetails": $svc.RuntimeDetails,
+                  "EbsVolumeScanDetails": $svc.EbsVolumeScanDetails,
+                  "MalwareScanDetails": $svc.MalwareScanDetails,
+                  "UserFeedback": $svc.UserFeedback,
+                  "Action": {
+                    "ActionType": $act.ActionType,
+                    "Blocked": $blocked,
+                    "AwsApiCallAction": ($act.AwsApiCallAction // {} | { CallerType, RemoteAccountDetails, AffectedResources }),
+                    "DnsRequestAction": ($act.DnsRequestAction // {} | { DomainWithSuffix, VpcOwnerAccountId }),
+                    "KubernetesApiCallAction": ($act.KubernetesApiCallAction // {} | { Namespace, Resource, ResourceName, Subresource, Parameters, SourceIps }),
+                    "KubernetesPermissionCheckedDetails": $act.KubernetesPermissionCheckedDetails,
+                    "KubernetesRoleBindingDetails": $act.KubernetesRoleBindingDetails,
+                    "KubernetesRoleDetails": $act.KubernetesRoleDetails
+                  }
+                },
+                "Resource": {
+                  "ResourceType": $res.ResourceType,
+                  "EbsVolumeDetails": $res.EbsVolumeDetails,
+                  "RdsDbUserDetails": $res.RdsDbUserDetails,
+                  "KubernetesUserDetails": $res.KubernetesDetails.KubernetesUserDetails
+                }
               },
 
               # --- Original record for audit / debugging ---
               "raw_data": (. | tostring)
             }
-          | walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) else . end)
+          | prune

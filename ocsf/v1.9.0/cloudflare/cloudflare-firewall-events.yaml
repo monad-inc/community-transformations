@@ -1,5 +1,5 @@
 name: "Cloudflare Firewall Events to OCSF v1.9.0"
-description: "Transforms Cloudflare firewall_events (WAF / firewall rule matches) records into the OCSF v1.9.0 HTTP Activity (4002) class."
+description: "Transforms Cloudflare firewall events (GraphQL firewallEventsAdaptive: WAF / firewall rule matches) into the OCSF v1.9.0 HTTP Activity (4002) class."
 author: "Monad"
 contributors:
   - "https://github.com/behobu"
@@ -18,7 +18,14 @@ config:
         query: |
           # ---------------------------------------------------------------
           # OCSF HTTP Activity (class_uid=4002, category_uid=4) — v1.9.0
-          # Input: one Cloudflare firewall_events record per invocation.
+          # Input: one GraphQL firewallEventsAdaptive row per invocation
+          # (camelCase): action, datetime, clientIP, clientAsn,
+          # clientASNDescription, clientCountryName, clientRequestHTTPHost,
+          # clientRequestPath, clientRequestHTTPMethodName, edgeColoName,
+          # edgeResponseStatus, ruleId, rulesetId, source, userAgent,
+          # rayName, description, and (Bot Management only) botScore,
+          # botScoreSrcName. Logpush firewall_events rows (PascalCase) come
+          # from the separate cloudflare-logpush input, not this one.
           # ---------------------------------------------------------------
           def to_epoch_ms($ts):
             def _num_ms($n):
@@ -49,119 +56,140 @@ config:
               end
             else null end;
 
+          # "" -> null so the prune pass drops not-applicable fields.
+          def nz($v): if $v == "" then null else $v end;
+          def num($v): if ($v | type) == "string" then ($v | tonumber? // null) else $v end;
+
           . as $r
+          | ($r.action // "" | ascii_downcase) as $act
 
-          # Datetime is ISO-8601 or epoch (seconds/ms). OCSF time = epoch milliseconds.
-          | to_epoch_ms($r.Datetime) as $t
+          # HTTP method -> activity_id (RFC + WebDAV methods per the OCSF
+          # enum; anything else -> 99 Other)
+          | ( { "CONNECT":1, "DELETE":2, "GET":3, "HEAD":4, "OPTIONS":5,
+                "POST":6, "PUT":7, "TRACE":8, "PATCH":9, "ACL":10,
+                "BASELINE-CONTROL":11, "BIND":12, "CHECKIN":13, "CHECKOUT":14,
+                "COPY":15, "LABEL":16, "LINK":17, "LOCK":18, "MERGE":19,
+                "MKACTIVITY":20, "MKCALENDAR":21, "MKCOL":22, "MKREDIRECTREF":23,
+                "MKWORKSPACE":24, "MOVE":25, "ORDERPATCH":26, "PRI":27,
+                "PROPFIND":28, "PROPPATCH":29, "QUERY":30, "REBIND":31,
+                "REPORT":32, "SEARCH":33, "UNBIND":34, "UNCHECKOUT":35,
+                "UNLINK":36, "UNLOCK":37, "UPDATE":38, "UPDATEREDIRECTREF":39,
+                "VERSION-CONTROL":40 }[($r.clientRequestHTTPMethodName // "" | ascii_upcase)] // 99 ) as $activity
 
-          # HTTP method -> activity_id
-          | ( { "CONNECT":1,"DELETE":2,"GET":3,"HEAD":4,"OPTIONS":5,
-                "POST":6,"PUT":7,"TRACE":8,"PATCH":9 }[($r.ClientRequestMethod // "" | ascii_upcase)] // 99 ) as $act
+          # Cloudflare action -> [disposition_id, disposition, action_id, action].
+          # Challenge outcomes: *_solved / *_bypassed / *_skipped let the request
+          # through; *_failed blocks it; a bare challenge is still pending.
+          | ( if   $act == "" or $act == "unknown"   then [0, "Unknown", 0, "Unknown"]
+              elif $act == "allow" or $act == "bypass" or $act == "skip"
+                                                     then [1, "Allowed", 1, "Allowed"]
+              elif $act == "block"                   then [2, "Blocked", 2, "Denied"]
+              elif $act == "drop"                    then [6, "Dropped", 2, "Denied"]
+              elif $act == "connection_close" or $act == "connectionclose"
+                                                     then [21, "Reset", 2, "Denied"]
+              elif $act == "log"                     then [17, "Logged", 3, "Observed"]
+              elif ($act | test("challenge")) and ($act | test("failed"))
+                                                     then [2, "Blocked", 2, "Denied"]
+              elif ($act | test("challenge")) and ($act | test("solved|bypassed|skipped"))
+                                                     then [1, "Allowed", 1, "Allowed"]
+              elif ($act | test("challenge"))        then [23, "Challenge", 99, "Challenge"]
+              else [99, $r.action, 99, $r.action] end ) as $d
 
-          # Cloudflare Action -> OCSF disposition_id
-          | ( { "allow":1,"bypass":1,"skip":1,"block":2,"drop":6,
-                "connectionclose":21,"jschallenge":22,"managedchallenge":23,
-                "challenge":23,"log":17 }[($r.Action // "" | ascii_downcase)] // 99 ) as $disp
-
-          # disposition -> action_id (allowed / denied / other)
-          | ( if $disp == 1 then 1
-              elif ($disp == 2 or $disp == 6) then 2
-              else 99 end ) as $action_id
-
-          # Action -> severity_id
-          | ( { "block":4,"drop":4,"connectionclose":4,
-                "challenge":3,"managedchallenge":3,"jschallenge":3,
-                "log":1,"allow":1,"bypass":1,"skip":1 }[($r.Action // "" | ascii_downcase)] // 2 ) as $sev
-
+          # Severity: blocked/dropped/reset = Medium, challenge = Low, else Informational.
+          | ( if ($d[0] == 2 or $d[0] == 6 or $d[0] == 21) then 3
+              elif $d[0] == 23 then 2
+              else 1 end ) as $sev
+          # edgeResponseStatus 0 means no response was recorded.
+          | (num($r.edgeResponseStatus) | if . == 0 then null else . end) as $status
+          | ( if ($d[0] == 2 or $d[0] == 6 or $d[0] == 21) then 2
+              elif ($status // 0) >= 400 then 2
+              elif ($status // 0) > 0 then 1
+              else 0 end ) as $status_id
+          | nz($r.clientRequestHTTPHost) as $host
           | {
-              "category_uid": 4,
-              "class_uid":    4002,
-              "type_uid":     (4002 * 100 + $act),
-              "activity_id":  $act,
-              "severity_id":  $sev,
-              "disposition_id": $disp,
-              "action_id":    $action_id,
-              "is_alert":     ($disp == 2 or $disp == 6),
+              category_uid: 4,
+              class_uid:    4002,
+              activity_id:  $activity,
+              type_uid:     (4002 * 100 + $activity),
+              severity_id:  $sev,
+              status_id:    $status_id,
+              status:       ({ "0": "Unknown", "1": "Success", "2": "Failure" }[$status_id | tostring]),
+              status_code:  ($status | if . == null then null else tostring end),
 
-              "time": $t,
+              disposition_id: $d[0],
+              disposition:    $d[1],
+              action_id:      $d[2],
+              action:         $d[3],
+              is_alert:       ($d[2] == 2),
 
-              "metadata": {
-                "version": "1.9.0",
-                "product": {
-                  "vendor_name": "Cloudflare",
-                  "name": "Cloudflare WAF"
+              time: to_epoch_ms($r.datetime),
+
+              metadata: {
+                # firewall_rule/policy/action_id/disposition_id/is_alert are
+                # security_control profile attributes; proxy_endpoint is
+                # network_proxy.
+                profiles: (["cloud", "security_control"]
+                           + (if nz($r.edgeColoName) != null then ["network_proxy"] else [] end)),
+                version: "1.9.0",
+                product: {
+                  vendor_name: "Cloudflare",
+                  name: "Cloudflare WAF",
+                  feature: (if nz($r.source) != null then { name: $r.source } else null end)
                 },
-                "uid": $r.RayID,
-                "log_provider": "Cloudflare Logpush",
-                "profiles": ["cloud", "osint", "security_control"]
+                uid: nz($r.rayName),
+                log_name: "firewallEventsAdaptive"
               },
 
-              "cloud": {
-                "provider": "Cloudflare"
+              cloud: { provider: "Cloudflare" },
+
+              message: (nz($r.description)
+                        // ("Cloudflare firewall " + ($r.action // "event")
+                            + (if $host != null then " for " + $host + ($r.clientRequestPath // "") else "" end))),
+
+              src_endpoint: {
+                ip: nz($r.clientIP),
+                location: (if nz($r.clientCountryName) != null then { country: $r.clientCountryName } else null end),
+                autonomous_system: (if num(nz($r.clientAsn)) != null or nz($r.clientASNDescription) != null
+                                    then { number: num(nz($r.clientAsn)), name: nz($r.clientASNDescription) } else null end)
               },
 
-              "osint": [],
+              # The Cloudflare edge data center (colo) that proxied the request.
+              proxy_endpoint: (if nz($r.edgeColoName) != null then { name: $r.edgeColoName } else null end),
 
-              "message": $r.Description,
-              "status_code": ($r.EdgeResponseStatus // null | if . == null then null else tostring end),
+              dst_endpoint: (if $host != null then { hostname: $host } else null end),
 
-              "src_endpoint": {
-                "ip": $r.ClientIP,
-                "location": (if ($r.ClientCountry // "") != "" then { "country": ($r.ClientCountry | ascii_upcase) } else null end),
-                "autonomous_system": (if ($r.ClientASN // null) != null then { "number": $r.ClientASN, "name": $r.ClientASNDescription } else null end)
+              http_request: {
+                http_method: (nz($r.clientRequestHTTPMethodName) | if . == null then null else ascii_upcase end),
+                user_agent: nz($r.userAgent),
+                url: (if $host != null or nz($r.clientRequestPath) != null
+                      then { hostname: $host, path: nz($r.clientRequestPath) } else null end)
               },
 
-              "dst_endpoint": {
-                "domain": $r.ClientRequestHost,
-                "svc_name": $r.EdgeColoCode
+              http_response: (if $status != null then { code: $status } else null end),
+
+              firewall_rule: (if nz($r.ruleId) != null
+                              then { uid: $r.ruleId, name: nz($r.description), type: nz($r.source) }
+                              else null end),
+              policy: (if nz($r.rulesetId) != null then { uid: $r.rulesetId, is_applied: true } else null end),
+
+              observables: [
+                (if nz($r.clientIP) != null then { name: "src_endpoint.ip", type_id: 2, value: $r.clientIP } else empty end),
+                (if $host != null then { name: "dst_endpoint.hostname", type_id: 1, value: $host } else empty end),
+                (if nz($r.userAgent) != null then { name: "http_request.user_agent", type_id: 16, value: $r.userAgent } else empty end)
+              ],
+
+              # botScore (1 = bot .. 99 = human) has no OCSF equivalent.
+              unmapped: {
+                botScore: $r.botScore,
+                botScoreSrcName: $r.botScoreSrcName
               },
 
-              "http_request": {
-                "http_method": $r.ClientRequestMethod,
-                "user_agent": $r.ClientRequestUserAgent,
-                "version": $r.ClientRequestProtocol,
-                "referrer": (if ($r.ClientRefererHost // "") != ""
-                             then (($r.ClientRefererScheme // "https") + "://" + $r.ClientRefererHost + ($r.ClientRefererPath // "")) else null end),
-                "url": {
-                  "scheme": $r.ClientRequestScheme,
-                  "hostname": $r.ClientRequestHost,
-                  "path": $r.ClientRequestPath,
-                  "query_string": (if ($r.ClientRequestQuery // "") != "" then ($r.ClientRequestQuery | ltrimstr("?")) else null end)
-                }
-              },
-
-              "http_response": {
-                "code": ($r.EdgeResponseStatus // 0)
-              },
-
-              "observables": (
-                [ (if ($r.ClientIP // "") != "" then { "name": "src_endpoint.ip", "type_id": 2, "value": $r.ClientIP } else empty end),
-                  (if ($r.ClientRequestHost // "") != "" then { "name": "http_request.url.hostname", "type_id": 1, "value": $r.ClientRequestHost } else empty end),
-                  (if ($r.RayID // "") != "" then { "name": "metadata.uid", "type_id": 10, "value": $r.RayID } else empty end)
-                ] ),
-
-              "unmapped": {
-                "RuleID": $r.RuleID,
-                "Ref": $r.Ref,
-                "Kind": $r.Kind,
-                "Source": $r.Source,
-                "ClientIPClass": $r.ClientIPClass,
-                "MatchIndex": $r.MatchIndex,
-                "OriginResponseStatus": $r.OriginResponseStatus,
-                "OriginatorRayID": (if ($r.OriginatorRayID // "00") != "00" then $r.OriginatorRayID else null end),
-                "ZoneName": $r.ZoneName,
-                "LeakedCredentialCheckResult": $r.LeakedCredentialCheckResult,
-                "cf_metadata": $r.Metadata
-              },
-
-              "raw_data": ($r | tostring)
+              raw_data: ($r | tostring)
             }
-
-          # Prune nulls / empty objects / empty arrays (single recursive pass).
-          | walk( if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
-                  elif type == "array" then map(select(. != null and . != {} and . != []))
-                  else . end )
-
-          # osint is a required attribute of HTTP Activity; guarantee its
-          # presence even though the prune pass drops empty arrays elsewhere.
-          | .osint = (.osint // [])
+          # Prune nulls / empty strings / empty objects / empty arrays.
+          | walk(
+              if type == "object" then
+                with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+              elif type == "array" then
+                map(select(. != null and . != {} and . != []))
+              else . end
+            )
