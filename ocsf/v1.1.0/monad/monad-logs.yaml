@@ -97,7 +97,8 @@ config:
                 "version": .log_version,
                 "vendor_name": "Monad"
               },
-              "version": "1.0.0"
+              "profiles": ["cloud"],
+              "version": "1.1.0"
             },
             "cloud": {
               "provider": "Monad"
