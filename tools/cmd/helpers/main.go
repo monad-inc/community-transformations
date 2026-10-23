@@ -94,10 +94,12 @@ func syncLines(lines []string, helpers map[repo.Key]*repo.Helper, names map[stri
 		return nil, err
 	}
 	present := map[string]int{} // helper name -> line index of its first def
+	presentKey := map[repo.Key]bool{}
 	for _, d := range defs {
 		if _, ok := present[d.Key.Name]; !ok {
 			present[d.Key.Name] = d.Start
 		}
+		presentKey[d.Key] = true
 	}
 	var out []string
 	next := 0
@@ -124,10 +126,66 @@ func syncLines(lines []string, helpers map[repo.Key]*repo.Helper, names map[stri
 			pipe = strings.Repeat(" ", len(pipe))
 			present[r] = d.Start
 		}
+		// A canonical def may call another arity of its own name (json_str/0
+		// calls json_str/1); such siblings go in ahead of it.
+		for _, k := range siblingKeys(helpers, d.Key) {
+			if presentKey[k] || !callsArity(h, k) {
+				continue
+			}
+			out = append(out, indent(helpers[k].Lines, d.Indent, pipe)...)
+			pipe = strings.Repeat(" ", len(pipe))
+			presentKey[k] = true
+		}
 		out = append(out, indent(h.Lines, d.Indent, pipe)...)
 		next = d.End
 	}
 	return append(out, lines[next:]...), nil
+}
+
+// siblingKeys returns the canonical keys sharing k's name but not its arity,
+// in arity order.
+func siblingKeys(helpers map[repo.Key]*repo.Helper, k repo.Key) []repo.Key {
+	var ks []repo.Key
+	for o := range helpers {
+		if o.Name == k.Name && o != k {
+			ks = append(ks, o)
+		}
+	}
+	sort.Slice(ks, func(i, j int) bool { return ks[i].Arity < ks[j].Arity })
+	return ks
+}
+
+// callsArity reports whether h's body calls k.Name with k's arity
+// (k.Arity > 0: "name(" with k.Arity-1 top-level ";" separators).
+func callsArity(h *repo.Helper, k repo.Key) bool {
+	if k.Arity == 0 {
+		return false
+	}
+	body := strings.Join(h.Lines, "\n")
+	for i := strings.Index(body, k.Name+"("); i >= 0; {
+		args, depth, n := body[i+len(k.Name)+1:], 1, 1
+		for j := 0; j < len(args) && depth > 0; j++ {
+			switch args[j] {
+			case '(', '[', '{':
+				depth++
+			case ')', ']', '}':
+				depth--
+			case ';':
+				if depth == 1 {
+					n++
+				}
+			}
+		}
+		if n == k.Arity && !strings.HasSuffix(strings.TrimRight(body[:i], " \t"), "def") {
+			return true
+		}
+		next := strings.Index(body[i+1:], k.Name+"(")
+		if next < 0 {
+			break
+		}
+		i += 1 + next
+	}
+	return false
 }
 
 func requiredHelper(helpers map[repo.Key]*repo.Helper, name string) *repo.Helper {
