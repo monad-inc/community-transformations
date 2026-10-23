@@ -23,13 +23,10 @@ config:
           # One jq pass, bind-once, single trailing prune.
           # ---------------------------------------------------------------
 
-          def prune:
-            walk(
-              if type == "object" then
-                with_entries(select(.value != null and .value != "" and .value != [] and .value != {}))
-              elif type == "array" then map(select(. != null))
-              else . end
-            );
+          def prune_blank:
+            walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null and . != "" and . != {} and . != []))
+                 else . end);
 
           . as $r
           | ($r.rules // []) as $rules
@@ -91,4 +88,4 @@ config:
 
               "tags": (["cloudflare", "ruleset", $r.kind] | map(select(. != null)))
             }
-          | prune
+          | prune_blank

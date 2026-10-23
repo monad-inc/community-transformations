@@ -109,6 +109,30 @@ Before submitting, ensure your transformation:
 4. Produces the expected output format
 5. Performs efficiently with larger datasets
 
+Every pull request runs the `Validate` workflow, which you can also run locally (Go 1.26+):
+
+```bash
+go -C tools run ./cmd/validate        # metadata, file placement, and jq parse/compile under the platform's gojq
+go -C tools run ./cmd/helpers check   # shared helper copies match helpers/helpers.jq
+```
+
+## Shared jq Helpers
+
+The Monad jq operation has no shared library, so each transformation carries its own copy of the helper functions it uses.
+`helpers/helpers.jq` holds the canonical definitions of the common ones: `to_epoch_ms`, `to_iso`, `sev_caption`, `sev_to_id`, `status_to_id`, `status_caption`, `cef_sev`, `truthy`, `is_ip`, `json_str`, `present_unique`, `prune`, and `prune_blank`.
+
+- If your transformation needs one of these, copy its definition from `helpers/helpers.jq` exactly.
+- Don't define a different function under one of these names, with any number of arguments; give a local variant its own name.
+- `helpers/helpers.jq` and `helpers/tests.json` are generated from the "Standard jq helpers" section of the transform builder skills in [monad-inc/community](https://github.com/monad-inc/community/tree/main/skills), which is the source of truth.
+  To change a helper, change it there, run that skill's `scripts/jq-helpers.sh export <this repo>`, then run the sync and check commands below (Go 1.26+) and review the transform diffs in the same pull request.
+
+```bash
+go -C tools run ./cmd/helpers sync    # rewrite drifted copies to the canonical definitions
+go -C tools run ./cmd/helpers check   # fail on any drifted copy; run the helper test cases
+```
+
+To try a helper locally, include the file with jq or gojq: `jq -L helpers 'include "helpers"; to_epoch_ms(.time)'`.
+
 ## Repository Organization
 
 When adding a new transformation:

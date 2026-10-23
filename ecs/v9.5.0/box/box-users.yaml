@@ -24,11 +24,9 @@ config:
           # One jq pass; single end-of-pipeline walk-based prune.
           # ---------------------------------------------------------------
           def prune:
-            walk(
-              if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
-              elif type == "array" then map(select(. != null and . != {} and . != []))
-              else . end
-            );
+            walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null and . != {} and . != []))
+                 else . end);
 
           . as $u |
           # login is an email; derive the domain part for user.domain
