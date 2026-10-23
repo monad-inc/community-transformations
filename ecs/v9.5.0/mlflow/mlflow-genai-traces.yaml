@@ -44,7 +44,10 @@ config:
 
           # Recursively drop null / {} / [] so the emitted document stays compact
           # (Elasticsearch rejects nulls; the doc is deeply nested).
-          def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
+          def prune:
+            walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null and . != {} and . != []))
+                 else . end);
 
           . as $t
           | ($t.info // {}) as $i

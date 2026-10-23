@@ -24,7 +24,8 @@ config:
           # malicious it is a threat indicator; otherwise an observed
           # indicator. event.kind=alert, category=threat, type=indicator.
           # ---------------------------------------------------------------
-          def truthy($v): ($v == true) or (($v|type) == "string" and ($v|ascii_downcase) == "true");
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
           def json_str($v):
             if $v == null or $v == {} or $v == [] then null
             elif ($v | type) == "string" then $v

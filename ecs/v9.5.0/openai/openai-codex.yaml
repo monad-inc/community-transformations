@@ -38,7 +38,8 @@ config:
             if $x == null or $x == "" then null
             elif ($x | type) == "string" then ($x | tonumber? // null)
             else $x end;
-          def truthy($v): ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
+          def truthy($v):
+            ($v == true) or (($v | type) == "string" and ($v | ascii_downcase) == "true");
 
           def av($v):
             if $v == null then null
@@ -51,7 +52,10 @@ config:
               (reduce ((($v.kvlistValue.values) // [])[]) as $a ({}; .[$a.key] = av($a.value)))
             else null end;
           def kv($arr): reduce (($arr // [])[]) as $a ({}; .[$a.key] = av($a.value));
-          def prune_blank: walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
+          def prune_blank:
+            walk(if type == "object" then with_entries(select(.value != null and .value != "" and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null and . != "" and . != {} and . != []))
+                 else . end);
 
           (.resourceLogs // [])[] as $rl
           | kv($rl.resource.attributes) as $res

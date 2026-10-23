@@ -36,7 +36,10 @@ config:
 
           # Single end-of-pipeline prune: ES rejects nulls and the doc is
           # nested. This is the one permitted recursive pass.
-          def prune: walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != [])) elif type == "array" then map(select(. != null)) else . end);
+          def prune:
+            walk(if type == "object" then with_entries(select(.value != null and .value != {} and .value != []))
+                 elif type == "array" then map(select(. != null and . != {} and . != []))
+                 else . end);
 
           . as $r
           | ($r.id | tostring) as $id
